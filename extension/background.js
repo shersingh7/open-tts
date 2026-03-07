@@ -49,6 +49,24 @@ async function handleGetVoices(sendResponse) {
 
 async function handleTTSRequest(request, sendResponse) {
   try {
+    // First check if server is running
+    const healthCheck = await fetch(`${SERVER_URL}/health`, {
+      method: "GET",
+      signal: AbortSignal.timeout(5000),
+    }).catch(() => null);
+
+    if (!healthCheck || !healthCheck.ok) {
+      sendResponse({
+        success: false,
+        error: "Server not running. Start with: cd ~/github/qwen-tts-mlx/backend && ./venv/bin/python server.py",
+        serverDown: true,
+      });
+      return;
+    }
+
+    console.log("[Qwen TTS Background] Sending to server - voice:", request.voice);
+
+    // Increased timeout for longer texts (5 minutes)
     const response = await fetch(`${SERVER_URL}/v1/synthesize`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -58,6 +76,7 @@ async function handleTTSRequest(request, sendResponse) {
         speed: request.speed,
         language: request.language || "Auto",
       }),
+      signal: AbortSignal.timeout(300000), // 5 minutes timeout
     });
 
     if (!response.ok) {
@@ -71,7 +90,11 @@ async function handleTTSRequest(request, sendResponse) {
     reader.onloadend = () => {
       sendResponse({ success: true, audioData: reader.result });
     };
+    reader.onerror = () => {
+      sendResponse({ success: false, error: "Failed to read audio data" });
+    };
   } catch (error) {
+    console.error("[Qwen TTS Background] Error:", error);
     sendResponse({ success: false, error: error.message });
   }
 }

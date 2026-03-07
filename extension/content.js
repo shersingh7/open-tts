@@ -6,7 +6,12 @@ let isSpeaking = false;
 let isPaused = false;
 
 const MAX_SELECTION_CHARS = 200000;
-const CHUNK_TARGET_CHARS = 320;
+// Optimal chunk size for M2 Pro: ~500 chars = ~8-10 seconds of audio
+const CHUNK_TARGET_CHARS = 500;
+// Number of chunks to pre-generate ahead while playing
+const PREFETCH_COUNT = 2;
+// Minimum chunks ready before playback starts
+const MIN_BUFFER_BEFORE_PLAY = 2;
 
 function removeLegacyWidget() {
   document.querySelectorAll("#qwen-tts-icon-container").forEach((node) => node.remove());
@@ -100,7 +105,7 @@ function flashError(message) {
   setTimeout(() => {
     widget.classList.remove("error");
     setLabel("Speak");
-  }, 2200);
+  }, 3000);
 }
 
 function stopAudio() {
@@ -166,36 +171,120 @@ function splitTextForTTS(text, maxChars = CHUNK_TARGET_CHARS) {
   return out;
 }
 
+/**
+ * AudioBuffer: Manages audio chunks with HTMLAudioElement for pitch-preserving playback
+ */
+class AudioBufferQueue {
+  constructor() {
+    this.audioBuffers = new Map(); // chunkIndex -> audioData URL
+    this.pendingRequests = new Map(); // chunkIndex -> Promise
+    this.isStopped = false;
+  }
+
+  // Check if a chunk is ready for playback
+  isReady(chunkIndex) {
+    return this.audioBuffers.has(chunkIndex);
+  }
+
+  // Check if a chunk is currently being generated
+  isPending(chunkIndex) {
+    return this.pendingRequests.has(chunkIndex);
+  }
+
+  // Get audio data for a chunk (must be ready)
+  getAudioData(chunkIndex) {
+    return this.audioBuffers.get(chunkIndex);
+  }
+
+  // Start generating a chunk (returns promise that resolves when ready)
+  async generateChunk(chunkIndex, text, settings) {
+    // Already ready
+    if (this.audioBuffers.has(chunkIndex)) {
+      return this.audioBuffers.get(chunkIndex);
+    }
+
+    // Already being generated
+    if (this.pendingRequests.has(chunkIndex)) {
+      return this.pendingRequests.get(chunkIndex);
+    }
+
+    // Start new generation
+    const promise = (async () => {
+      try {
+        console.log(`[Qwen TTS] Generating chunk ${chunkIndex}, voice: ${settings.voice || "ryan"}`);
+        const audioData = await requestChunkAudio(text, settings);
+        if (this.isStopped) return null;
+
+        this.audioBuffers.set(chunkIndex, audioData);
+        return audioData;
+      } catch (error) {
+        console.error(`[Qwen TTS] Error generating chunk ${chunkIndex}:`, error);
+        throw error;
+      } finally {
+        this.pendingRequests.delete(chunkIndex);
+      }
+    })();
+
+    this.pendingRequests.set(chunkIndex, promise);
+    return promise;
+  }
+
+  // Clean up old buffers to free memory
+  cleanup(keepFromIndex) {
+    for (const [idx] of this.audioBuffers) {
+      if (idx < keepFromIndex) {
+        this.audioBuffers.delete(idx);
+      }
+    }
+  }
+
+  stop() {
+    this.isStopped = true;
+    this.pendingRequests.clear();
+    this.audioBuffers.clear();
+  }
+}
+
 async function requestChunkAudio(text, settings) {
+  console.log("[Qwen TTS] Requesting audio:", {
+    voice: settings.voice || "ryan",
+    textLength: text.length,
+  });
+
   const response = await chrome.runtime.sendMessage({
     type: "TTS_REQUEST",
     text,
     voice: settings.voice || "ryan",
-    // Keep model synthesis at 1.0x; browser playbackRate gives exact user speed.
     speed: 1.0,
     language: settings.language || "Auto",
   });
 
   if (!response?.success) {
-    throw new Error(response?.error || "Unknown TTS error");
+    const errorMsg = response?.error || "Unknown TTS error";
+    if (response?.serverDown) {
+      throw new Error("Server not running. Run: cd ~/github/qwen-tts-mlx/backend && ./venv/bin/python server.py");
+    }
+    throw new Error(errorMsg);
   }
 
   return response.audioData;
 }
 
+// Play audio using HTMLAudioElement (preserves pitch when changing speed)
 function playAudioData(audioData, runId, playbackRate) {
-  return new Promise(async (resolve, reject) => {
-    try {
-      if (runId !== speakRunId) return resolve();
-      stopAudio();
-      currentAudio = new Audio(audioData);
-      currentAudio.playbackRate = Math.max(0.5, Math.min(3.0, Number(playbackRate) || 1.0));
-      currentAudio.onended = () => resolve();
-      currentAudio.onerror = () => reject(new Error("Audio playback failed"));
-      await currentAudio.play();
-    } catch (err) {
-      reject(err);
-    }
+  return new Promise((resolve, reject) => {
+    if (runId !== speakRunId) return resolve();
+    stopAudio();
+
+    currentAudio = new Audio(audioData);
+    // HTMLAudioElement playbackRate preserves pitch (unlike Web Audio API)
+    currentAudio.playbackRate = Math.max(0.5, Math.min(3.0, playbackRate));
+    currentAudio.preservesPitch = true;
+
+    currentAudio.onended = () => resolve();
+    currentAudio.onerror = (e) => reject(new Error(`Audio playback failed: ${e.message || "unknown error"}`));
+
+    currentAudio.play().catch(reject);
   });
 }
 
@@ -222,6 +311,7 @@ async function onSpeakClick(event) {
   const text = selectedText?.trim();
   if (!text) return;
 
+  // Handle pause/resume for existing playback
   if (isSpeaking) {
     if (currentAudio && !currentAudio.paused && !isPaused) {
       currentAudio.pause();
@@ -254,49 +344,108 @@ async function onSpeakClick(event) {
   isPaused = false;
   widget?.classList.remove("paused");
 
+  let audioQueue = null;
+
   try {
     setBusy(true, "Preparing…");
 
     const settings = await chrome.storage.sync.get(["voice", "speed", "language"]);
     const playbackRate = Number(settings.speed) || 1.0;
+
+    console.log("[Qwen TTS] Settings from storage:", settings);
+    console.log("[Qwen TTS] Using voice:", settings.voice || "ryan", "speed:", playbackRate);
+
     const chunks = splitTextForTTS(text, CHUNK_TARGET_CHARS);
 
     if (!chunks.length) throw new Error("Nothing to read");
 
-    let idx = 0;
-    let nextAudioPromise = requestChunkAudio(chunks[0], settings);
+    console.log(`[Qwen TTS] Split into ${chunks.length} chunks`);
 
-    while (idx < chunks.length) {
-      if (runId !== speakRunId) return;
+    // Initialize audio buffer queue
+    audioQueue = new AudioBufferQueue();
 
-      setBusy(true, `Reading ${idx + 1}/${chunks.length}… tap to pause`);
-      const audioData = await nextAudioPromise;
+    // Pre-generate initial buffer before playing
+    const initialBufferCount = Math.min(MIN_BUFFER_BEFORE_PLAY, chunks.length);
+    setBusy(true, `Buffering ${initialBufferCount} of ${chunks.length} chunks…`);
 
-      if (idx + 1 < chunks.length) {
-        // Start generating next chunk while current chunk is playing.
-        nextAudioPromise = requestChunkAudio(chunks[idx + 1], settings);
-      } else {
-        nextAudioPromise = null;
-      }
-
-      await playAudioData(audioData, runId, playbackRate);
-      idx += 1;
+    // Start generating initial chunks in parallel
+    const initialPromises = [];
+    for (let i = 0; i < initialBufferCount; i++) {
+      initialPromises.push(audioQueue.generateChunk(i, chunks[i], settings));
     }
 
-    if (runId === speakRunId) {
+    // Wait for initial buffer to be ready
+    try {
+      await Promise.all(initialPromises);
+    } catch (error) {
+      console.error("[Qwen TTS] Error generating initial chunks:", error);
+      throw error;
+    }
+
+    if (runId !== speakRunId || audioQueue.isStopped) return;
+
+    // Begin playback
+    let currentIndex = 0;
+
+    // Main playback loop
+    while (currentIndex < chunks.length && !audioQueue.isStopped && runId === speakRunId) {
+      // Start generating next chunks ahead of time
+      for (let ahead = 1; ahead <= PREFETCH_COUNT; ahead++) {
+        const futureIdx = currentIndex + ahead;
+        if (futureIdx < chunks.length && !audioQueue.isReady(futureIdx) && !audioQueue.isPending(futureIdx)) {
+          audioQueue.generateChunk(futureIdx, chunks[futureIdx], settings);
+        }
+      }
+
+      // Wait for current chunk if not ready yet
+      if (!audioQueue.isReady(currentIndex)) {
+        setBusy(true, `Reading ${currentIndex + 1}/${chunks.length}… buffering`);
+        try {
+          await audioQueue.generateChunk(currentIndex, chunks[currentIndex], settings);
+        } catch (error) {
+          console.error(`[Qwen TTS] Error generating chunk ${currentIndex}:`, error);
+          throw error;
+        }
+      }
+
+      if (audioQueue.isStopped || runId !== speakRunId) break;
+
+      setBusy(true, `Reading ${currentIndex + 1}/${chunks.length}… tap to pause`);
+
+      // Play current chunk
+      const audioData = audioQueue.getAudioData(currentIndex);
+      try {
+        await playAudioData(audioData, runId, playbackRate);
+      } catch (error) {
+        console.error(`[Qwen TTS] Error playing chunk ${currentIndex}:`, error);
+        throw error;
+      }
+
+      // Move to next
+      currentIndex++;
+
+      // Clean up old buffers
+      audioQueue.cleanup(currentIndex);
+    }
+
+    if (runId === speakRunId && !audioQueue.isStopped) {
       setBusy(false, "Speak");
     }
   } catch (error) {
+    console.error("[Qwen TTS] Error:", error);
     if (runId === speakRunId) {
       setBusy(false);
-      flashError("Couldn’t read. Tap again");
+      const errorMsg = error?.message || "Couldn't read. Tap again";
+      flashError(errorMsg);
     }
-    console.error("Qwen MLX TTS error:", error);
   } finally {
     if (runId === speakRunId) {
       isSpeaking = false;
       isPaused = false;
       widget?.classList.remove("paused");
+    }
+    if (audioQueue) {
+      audioQueue.stop();
     }
   }
 }
