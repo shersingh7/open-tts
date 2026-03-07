@@ -24,7 +24,7 @@ Fast, local text-to-speech using Qwen3-TTS on Apple Silicon. Runs entirely on yo
 
 ## Quick Start
 
-### 1. Setup
+### 1. Setup (one-time)
 
 ```bash
 cd backend
@@ -44,31 +44,38 @@ This will:
 3. Click **Load unpacked**
 4. Select the `extension` folder
 
-### 3. Install Native Messaging Host (for Start/Stop Server buttons)
-
-To use the Start/Stop Server buttons in the extension popup, you need to install the native messaging host:
+### 3. Install Native Messaging Host (required for Start/Stop buttons)
 
 ```bash
 cd backend
 ./install_native_host.sh
 ```
 
-When prompted, enter your Chrome extension ID (found on the `chrome://extensions/` page when Developer mode is enabled).
+When prompted, enter your Chrome extension ID (visible on `chrome://extensions/` page).
 
 **To uninstall:**
 ```bash
 ./uninstall_native_host.sh
 ```
 
-### 4. Use It
+### 4. Use It (Easiest Way)
 
-**Option A: Start server from extension (recommended)**
+Just use the Start/Stop buttons in the extension:
+
 1. Click the extension icon in Chrome
-2. Click "Start Server" button
-3. Wait for status to turn green (server running)
-4. Select any text on a webpage and click the speaker icon
+2. Click **"▶ Start Server"** - wait for "Server running" status
+3. Select any text on any webpage and click the speaker icon to hear it
+4. Click **"⏹ Stop Server"** when done
 
-**Option B: Start server manually**
+**That's it!** No need to run any terminal commands.
+
+---
+
+<details>
+<summary>Manual Server Start (Alternative)</summary>
+
+If you prefer running the server manually from the terminal:
+
 ```bash
 cd backend
 source venv/bin/activate
@@ -77,11 +84,14 @@ python server.py
 
 The server will start at `http://127.0.0.1:8000`
 
-### 5. Adjust Settings
+</details>
 
-- Click the extension icon to access settings
-- Select voice, language, and playback speed
-- Use the "Start Server" / "Stop Server" buttons as needed
+### Settings
+
+Click the extension icon to:
+- Select voice (9 options: Serena, Vivian, Ryan, etc.)
+- Select language (Auto, English, Chinese, Japanese, Korean)
+- Adjust playback speed (0.5x - 3.0x)
 
 ## Auto-Start on Login (macOS)
 
