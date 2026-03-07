@@ -1,25 +1,26 @@
 # Qwen3-TTS MLX Local Server
 
-> 🍎 **Apple Silicon Only** - This project uses MLX, which requires an M1/M2/M3/M4 Mac. Not compatible with Intel Macs, Windows, or Linux.
+> Apple Silicon Only - This project uses MLX, which requires an M1/M2/M3/M4 Mac. Not compatible with Intel Macs, Windows, or Linux.
 
 Fast, local text-to-speech using Qwen3-TTS on Apple Silicon. Runs entirely on your Mac with no cloud API calls.
 
 ## Features
 
-- 🚀 **Fast** - MLX-optimized for Apple Silicon (M1/M2/M3/M4)
-- 🔒 **Private** - All processing happens locally, no cloud API
-- 🗣️ **Multiple Voices** - 9 built-in voices (Serena, Vivian, Ryan, etc.)
-- 🌍 **Multilingual** - Supports English, Chinese, Japanese, Korean, and auto-detect
-- 🎯 **Chrome Extension** - Select text on any page and click to hear it
+- Fast - MLX-optimized for Apple Silicon (M1/M2/M3/M4)
+- Private - All processing happens locally, no cloud API
+- Multiple Voices - 9 built-in voices (Serena, Vivian, Ryan, etc.)
+- Multilingual - Supports English, Chinese, Japanese, Korean, and auto-detect
+- Chrome Extension - Select text on any page and click to hear it
+- Server Control - Start/Stop server directly from the extension popup
 
 ## Requirements
 
-- **Mac with Apple Silicon (M1/M2/M3/M4)** - This project uses MLX, which is optimized for Apple Silicon. It will NOT work on Intel Macs or Windows/Linux.
+- Mac with Apple Silicon (M1/M2/M3/M4) - This project uses MLX, which is optimized for Apple Silicon. It will NOT work on Intel Macs or Windows/Linux.
 - macOS 14.0+ (Sonoma or later)
 - Python 3.12
 - ~4GB disk space for the model
 
-> ⚠️ **Note:** This project uses Apple's MLX framework, which is exclusive to Apple Silicon. If you're on an Intel Mac or another platform, this won't work.
+> Note: This project uses Apple's MLX framework, which is exclusive to Apple Silicon. If you're on an Intel Mac or another platform, this won't work.
 
 ## Quick Start
 
@@ -36,8 +37,38 @@ This will:
 - Install dependencies
 - Download the Qwen3-TTS model (~1.7B parameters, 8-bit quantized)
 
-### 2. Start the Server
+### 2. Install Chrome Extension
 
+1. Open Chrome and go to `chrome://extensions/`
+2. Enable **Developer mode** (toggle in top right)
+3. Click **Load unpacked**
+4. Select the `extension` folder
+
+### 3. Install Native Messaging Host (for Start/Stop Server buttons)
+
+To use the Start/Stop Server buttons in the extension popup, you need to install the native messaging host:
+
+```bash
+cd backend
+./install_native_host.sh
+```
+
+When prompted, enter your Chrome extension ID (found on the `chrome://extensions/` page when Developer mode is enabled).
+
+**To uninstall:**
+```bash
+./uninstall_native_host.sh
+```
+
+### 4. Use It
+
+**Option A: Start server from extension (recommended)**
+1. Click the extension icon in Chrome
+2. Click "Start Server" button
+3. Wait for status to turn green (server running)
+4. Select any text on a webpage and click the speaker icon
+
+**Option B: Start server manually**
 ```bash
 cd backend
 source venv/bin/activate
@@ -46,18 +77,11 @@ python server.py
 
 The server will start at `http://127.0.0.1:8000`
 
-### 3. Install Chrome Extension
+### 5. Adjust Settings
 
-1. Open Chrome and go to `chrome://extensions/`
-2. Enable **Developer mode** (toggle in top right)
-3. Click **Load unpacked**
-4. Select the `extension` folder
-
-### 4. Use It
-
-- Select any text on a webpage
-- Click the speaker icon that appears
-- Adjust voice, speed, and language in the extension popup
+- Click the extension icon to access settings
+- Select voice, language, and playback speed
+- Use the "Start Server" / "Stop Server" buttons as needed
 
 ## Auto-Start on Login (macOS)
 
@@ -113,18 +137,18 @@ Environment variables:
 ## Project Structure
 
 ```
-├── backend/
-│   ├── server.py           # FastAPI server
-│   ├── requirements.txt    # Python dependencies
-│   ├── setup.sh            # Setup script
-│   └── install_launch_agent.sh
-├── extension/
-│   ├── manifest.json       # Chrome extension config
-│   ├── background.js       # Service worker
-│   ├── content.js          # Content script (page interaction)
-│   ├── popup.html/js       # Extension popup
-│   └── *.css               # Styles
-└── README.md
+backend/
+  server.py           # FastAPI server
+  native_host.py      # Native messaging host for extension
+  requirements.txt    # Python dependencies
+  setup.sh            # Setup script
+  install_native_host.sh   # Install native host for Start/Stop buttons
+  install_launch_agent.sh  # Auto-start on login
+extension/
+  manifest.json       # Chrome extension config
+  background.js       # Service worker
+  content.js          # Content script (page interaction)
+  popup.html/js/css   # Extension popup
 ```
 
 ## How It Works
@@ -133,6 +157,11 @@ Environment variables:
 2. **Background script** forwards requests to local server
 3. **Server** uses MLX to run Qwen3-TTS model
 4. **Audio** is generated and played in the browser
+
+For the Start/Stop Server feature:
+1. **Extension** sends command to native messaging host
+2. **Native host** (Python script) starts/stops the server process
+3. **Extension** polls health endpoint to confirm server status
 
 ## Troubleshooting
 
@@ -144,6 +173,12 @@ lsof -i :8000
 # Kill existing process
 kill -9 <PID>
 ```
+
+### Native messaging error
+If you see "Native messaging error" when clicking Start/Stop:
+1. Make sure you ran `./install_native_host.sh`
+2. Make sure you entered the correct extension ID
+3. Reload the extension in `chrome://extensions/`
 
 ### Model fails to download
 - Check internet connection

@@ -17,6 +17,14 @@
     </header>
 
     <section class="card">
+      <div class="server-controls">
+        <button id="startServerBtn" class="server-btn start-btn">▶ Start Server</button>
+        <button id="stopServerBtn" class="server-btn stop-btn" disabled>⏹ Stop Server</button>
+      </div>
+      <div id="serverStatus" class="server-status">Checking…</div>
+    </section>
+
+    <section class="card">
       <label for="voice">Voice</label>
       <select id="voice">
         <option value="" disabled selected>Loading voices…</option>

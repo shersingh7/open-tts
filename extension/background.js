@@ -1,4 +1,5 @@
 const SERVER_URL = "http://127.0.0.1:8000";
+const NATIVE_HOST_NAME = "com.qwen_tts_mlx.native_host";
 
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   if (request.type === "TTS_REQUEST") {
@@ -15,7 +16,79 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     handleHealth(sendResponse);
     return true;
   }
+
+  if (request.type === "START_SERVER") {
+    handleStartServer(sendResponse);
+    return true;
+  }
+
+  if (request.type === "STOP_SERVER") {
+    handleStopServer(sendResponse);
+    return true;
+  }
+
+  if (request.type === "GET_SERVER_STATUS") {
+    handleServerStatus(sendResponse);
+    return true;
+  }
 });
+
+function sendNativeMessage(command) {
+  return new Promise((resolve, reject) => {
+    chrome.runtime.sendNativeMessage(
+      NATIVE_HOST_NAME,
+      { command },
+      (response) => {
+        const err = chrome.runtime.lastError;
+        if (err) {
+          reject(new Error(err.message));
+          return;
+        }
+        resolve(response);
+      }
+    );
+  });
+}
+
+async function handleStartServer(sendResponse) {
+  try {
+    const response = await sendNativeMessage("start");
+    sendResponse({ success: response?.success ?? true, message: response?.message });
+  } catch (error) {
+    console.error("[Qwen TTS Background] Start server error:", error);
+    sendResponse({
+      success: false,
+      error: `Native messaging error: ${error.message}. Make sure the native host is installed (run install_native_host.sh)`,
+    });
+  }
+}
+
+async function handleStopServer(sendResponse) {
+  try {
+    const response = await sendNativeMessage("stop");
+    sendResponse({ success: response?.success ?? true, message: response?.message });
+  } catch (error) {
+    console.error("[Qwen TTS Background] Stop server error:", error);
+    sendResponse({
+      success: false,
+      error: `Native messaging error: ${error.message}. Make sure the native host is installed (run install_native_host.sh)`,
+    });
+  }
+}
+
+async function handleServerStatus(sendResponse) {
+  try {
+    const response = await sendNativeMessage("status");
+    sendResponse({
+      success: true,
+      running: response?.running ?? false,
+      pid: response?.pid,
+    });
+  } catch (error) {
+    console.error("[Qwen TTS Background] Server status error:", error);
+    sendResponse({ success: false, running: false });
+  }
+}
 
 async function fetchJson(path, options = {}) {
   const response = await fetch(`${SERVER_URL}${path}`, options);

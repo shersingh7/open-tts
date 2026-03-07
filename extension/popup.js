@@ -6,6 +6,9 @@ const statusDiv = document.getElementById("status");
 const modelInfo = document.getElementById("modelInfo");
 const previewText = document.getElementById("previewText");
 const previewBtn = document.getElementById("previewBtn");
+const startServerBtn = document.getElementById("startServerBtn");
+const stopServerBtn = document.getElementById("stopServerBtn");
+const serverStatus = document.getElementById("serverStatus");
 
 const DEFAULTS = {
   voice: "ryan",
@@ -19,6 +22,25 @@ let currentPreviewAudio = null;
 function setStatus(connected, text) {
   statusDiv.textContent = text;
   statusDiv.className = `status ${connected ? "connected" : "disconnected"}`;
+}
+
+function setServerUI(state, message) {
+  // Update buttons
+  if (state === "running") {
+    startServerBtn.disabled = true;
+    stopServerBtn.disabled = false;
+  } else if (state === "stopped") {
+    startServerBtn.disabled = false;
+    stopServerBtn.disabled = true;
+  } else {
+    // starting or stopping
+    startServerBtn.disabled = true;
+    stopServerBtn.disabled = true;
+  }
+
+  // Update status text
+  serverStatus.textContent = message;
+  serverStatus.className = `server-status ${state}`;
 }
 
 function storageGet(keys) {
@@ -40,6 +62,60 @@ function runtimeMessage(payload) {
       resolve(response);
     });
   });
+}
+
+async function handleStartServer() {
+  setServerUI("starting", "Starting server...");
+
+  try {
+    const response = await runtimeMessage({ type: "START_SERVER" });
+
+    if (response?.success) {
+      // Wait a bit for the server to fully start
+      await new Promise((r) => setTimeout(r, 2000));
+      // Refresh health and voices
+      await Promise.all([refreshHealth(), loadVoices()]);
+      setServerUI("running", "Server running");
+    } else {
+      setServerUI("error", response?.error || "Failed to start");
+    }
+  } catch (error) {
+    setServerUI("error", `Error: ${error.message}`);
+  }
+}
+
+async function handleStopServer() {
+  setServerUI("starting", "Stopping server...");
+
+  try {
+    const response = await runtimeMessage({ type: "STOP_SERVER" });
+
+    if (response?.success) {
+      setServerUI("stopped", "Server stopped");
+      setStatus(false, "Server stopped");
+      modelInfo.textContent = "Start server to use TTS";
+      voiceSelect.innerHTML = "<option disabled selected>Start server first</option>";
+    } else {
+      setServerUI("error", response?.error || "Failed to stop");
+    }
+  } catch (error) {
+    setServerUI("error", `Error: ${error.message}`);
+  }
+}
+
+async function checkServerStatus() {
+  try {
+    const healthResponse = await runtimeMessage({ type: "GET_HEALTH" });
+    if (healthResponse?.success && healthResponse?.data?.model_loaded) {
+      setServerUI("running", "Server running");
+      return true;
+    }
+  } catch (error) {
+    // Server not reachable
+  }
+
+  setServerUI("stopped", "Server not running");
+  return false;
 }
 
 async function loadSettings() {
@@ -73,6 +149,8 @@ function wireEvents() {
   });
 
   previewBtn.addEventListener("click", handlePreview);
+  startServerBtn.addEventListener("click", handleStartServer);
+  stopServerBtn.addEventListener("click", handleStopServer);
 }
 
 async function loadVoices() {
@@ -141,7 +219,6 @@ async function handlePreview() {
       type: "TTS_REQUEST",
       text,
       voice: voiceSelect.value,
-      // Keep synthesis speed fixed; playbackRate controls exact user speed.
       speed: 1.0,
       language: languageSelect.value,
     });
@@ -168,11 +245,22 @@ async function init() {
   try {
     await loadSettings();
     wireEvents();
-    await Promise.all([refreshHealth(), loadVoices()]);
+
+    // Check server status
+    const serverRunning = await checkServerStatus();
+
+    if (serverRunning) {
+      await Promise.all([refreshHealth(), loadVoices()]);
+    } else {
+      setStatus(false, "Server not running");
+      modelInfo.textContent = "Click 'Start Server' to begin";
+      voiceSelect.innerHTML = "<option disabled selected>Start server first</option>";
+    }
   } catch (error) {
-    setStatus(false, `Disconnected: ${error.message}`);
+    setStatus(false, `Error: ${error.message}`);
     modelInfo.textContent = "Check server at 127.0.0.1:8000";
     voiceSelect.innerHTML = "<option disabled selected>Server unavailable</option>";
+    setServerUI("stopped", "Server not running");
   }
 }
 
