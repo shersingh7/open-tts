@@ -1,9 +1,0 @@
-{
-  "name": "com.qwen_tts_mlx.native_host",
-  "description": "Native Messaging Host for Qwen3-TTS MLX - manages the TTS server",
-  "path": "__PATH__",
-  "type": "stdio",
-  "allowed_origins": [
-    "chrome-extension://__EXTENSION_ID__/"
-  ]
-}

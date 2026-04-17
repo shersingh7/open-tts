@@ -1,16 +1,27 @@
 #!/bin/bash
-# Uninstall the launch agent
+# Uninstall the Open TTS launch agent
 
-PLIST_NAME="com.qwen-tts.server"
+set -e
+
+PLIST_NAME="com.open-tts.server"
 PLIST_PATH="$HOME/Library/LaunchAgents/$PLIST_NAME.plist"
 
-echo "Uninstalling Qwen3-TTS launch agent..."
+echo "Uninstalling Open TTS launch agent..."
 
-# Stop and unload
-launchctl stop "$PLIST_NAME" 2>/dev/null || true
-launchctl unload "$PLIST_PATH" 2>/dev/null || true
+# Also clean up old naming convention (pre-migration)
+OLD_PLIST_NAME="com.qwen-tts.server"
+OLD_PLIST_PATH="$HOME/Library/LaunchAgents/$OLD_PLIST_NAME.plist"
+if [ -f "$OLD_PLIST_PATH" ]; then
+    launchctl unload "$OLD_PLIST_PATH" 2>/dev/null || true
+    rm -f "$OLD_PLIST_PATH"
+    echo "✓ Removed old launch agent ($OLD_PLIST_NAME)"
+fi
 
-# Remove plist
-rm -f "$PLIST_PATH"
+# Stop and unload current
+if [ -f "$PLIST_PATH" ]; then
+    launchctl unload "$PLIST_PATH" 2>/dev/null || true
+    rm -f "$PLIST_PATH"
+    echo "✓ Removed launch agent ($PLIST_NAME)"
+fi
 
 echo "✓ Launch agent uninstalled"

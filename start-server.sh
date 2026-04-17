@@ -1,5 +1,5 @@
 #!/bin/bash
-# Start the Qwen3-TTS MLX server
+# Start the Open TTS server
 
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 cd "$SCRIPT_DIR/backend"
@@ -9,5 +9,5 @@ if [ ! -d "venv" ]; then
     ./setup.sh
 fi
 
-echo "Starting Qwen3-TTS server..."
+echo "Starting Open TTS server..."
 ./venv/bin/python server.py

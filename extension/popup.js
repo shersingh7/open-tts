@@ -63,20 +63,70 @@ function runtimeMessage(payload) {
   });
 }
 
+// Stop any active TTS in all tabs before starting new audio
+async function stopAllTabsTTS() {
+  try {
+    const tabs = await chrome.tabs.query({});
+    for (const tab of tabs) {
+      try {
+        await chrome.tabs.sendMessage(tab.id, { type: "STOP_TTS" });
+      } catch (e) {
+        // Tab might not have content script — ignore
+      }
+    }
+  } catch (e) {}
+}
+
 async function handleStartServer() {
   setServerUI("starting", "Starting server...");
   try {
     const response = await runtimeMessage({ type: "START_SERVER" });
     if (response?.success) {
-      await new Promise((r) => setTimeout(r, 2000));
-      await Promise.all([refreshHealth(), loadModels()]);
-      setServerUI("running", "Server running");
+      // Wait for server to be ready (with retries)
+      let ready = false;
+      for (let i = 0; i < 10; i++) {
+        await new Promise(r => setTimeout(r, 1000));
+        const health = await runtimeMessage({ type: "GET_HEALTH" }).catch(() => null);
+        if (health?.success && health?.data?.model_loaded) {
+          ready = true;
+          break;
+        }
+      }
+      if (ready) {
+        await Promise.all([refreshHealth(), loadModels()]);
+        setServerUI("running", "Server running");
+      } else {
+        setServerUI("running", "Server starting (model loading...)");
+        // Keep checking
+        pollServerReady();
+      }
     } else {
-      setServerUI("error", response?.error || "Failed to start");
+      setServerUI("error", response?.message || "Failed to start");
     }
   } catch (error) {
     setServerUI("error", `Error: ${error.message}`);
   }
+}
+
+function pollServerReady() {
+  let attempts = 0;
+  const maxAttempts = 20;
+  const interval = setInterval(async () => {
+    attempts++;
+    if (attempts > maxAttempts) {
+      clearInterval(interval);
+      setServerUI("error", "Server failed to start");
+      return;
+    }
+    try {
+      const health = await runtimeMessage({ type: "GET_HEALTH" });
+      if (health?.success && health?.data?.model_loaded) {
+        clearInterval(interval);
+        await Promise.all([refreshHealth(), loadModels()]);
+        setServerUI("running", "Server running");
+      }
+    } catch (e) {}
+  }, 1500);
 }
 
 async function handleStopServer() {
@@ -90,7 +140,7 @@ async function handleStopServer() {
       voiceSelect.innerHTML = "<option disabled selected>Start server first</option>";
       modelSelect.innerHTML = "<option disabled selected>Start server first</option>";
     } else {
-      setServerUI("error", response?.error || "Failed to stop");
+      setServerUI("error", response?.message || "Failed to stop");
     }
   } catch (error) {
     setServerUI("error", `Error: ${error.message}`);
@@ -100,13 +150,20 @@ async function handleStopServer() {
 async function checkServerStatus() {
   try {
     const healthResponse = await runtimeMessage({ type: "GET_HEALTH" });
-    if (healthResponse?.success && healthResponse?.data?.model_loaded) {
-      setServerUI("running", "Server running");
-      return true;
+    if (healthResponse?.success) {
+      if (healthResponse?.data?.model_loaded) {
+        setServerUI("running", "Server running");
+        return true;
+      } else if (healthResponse?.data?.load_error) {
+        setServerUI("error", "Model load failed — try reloading");
+        return false;
+      }
+      // Server up but model not loaded yet
+      setServerUI("starting", "Server starting (model loading...)");
+      pollServerReady();
+      return false;
     }
-  } catch (error) {
-    // Server not reachable
-  }
+  } catch (error) {}
   setServerUI("stopped", "Server not running");
   return false;
 }
@@ -147,16 +204,12 @@ function wireEvents() {
     currentModelId = selectedModel;
     await storageSet({ model: selectedModel });
 
-    // Switch model on server
     setServerUI("starting", `Switching to ${modelSelect.options[modelSelect.selectedIndex].text}...`);
     try {
       const response = await runtimeMessage({ type: "LOAD_MODEL", modelId: selectedModel });
       if (response?.success) {
-        // Reload voices for new model
         await loadVoices(selectedModel);
         setServerUI("running", "Server running");
-
-        // Update language dropdown visibility based on model
         updateLanguageVisibility(selectedModel);
       } else {
         setServerUI("error", response?.error || "Failed to switch model");
@@ -172,9 +225,6 @@ function wireEvents() {
 }
 
 function updateLanguageVisibility(modelId) {
-  // Fish S2 Pro doesn't use lang_code — hide language selector
-  // We'll disable it rather than hide for cleaner UX
-  const langSection = languageSelect.closest("label");
   if (modelId === "fish-s2-pro") {
     languageSelect.disabled = true;
     languageSelect.value = "Auto";
@@ -202,130 +252,120 @@ async function loadModels() {
     modelSelect.appendChild(option);
   });
 
-  if (!modelSelect.value && data.models.length > 0) {
-    // Auto-select the active model
-    const active = data.models.find((m) => m.active);
-    modelSelect.value = active ? active.id : data.models[0].id;
+  // Load voices for the active (or preferred) model
+  const activeModel = data.models.find((m) => m.active) || data.models.find((m) => m.id === preferred);
+  if (activeModel) {
+    await loadVoices(activeModel.id);
+    updateLanguageVisibility(activeModel.id);
+    currentModelId = activeModel.id;
   }
-
-  currentModelId = modelSelect.value;
-  await storageSet({ model: modelSelect.value });
-
-  // Load voices for the selected model
-  await loadVoices(modelSelect.value);
-  updateLanguageVisibility(modelSelect.value);
 }
 
 async function loadVoices(modelId) {
-  const response = await runtimeMessage({ type: "GET_VOICES", modelId });
-  if (!response?.success) {
-    throw new Error(response?.error || "Unable to load voices");
-  }
+  // Use voices from the models endpoint (already included)
+  const modelsResponse = await runtimeMessage({ type: "GET_MODELS" });
+  const modelData = modelsResponse?.data?.models?.find((m) => m.id === modelId);
 
-  const data = response.data;
   const saved = await storageGet(["voice"]);
-  const preferred = (saved.voice || DEFAULTS.voice || "").toLowerCase();
+  const preferredVoice = saved.voice || DEFAULTS.voice;
 
   voiceSelect.innerHTML = "";
-  data.voices.forEach((voice) => {
-    const option = document.createElement("option");
-    option.value = voice.id;
-    option.textContent = voice.name;
-    if (voice.id.toLowerCase() === preferred) option.selected = true;
-    voiceSelect.appendChild(option);
-  });
 
-  if (!voiceSelect.value && data.voices.length > 0) {
-    voiceSelect.value = data.voices[0].id;
+  if (modelData?.voices?.length) {
+    modelData.voices.forEach((v) => {
+      const option = document.createElement("option");
+      option.value = v.id;
+      option.textContent = v.name;
+      if (v.id === preferredVoice) option.selected = true;
+      voiceSelect.appendChild(option);
+    });
+  } else {
+    voiceSelect.innerHTML = "<option disabled selected>No voices available</option>";
   }
-
-  await storageSet({ voice: voiceSelect.value });
 }
 
 async function refreshHealth() {
-  const response = await runtimeMessage({ type: "GET_HEALTH" });
-  if (!response?.success) {
-    throw new Error(response?.error || "Health check failed");
+  try {
+    const response = await runtimeMessage({ type: "GET_HEALTH" });
+    if (response?.success && response?.data?.model_loaded) {
+      const model = response.data.model || DEFAULTS.model;
+      const reg = { "qwen3-tts": "Qwen3-TTS 1.7B", "fish-s2-pro": "Fish Audio S2 Pro" };
+      setStatus(true, `Connected — ${reg[model] || model}`);
+      modelInfo.textContent = `Model: ${reg[model] || model}`;
+    } else if (response?.success) {
+      setStatus(false, "Server up, model not loaded");
+      modelInfo.textContent = response.data?.load_error || "Model not loaded";
+    } else {
+      setStatus(false, "Server unreachable");
+      modelInfo.textContent = "—";
+    }
+  } catch (e) {
+    setStatus(false, "Server unreachable");
+    modelInfo.textContent = "—";
   }
-
-  const health = response.data;
-  if (!health.model_loaded) {
-    setStatus(false, "Server up, model failed to load");
-    modelInfo.textContent = health.load_error || health.model || "Model load failed";
-    return;
-  }
-
-  setStatus(true, "Connected to local TTS server");
-  modelInfo.textContent = `Model: ${health.model}`;
-  currentModelId = health.model;
 }
 
 async function handlePreview() {
-  const text = previewText.value.trim();
-  if (!text) {
-    setStatus(false, "Preview text is empty");
-    return;
+  // Stop any active TTS first
+  await stopAllTabsTTS();
+
+  if (currentPreviewAudio) {
+    currentPreviewAudio.pause();
+    currentPreviewAudio.src = "";
+    currentPreviewAudio = null;
   }
 
+  const text = previewText.value.trim();
+  if (!text) return;
+
   previewBtn.disabled = true;
-  previewBtn.textContent = "⏳ Generating…";
+  previewBtn.textContent = "Generating…";
 
   try {
-    if (currentPreviewAudio) {
-      currentPreviewAudio.pause();
-      currentPreviewAudio = null;
-    }
-
-    const playbackRate = Number(speedInput.value) || 1.0;
-
+    const settings = await storageGet(["voice", "speed", "language", "model"]);
     const response = await runtimeMessage({
       type: "TTS_REQUEST",
       text,
-      voice: voiceSelect.value,
-      speed: 1.0,
-      language: languageSelect.value,
-      model: modelSelect.value,
+      voice: settings.voice || DEFAULTS.voice,
+      speed: Number(settings.speed) || DEFAULTS.speed,
+      language: settings.language || DEFAULTS.language,
+      model: settings.model || DEFAULTS.model,
     });
 
-    if (!response?.success) {
-      throw new Error(response?.error || "Preview failed");
+    if (response?.success) {
+      const dataUrl = response.audioData;
+      currentPreviewAudio = new Audio(dataUrl);
+      currentPreviewAudio.playbackRate = Number(settings.speed) || 1.0;
+      currentPreviewAudio.preservesPitch = true;
+      currentPreviewAudio.onended = () => {
+        previewBtn.disabled = false;
+        previewBtn.textContent = "▶ Play preview";
+      };
+      currentPreviewAudio.onerror = () => {
+        previewBtn.disabled = false;
+        previewBtn.textContent = "▶ Play preview";
+      };
+      await currentPreviewAudio.play();
+    } else {
+      previewBtn.disabled = false;
+      previewBtn.textContent = "▶ Play preview";
+      setStatus(false, response?.error || "TTS failed");
     }
-
-    currentPreviewAudio = new Audio(response.audioData);
-    currentPreviewAudio.playbackRate = playbackRate;
-    await currentPreviewAudio.play();
-
-    setStatus(true, "Preview playing");
-    currentPreviewAudio.onended = () => setStatus(true, "Connected to local TTS server");
   } catch (error) {
-    setStatus(false, `Preview failed: ${error.message}`);
-  } finally {
     previewBtn.disabled = false;
     previewBtn.textContent = "▶ Play preview";
+    setStatus(false, `Error: ${error.message}`);
   }
 }
 
+// Initialization
 async function init() {
-  try {
-    await loadSettings();
-    wireEvents();
-
-    const serverRunning = await checkServerStatus();
-
-    if (serverRunning) {
-      await Promise.all([refreshHealth(), loadModels()]);
-    } else {
-      setStatus(false, "Server not running");
-      modelInfo.textContent = "Click 'Start Server' to begin";
-      voiceSelect.innerHTML = "<option disabled selected>Start server first</option>";
-      modelSelect.innerHTML = "<option disabled selected>Start server first</option>";
-    }
-  } catch (error) {
-    setStatus(false, `Error: ${error.message}`);
-    modelInfo.textContent = "Check server at 127.0.0.1:8000";
-    voiceSelect.innerHTML = "<option disabled selected>Server unavailable</option>";
-    modelSelect.innerHTML = "<option disabled selected>Server unavailable</option>";
-    setServerUI("stopped", "Server not running");
+  await loadSettings();
+  wireEvents();
+  const isUp = await checkServerStatus();
+  if (isUp) {
+    await loadModels();
+    await refreshHealth();
   }
 }
 

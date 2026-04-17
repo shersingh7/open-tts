@@ -5,24 +5,28 @@ let speakRunId = 0;
 let isSpeaking = false;
 let isPaused = false;
 
+// Web Audio API for gapless streaming playback
+let audioContext = null;
+let nextPlayTime = 0;
+let activeSourceCount = 0;
+let isStreamActive = false;
+let activeAudioQueue = null;
+let currentPlaybackRate = 1.0;
+let activeSources = new Set(); // Track AudioBufferSourceNodes for clean stop
+
 const MAX_SELECTION_CHARS = 200000;
-// Optimal chunk size for M2 Pro: ~500 chars = ~8-10 seconds of audio
-const CHUNK_TARGET_CHARS = 500;
-// Number of chunks to pre-generate ahead while playing
-const PREFETCH_COUNT = 2;
-// Minimum chunks ready before playback starts
-const MIN_BUFFER_BEFORE_PLAY = 2;
+const CHUNK_TARGET_CHARS = 2000;
+
+// ---------------------------------------------------------------------------
+// Widget
+// ---------------------------------------------------------------------------
 
 function removeLegacyWidget() {
-  document.querySelectorAll("#qwen-tts-icon-container").forEach((node) => node.remove());
+  document.querySelectorAll("#qwen-tts-icon-container").forEach(n => n.remove());
 }
-
 removeLegacyWidget();
-const legacyObserver = new MutationObserver(() => removeLegacyWidget());
-legacyObserver.observe(document.documentElement || document.body, {
-  childList: true,
-  subtree: true,
-});
+new MutationObserver(() => removeLegacyWidget())
+  .observe(document.documentElement || document.body, { childList: true, subtree: true });
 
 function createWidget() {
   const container = document.createElement("div");
@@ -49,72 +53,85 @@ function createWidget() {
 
   container.appendChild(button);
   container.appendChild(label);
-
   button.addEventListener("click", onSpeakClick);
-
   document.body.appendChild(container);
   widget = container;
   return container;
 }
 
 function setLabel(text) {
-  if (!widget) return;
-  const label = widget.querySelector("#qwen-tts-label");
+  const label = widget?.querySelector("#qwen-tts-label");
   if (label) label.textContent = text;
 }
 
 function showWidgetAtSelection(text) {
   selectedText = text;
-
   if (!widget) createWidget();
-
-  const selection = window.getSelection();
-  if (!selection || selection.rangeCount === 0) return;
-
-  const rect = selection.getRangeAt(0).getBoundingClientRect();
-  const top = window.scrollY + rect.top - 44;
-  const left = window.scrollX + rect.left + rect.width / 2 - 48;
-
-  const maxLeft = window.scrollX + document.documentElement.clientWidth - 100;
-  const safeTop = Math.max(window.scrollY + 8, top);
-  const safeLeft = Math.max(window.scrollX + 8, Math.min(left, maxLeft));
-
-  widget.style.top = `${safeTop}px`;
-  widget.style.left = `${safeLeft}px`;
+  const sel = window.getSelection();
+  if (!sel || sel.rangeCount === 0) return;
+  const rect = sel.getRangeAt(0).getBoundingClientRect();
+  const top = Math.max(window.scrollY + 8, window.scrollY + rect.top - 44);
+  const left = Math.max(window.scrollX + 8, Math.min(
+    window.scrollX + rect.left + rect.width / 2 - 48,
+    window.scrollX + document.documentElement.clientWidth - 100
+  ));
+  widget.style.top = `${top}px`;
+  widget.style.left = `${left}px`;
   widget.classList.add("visible");
 }
 
-function hideWidget() {
-  if (widget) widget.classList.remove("visible");
-}
+function hideWidget() { widget?.classList.remove("visible"); }
 
-function setBusy(busy, labelText = null) {
+function setBusy(busy, labelText) {
   if (!widget) return;
   widget.classList.toggle("busy", busy);
-  if (labelText) {
-    setLabel(labelText);
-  } else {
-    setLabel(busy ? "Generating…" : "Speak");
-  }
+  setLabel(labelText || (busy ? "Generating…" : "Speak"));
 }
 
 function flashError(message) {
   if (!widget) return;
   setLabel(message);
   widget.classList.add("error");
-  setTimeout(() => {
-    widget.classList.remove("error");
-    setLabel("Speak");
-  }, 3000);
+  setTimeout(() => { widget?.classList.remove("error"); setLabel("Speak"); }, 3000);
 }
 
-function stopAudio() {
+// ---------------------------------------------------------------------------
+// Audio cleanup — reuse AudioContext, just stop sources
+// ---------------------------------------------------------------------------
+
+function stopStreamPlayback() {
+  // Stop all active AudioBufferSourceNodes without closing the AudioContext
+  for (const source of activeSources) {
+    try { source.stop(); } catch(e) {}
+    try { source.disconnect(); } catch(e) {}
+  }
+  activeSources.clear();
+  activeSourceCount = 0;
+  nextPlayTime = 0;
+  isStreamActive = false;
+}
+
+function closeAudioContext() {
+  if (audioContext && audioContext.state !== "closed") {
+    audioContext.close().catch(() => {});
+    audioContext = null;
+  }
+}
+
+function stopAllAudio() {
   if (currentAudio) {
     currentAudio.pause();
+    if (currentAudio._objectUrl) URL.revokeObjectURL(currentAudio._objectUrl);
     currentAudio.src = "";
     currentAudio = null;
   }
+  stopStreamPlayback();
+  closeAudioContext(); // Full stop — close context
 }
+
+// ---------------------------------------------------------------------------
+// Text splitting — paragraph-aware, 2000-char target
+// ---------------------------------------------------------------------------
 
 function normalizeText(text) {
   return (text || "")
@@ -129,182 +146,373 @@ function splitTextForTTS(text, maxChars = CHUNK_TARGET_CHARS) {
   if (cleaned.length <= maxChars) return [cleaned];
 
   const out = [];
-  const sentences = cleaned.split(/(?<=[.!?])\s+/);
+  const flush = (chunk) => { if (chunk.trim()) out.push(chunk.trim()); };
+
+  const paragraphs = cleaned.split(/\n\n+/);
   let current = "";
 
-  const pushCurrent = () => {
-    const trimmed = current.trim();
-    if (trimmed) out.push(trimmed);
-    current = "";
-  };
+  for (const para of paragraphs) {
+    if (!para.trim()) continue;
+    const candidate = current ? `${current}\n\n${para}` : para;
 
-  for (const sentence of sentences) {
-    if (!sentence) continue;
+    if (candidate.length > maxChars && current) flush(current), current = "";
 
-    if (sentence.length > maxChars) {
-      if (current) pushCurrent();
-      const words = sentence.split(" ");
-      let longChunk = "";
-      for (const word of words) {
-        const candidate = longChunk ? `${longChunk} ${word}` : word;
-        if (candidate.length > maxChars && longChunk) {
-          out.push(longChunk.trim());
-          longChunk = word;
-        } else {
-          longChunk = candidate;
+    if (para.length > maxChars) {
+      if (current) flush(current), current = "";
+      const sentences = para.split(/(?<=[.!?])\s+/);
+      let sChunk = "";
+      for (const s of sentences) {
+        if (!s) continue;
+        if (s.length > maxChars) {
+          if (sChunk) flush(sChunk), sChunk = "";
+          const words = s.split(" ");
+          let wChunk = "";
+          for (const w of words) {
+            const next = wChunk ? `${wChunk} ${w}` : w;
+            if (next.length > maxChars && wChunk) flush(wChunk), wChunk = w;
+            else wChunk = next;
+          }
+          if (wChunk) flush(wChunk);
+          continue;
         }
+        const next = sChunk ? `${sChunk} ${s}` : s;
+        if (next.length > maxChars) flush(sChunk), sChunk = s;
+        else sChunk = next;
       }
-      if (longChunk.trim()) out.push(longChunk.trim());
-      continue;
-    }
-
-    const candidate = current ? `${current} ${sentence}` : sentence;
-    if (candidate.length > maxChars) {
-      pushCurrent();
-      current = sentence;
+      if (sChunk) flush(sChunk);
     } else {
       current = candidate;
+      if (current.length > maxChars) flush(current), current = "";
     }
   }
-
-  if (current) pushCurrent();
+  if (current) flush(current);
   return out;
 }
 
-/**
- * AudioBuffer: Manages audio chunks with HTMLAudioElement for pitch-preserving playback
- */
+// ---------------------------------------------------------------------------
+// Base64 → Object URL (only for non-streaming path in DOM context)
+// ---------------------------------------------------------------------------
+
+function base64ToObjectUrl(base64, mimeType = "audio/wav") {
+  const binaryStr = atob(base64);
+  const bytes = new Uint8Array(binaryStr.length);
+  for (let i = 0; i < binaryStr.length; i++) {
+    bytes[i] = binaryStr.charCodeAt(i);
+  }
+  const blob = new Blob([bytes], { type: mimeType });
+  return URL.createObjectURL(blob);
+}
+
+// Base64 → ArrayBuffer (for direct AudioContext decode — streaming path)
+function base64ToArrayBuffer(base64) {
+  const binaryStr = atob(base64);
+  const bytes = new Uint8Array(binaryStr.length);
+  for (let i = 0; i < binaryStr.length; i++) {
+    bytes[i] = binaryStr.charCodeAt(i);
+  }
+  return bytes.buffer;
+}
+
+// ---------------------------------------------------------------------------
+// AudioBufferQueue — per-chunk lifecycle manager
+// ---------------------------------------------------------------------------
+
 class AudioBufferQueue {
   constructor() {
-    this.audioBuffers = new Map(); // chunkIndex -> audioData URL
-    this.pendingRequests = new Map(); // chunkIndex -> Promise
+    this.buffers = new Map();
+    this.pending = new Map();
     this.isStopped = false;
+    this.completedCount = 0;
+    this.totalChunks = 0;
+    this.objectUrls = []; // Track all Object URLs for cleanup
   }
 
-  // Check if a chunk is ready for playback
-  isReady(chunkIndex) {
-    return this.audioBuffers.has(chunkIndex);
-  }
+  isReady(idx) { const b = this.buffers.get(idx); return b?.complete; }
 
-  // Check if a chunk is currently being generated
-  isPending(chunkIndex) {
-    return this.pendingRequests.has(chunkIndex);
-  }
-
-  // Get audio data for a chunk (must be ready)
-  getAudioData(chunkIndex) {
-    return this.audioBuffers.get(chunkIndex);
-  }
-
-  // Start generating a chunk (returns promise that resolves when ready)
-  async generateChunk(chunkIndex, text, settings) {
-    // Already ready
-    if (this.audioBuffers.has(chunkIndex)) {
-      return this.audioBuffers.get(chunkIndex);
+  addStreamChunk(idx, objectUrl) {
+    if (this.isStopped) return;
+    if (!this.buffers.has(idx))
+      this.buffers.set(idx, { objectUrls: [], complete: false });
+    if (objectUrl) {
+      this.buffers.get(idx).objectUrls.push(objectUrl);
+      this.objectUrls.push(objectUrl);
     }
+  }
 
-    // Already being generated
-    if (this.pendingRequests.has(chunkIndex)) {
-      return this.pendingRequests.get(chunkIndex);
+  markChunkComplete(idx) {
+    if (this.isStopped) return;
+    if (!this.buffers.has(idx))
+      this.buffers.set(idx, { objectUrls: [], complete: true });
+    const b = this.buffers.get(idx);
+    if (!b.complete) {
+      b.complete = true;
+      this.completedCount++;
     }
+    const p = this.pending.get(idx);
+    if (p) { this.pending.delete(idx); p.resolve(b); }
+  }
 
-    // Start new generation
-    const promise = (async () => {
-      try {
-        console.log(`[Qwen TTS] Generating chunk ${chunkIndex}, voice: ${settings.voice || "ryan"}`);
-        const audioData = await requestChunkAudio(text, settings);
-        if (this.isStopped) return null;
+  setChunkData(idx, audioData, isObjectUrl) {
+    if (this.isStopped) return;
+    this.buffers.set(idx, { audioData, isObjectUrl, objectUrls: [], complete: true });
+    this.completedCount++;
+    if (isObjectUrl) this.objectUrls.push(audioData);
+    const p = this.pending.get(idx);
+    if (p) { this.pending.delete(idx); p.resolve(this.buffers.get(idx)); }
+  }
 
-        this.audioBuffers.set(chunkIndex, audioData);
-        return audioData;
-      } catch (error) {
-        console.error(`[Qwen TTS] Error generating chunk ${chunkIndex}:`, error);
-        throw error;
-      } finally {
-        this.pendingRequests.delete(chunkIndex);
-      }
-    })();
-
-    this.pendingRequests.set(chunkIndex, promise);
+  waitForChunk(idx) {
+    const b = this.buffers.get(idx);
+    if (b?.complete) return Promise.resolve(b);
+    // If there's already a pending promise for this chunk, just return it
+    if (this.pending.has(idx)) return this.pending.get(idx).promise;
+    // Create a new pending entry
+    let resolve, reject;
+    const promise = new Promise((res, rej) => { resolve = res; reject = rej; });
+    this.pending.set(idx, { promise, resolve, reject });
     return promise;
   }
 
-  // Clean up old buffers to free memory
-  cleanup(keepFromIndex) {
-    for (const [idx] of this.audioBuffers) {
-      if (idx < keepFromIndex) {
-        this.audioBuffers.delete(idx);
+  waitForAll() {
+    if (this.completedCount >= this.totalChunks) return Promise.resolve();
+    return new Promise((resolve) => {
+      const check = setInterval(() => {
+        if (this.isStopped || this.completedCount >= this.totalChunks) {
+          clearInterval(check);
+          resolve();
+        }
+      }, 200);
+    });
+  }
+
+  getChunk(idx) { return this.buffers.get(idx); }
+
+  cleanup(fromIdx) {
+    for (const [idx, b] of this.buffers) {
+      if (idx < fromIdx) {
+        this.buffers.delete(idx);
       }
     }
+  }
+
+  revokeAllUrls() {
+    for (const url of this.objectUrls) {
+      try { URL.revokeObjectURL(url); } catch (e) {}
+    }
+    this.objectUrls = [];
   }
 
   stop() {
     this.isStopped = true;
-    this.pendingRequests.clear();
-    this.audioBuffers.clear();
+    this.revokeAllUrls();
+    for (const [idx, p] of this.pending) { if (p) p.reject(new Error("stopped")); }
+    this.buffers.clear();
+    this.pending.clear();
   }
 }
 
-async function requestChunkAudio(text, settings) {
-  console.log("[Open TTS] Requesting audio:", {
-    model: settings.model || "qwen3-tts",
-    voice: settings.voice || "ryan",
-    textLength: text.length,
-  });
+// ---------------------------------------------------------------------------
+// Audio request helpers
+// ---------------------------------------------------------------------------
 
+async function requestChunkAudio(text, settings) {
   const response = await chrome.runtime.sendMessage({
     type: "TTS_REQUEST",
     text,
     voice: settings.voice || "ryan",
-    speed: 1.0,
+    speed: settings.speed || 1.0,  // FIX: was hardcoded 1.0
     language: settings.language || "Auto",
     model: settings.model || "qwen3-tts",
   });
-
   if (!response?.success) {
-    const errorMsg = response?.error || "Unknown TTS error";
-    if (response?.serverDown) {
-      throw new Error("Server not running. Run: cd ~/github/qwen-tts-mlx/backend && ./venv/bin/python server.py");
-    }
-    throw new Error(errorMsg);
+    if (response?.serverDown) throw new Error("Server not running. Start it from the extension popup.");
+    throw new Error(response?.error || "Unknown TTS error");
   }
-
-  return response.audioData;
+  // background.js returns base64 data URL — convert to Object URL in DOM
+  const dataUrl = response.audioData;
+  if (dataUrl && dataUrl.startsWith("data:")) {
+    const mimeMatch = dataUrl.match(/^data:([^;]+);/);
+    const mime = mimeMatch ? mimeMatch[1] : "audio/ogg";
+    const base64 = dataUrl.split(",")[1];
+    const objectUrl = base64ToObjectUrl(base64, mime);
+    return { audioData: objectUrl, isObjectUrl: true };
+  }
+  return { audioData: dataUrl, isObjectUrl: false };
 }
 
-// Play audio using HTMLAudioElement (preserves pitch when changing speed)
-function playAudioData(audioData, runId, playbackRate) {
+function requestStreamAudio(text, settings, chunkIndex) {
+  chrome.runtime.sendMessage({
+    type: "TTS_STREAM_REQUEST",
+    text,
+    voice: settings.voice || "ryan",
+    speed: settings.speed || 1.0,  // FIX: was hardcoded 1.0
+    language: settings.language || "Auto",
+    model: settings.model || "qwen3-tts",
+    chunkIndex,
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Web Audio API gapless scheduling — reuse AudioContext
+// ---------------------------------------------------------------------------
+
+function getAudioContext() {
+  if (!audioContext || audioContext.state === "closed")
+    audioContext = new (window.AudioContext || window.webkitAudioContext)();
+  return audioContext;
+}
+
+// Schedule a pre-decoded AudioBuffer directly (no Object URL needed)
+function scheduleAudioBuffer(audioBuffer) {
+  const ctx = getAudioContext();
+
+  const source = ctx.createBufferSource();
+  source.buffer = audioBuffer;
+  source.playbackRate.value = Math.max(0.5, Math.min(3.0, currentPlaybackRate));
+  source.connect(ctx.destination);
+
+  const now = ctx.currentTime;
+  if (nextPlayTime < now) nextPlayTime = now + 0.02;
+  source.start(nextPlayTime);
+  nextPlayTime += audioBuffer.duration / currentPlaybackRate;
+
+  activeSourceCount++;
+  activeSources.add(source);
+  source.onended = () => {
+    activeSourceCount--;
+    activeSources.delete(source);
+  };
+
+  return audioBuffer.duration;
+}
+
+// Schedule via Object URL fetch + decode (only used for non-streaming path)
+async function scheduleAudioUrl(audioUrl) {
+  const ctx = getAudioContext();
+  if (ctx.state === "suspended") await ctx.resume();
+
+  try {
+    const resp = await fetch(audioUrl);
+    const arrBuf = await resp.arrayBuffer();
+    const decoded = await ctx.decodeAudioData(arrBuf);
+    return scheduleAudioBuffer(decoded);
+  } catch (e) {
+    console.error("[Open TTS] scheduleAudioUrl error:", e);
+    return 0;
+  }
+}
+
+function waitForAllAudioToFinish() {
+  return new Promise((resolve) => {
+    const check = setInterval(() => {
+      if (activeSourceCount <= 0) {
+        clearInterval(check);
+        resolve();
+      }
+    }, 200);
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Stream chunk messages from background.js — direct decode (no Object URL)
+// ---------------------------------------------------------------------------
+
+chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  if (message.type === "STOP_TTS") {
+    stopAllAudio();
+    if (activeAudioQueue) { activeAudioQueue.stop(); activeAudioQueue = null; }
+    isSpeaking = false;
+    isPaused = false;
+    speakRunId++;
+    isStreamActive = false;
+    widget?.classList.remove("paused");
+    setLabel("Speak");
+    if (sendResponse) sendResponse({ stopped: true });
+    return;
+  }
+
+  if (!activeAudioQueue || !isStreamActive) return;
+
+  if (message.type === "TTS_STREAM_CHUNK") {
+    const { chunkIndex, audioBase64, audioMimeType } = message;
+
+    // Direct decode: base64 → ArrayBuffer → AudioContext.decodeAudioData → schedule
+    // Works for both WAV (streaming) and opus/mp3 (non-streaming fallback)
+    (async () => {
+      try {
+        const ctx = getAudioContext();
+        if (ctx.state === "suspended") await ctx.resume();
+
+        const arrBuf = base64ToArrayBuffer(audioBase64);
+        const audioBuffer = await ctx.decodeAudioData(arrBuf);
+        const dur = scheduleAudioBuffer(audioBuffer);
+        if (dur > 0) console.log(`[Open TTS] Scheduled sub-chunk: ${dur.toFixed(1)}s (chunk ${chunkIndex}${audioMimeType ? `, ${audioMimeType}` : ''})`);
+      } catch (e) {
+        console.error("[Open TTS] Stream decode error:", e);
+      }
+    })();
+
+    // Track in queue (no Object URL needed — we decoded directly)
+    activeAudioQueue.addStreamChunk(chunkIndex, null);
+  }
+
+  if (message.type === "TTS_STREAM_DONE") {
+    const { chunkIndex } = message;
+    console.log(`[Open TTS] Stream complete for chunk ${chunkIndex}`);
+    activeAudioQueue.markChunkComplete(chunkIndex);
+  }
+
+  if (message.type === "TTS_STREAM_ERROR") {
+    const { chunkIndex, error } = message;
+    console.error(`[Open TTS] Stream error chunk ${chunkIndex}:`, error);
+    const p = activeAudioQueue.pending.get(chunkIndex);
+    if (p) { activeAudioQueue.pending.delete(chunkIndex); p.reject(new Error(error)); }
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Mouse events
+// ---------------------------------------------------------------------------
+
+document.addEventListener("mouseup", () => {
+  const text = window.getSelection()?.toString().trim();
+  if (text) showWidgetAtSelection(text.slice(0, MAX_SELECTION_CHARS));
+  else setTimeout(() => { if (!window.getSelection()?.toString().trim()) hideWidget(); }, 80);
+});
+
+document.addEventListener("mousedown", (e) => {
+  if (widget && !widget.contains(e.target)) hideWidget();
+});
+
+// ---------------------------------------------------------------------------
+// Play HTMLAudioElement (non-streaming, single chunk)
+// ---------------------------------------------------------------------------
+
+function playAudioObjectUrl(audioData, runId, playbackRate) {
   return new Promise((resolve, reject) => {
     if (runId !== speakRunId) return resolve();
-    stopAudio();
+
+    // Only stop HTMLAudioElement, NOT stream playback / audioContext
+    if (currentAudio) {
+      currentAudio.pause();
+      if (currentAudio._objectUrl) URL.revokeObjectURL(currentAudio._objectUrl);
+      currentAudio.src = "";
+      currentAudio = null;
+    }
 
     currentAudio = new Audio(audioData);
-    // HTMLAudioElement playbackRate preserves pitch (unlike Web Audio API)
+    currentAudio._objectUrl = audioData.startsWith("blob:") ? audioData : null;
     currentAudio.playbackRate = Math.max(0.5, Math.min(3.0, playbackRate));
     currentAudio.preservesPitch = true;
-
-    currentAudio.onended = () => resolve();
-    currentAudio.onerror = (e) => reject(new Error(`Audio playback failed: ${e.message || "unknown error"}`));
-
+    currentAudio.onended = resolve;
+    currentAudio.onerror = () => reject(new Error("Audio playback failed"));
     currentAudio.play().catch(reject);
   });
 }
 
-document.addEventListener("mouseup", () => {
-  const text = window.getSelection()?.toString().trim();
-  if (text) {
-    showWidgetAtSelection(text.slice(0, MAX_SELECTION_CHARS));
-  } else {
-    setTimeout(() => {
-      if (!window.getSelection()?.toString().trim()) hideWidget();
-    }, 80);
-  }
-});
-
-document.addEventListener("mousedown", (event) => {
-  if (!widget) return;
-  if (!widget.contains(event.target)) hideWidget();
-});
+// ---------------------------------------------------------------------------
+// Main speak handler
+// ---------------------------------------------------------------------------
 
 async function onSpeakClick(event) {
   event.preventDefault();
@@ -313,7 +521,7 @@ async function onSpeakClick(event) {
   const text = selectedText?.trim();
   if (!text) return;
 
-  // Handle pause/resume for existing playback
+  // Pause / resume (HTMLAudioElement only — streaming can't pause mid-buffer)
   if (isSpeaking) {
     if (currentAudio && !currentAudio.paused && !isPaused) {
       currentAudio.pause();
@@ -322,7 +530,6 @@ async function onSpeakClick(event) {
       setBusy(true, "Paused · tap to resume");
       return;
     }
-
     if (currentAudio && isPaused) {
       await currentAudio.play();
       isPaused = false;
@@ -330,13 +537,13 @@ async function onSpeakClick(event) {
       setBusy(true, "Reading… tap to pause");
       return;
     }
-
-    // If generation is running but no active audio yet, stop the run.
-    speakRunId += 1;
+    // Stop everything
+    speakRunId++;
     isSpeaking = false;
     isPaused = false;
     widget?.classList.remove("paused");
-    stopAudio();
+    stopAllAudio();
+    if (activeAudioQueue) { activeAudioQueue.stop(); activeAudioQueue = null; }
     setBusy(false, "Stopped");
     return;
   }
@@ -344,110 +551,108 @@ async function onSpeakClick(event) {
   const runId = ++speakRunId;
   isSpeaking = true;
   isPaused = false;
+  isStreamActive = false;
   widget?.classList.remove("paused");
+  nextPlayTime = 0;
+  activeSourceCount = 0;
+  activeSources.clear();
 
-  let audioQueue = null;
+  // Eagerly resume AudioContext on user gesture (before any network requests)
+  const ctx = getAudioContext();
+  if (ctx.state === "suspended") await ctx.resume();
+
+  const queue = new AudioBufferQueue();
+  activeAudioQueue = queue;
 
   try {
     setBusy(true, "Preparing…");
-
+    // Pre-warm server connection while we prepare chunks
+    const serverReady = chrome.runtime.sendMessage({ type: "ENSURE_SERVER" }).catch(() => null);
     const settings = await chrome.storage.sync.get(["voice", "speed", "language", "model"]);
     const playbackRate = Number(settings.speed) || 1.0;
-
-    console.log("[Qwen TTS] Settings from storage:", settings);
-    console.log("[Qwen TTS] Using voice:", settings.voice || "ryan", "speed:", playbackRate);
+    currentPlaybackRate = playbackRate;
 
     const chunks = splitTextForTTS(text, CHUNK_TARGET_CHARS);
-
     if (!chunks.length) throw new Error("Nothing to read");
 
-    console.log(`[Qwen TTS] Split into ${chunks.length} chunks`);
+    // Ensure server is ready before we start requesting audio
+    await serverReady;
 
-    // Initialize audio buffer queue
-    audioQueue = new AudioBufferQueue();
+    queue.totalChunks = chunks.length;
+    console.log(`[Open TTS] ${chunks.length} chunk(s), ${text.length} chars, speed: ${playbackRate}x`);
 
-    // Pre-generate initial buffer before playing
-    const initialBufferCount = Math.min(MIN_BUFFER_BEFORE_PLAY, chunks.length);
-    setBusy(true, `Buffering ${initialBufferCount} of ${chunks.length} chunks…`);
+    const useStream = chunks.length > 1 || text.length > 800;
 
-    // Start generating initial chunks in parallel
-    const initialPromises = [];
-    for (let i = 0; i < initialBufferCount; i++) {
-      initialPromises.push(audioQueue.generateChunk(i, chunks[i], settings));
-    }
+    if (useStream) {
+      // ---- STREAMING PATH ----
+      // Sequential chunk generation: MLX GPU can't handle concurrent inference
+      // Streaming within each chunk delivers sub-chunks progressively
+      // so audio starts playing in ~0.5s regardless of total length.
+      isStreamActive = true;
 
-    // Wait for initial buffer to be ready
-    try {
-      await Promise.all(initialPromises);
-    } catch (error) {
-      console.error("[Qwen TTS] Error generating initial chunks:", error);
-      throw error;
-    }
+      for (let i = 0; i < chunks.length; i++) {
+        if (runId !== speakRunId || queue.isStopped) return;
 
-    if (runId !== speakRunId || audioQueue.isStopped) return;
+        setBusy(true, `Generating ${i + 1}/${chunks.length}…`);
 
-    // Begin playback
-    let currentIndex = 0;
+        // Start streaming for this chunk
+        requestStreamAudio(chunks[i], settings, i);
 
-    // Main playback loop
-    while (currentIndex < chunks.length && !audioQueue.isStopped && runId === speakRunId) {
-      // Start generating next chunks ahead of time
-      for (let ahead = 1; ahead <= PREFETCH_COUNT; ahead++) {
-        const futureIdx = currentIndex + ahead;
-        if (futureIdx < chunks.length && !audioQueue.isReady(futureIdx) && !audioQueue.isPending(futureIdx)) {
-          audioQueue.generateChunk(futureIdx, chunks[futureIdx], settings);
-        }
-      }
-
-      // Wait for current chunk if not ready yet
-      if (!audioQueue.isReady(currentIndex)) {
-        setBusy(true, `Reading ${currentIndex + 1}/${chunks.length}… buffering`);
+        // Wait for this chunk's stream to complete
         try {
-          await audioQueue.generateChunk(currentIndex, chunks[currentIndex], settings);
-        } catch (error) {
-          console.error(`[Qwen TTS] Error generating chunk ${currentIndex}:`, error);
-          throw error;
+          await queue.waitForChunk(i);
+        } catch (e) {
+          if (queue.isStopped) return;
+          throw e;
         }
+
+        if (runId !== speakRunId || queue.isStopped) return;
+
+        setBusy(true, `Reading ${i + 1}/${chunks.length}… tap to stop`);
+
+        // Brief pause to let audio pipeline fill before next chunk request
+        // GPU lock on server ensures no concurrent inference
+        if (i < chunks.length - 1) {
+          await new Promise(r => setTimeout(r, 20));
+        }
+
+        queue.cleanup(i);
       }
 
-      if (audioQueue.isStopped || runId !== speakRunId) break;
-
-      setBusy(true, `Reading ${currentIndex + 1}/${chunks.length}… tap to pause`);
-
-      // Play current chunk
-      const audioData = audioQueue.getAudioData(currentIndex);
-      try {
-        await playAudioData(audioData, runId, playbackRate);
-      } catch (error) {
-        console.error(`[Qwen TTS] Error playing chunk ${currentIndex}:`, error);
-        throw error;
+      // All chunks generated and scheduled — wait for remaining audio to finish
+      if (activeSourceCount > 0) {
+        setBusy(true, "Finishing…");
+        await waitForAllAudioToFinish();
       }
 
-      // Move to next
-      currentIndex++;
+      queue.revokeAllUrls();
 
-      // Clean up old buffers
-      audioQueue.cleanup(currentIndex);
+    } else {
+      // ---- NON-STREAMING PATH (short text, single chunk) ----
+      setBusy(true, "Generating…");
+      const result = await requestChunkAudio(chunks[0], settings);
+      queue.setChunkData(0, result.audioData, result.isObjectUrl);
+
+      if (runId !== speakRunId || queue.isStopped) return;
+
+      setBusy(true, "Reading… tap to pause");
+      await playAudioObjectUrl(result.audioData, runId, playbackRate);
     }
 
-    if (runId === speakRunId && !audioQueue.isStopped) {
-      setBusy(false, "Speak");
-    }
+    if (runId === speakRunId && !queue.isStopped) setBusy(false);
   } catch (error) {
-    console.error("[Qwen TTS] Error:", error);
-    if (runId === speakRunId) {
-      setBusy(false);
-      const errorMsg = error?.message || "Couldn't read. Tap again";
-      flashError(errorMsg);
-    }
+    console.error("[Open TTS] Error:", error);
+    if (runId === speakRunId) flashError(error?.message || "Couldn't read. Tap again");
   } finally {
     if (runId === speakRunId) {
       isSpeaking = false;
       isPaused = false;
+      isStreamActive = false;
       widget?.classList.remove("paused");
     }
-    if (audioQueue) {
-      audioQueue.stop();
+    if (activeAudioQueue === queue) {
+      queue.stop();
+      activeAudioQueue = null;
     }
   }
 }

@@ -7,6 +7,7 @@ Handles start/stop server commands from the Chrome extension.
 import json
 import os
 import signal
+import socket
 import subprocess
 import sys
 import struct
@@ -20,6 +21,7 @@ SERVER_SCRIPT = BACKEND_DIR / "server.py"
 VENV_PYTHON = BACKEND_DIR / "venv" / "bin" / "python"
 PID_FILE = BACKEND_DIR / ".server.pid"
 LOG_FILE = BACKEND_DIR / "server.log"
+DEFAULT_PORT = int(os.getenv("OPEN_TTS_PORT", "8000"))
 
 def get_message():
     """Read a message from stdin (Native Messaging protocol)."""
@@ -43,84 +45,217 @@ def send_response(success, message, **extra):
     response = {"success": success, "message": message, **extra}
     send_message(response)
 
-def is_server_running():
-    """Check if the server is running by checking PID file and process."""
-    if not PID_FILE.exists():
+def is_port_in_use(port=DEFAULT_PORT):
+    """Check if a port is actually in use by attempting a TCP connection."""
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.settimeout(1)
+            result = s.connect_ex(("127.0.0.1", port))
+            return result == 0
+    except (OSError, socket.error):
         return False
 
+def get_pid_on_port(port=DEFAULT_PORT):
+    """Find the PID of the process listening on the given port (macOS)."""
     try:
-        pid = int(PID_FILE.read_text().strip())
-        # Check if process exists
-        os.kill(pid, 0)
-        return True
-    except (ValueError, ProcessLookupError, PermissionError):
-        # PID file exists but process doesn't - clean up
-        if PID_FILE.exists():
-            PID_FILE.unlink()
-        return False
+        result = subprocess.run(
+            ["lsof", "-ti", f":{port}", "-sTCP:LISTEN"],
+            capture_output=True, text=True, timeout=5,
+        )
+        pids = result.stdout.strip().split("\n")
+        pids = [int(p) for p in pids if p.strip().isdigit()]
+        return pids[0] if pids else None
+    except (subprocess.TimeoutExpired, ValueError, FileNotFoundError):
+        return None
+
+def is_server_running():
+    """Check if the server is running — checks both PID file AND actual port."""
+    # First check: is the port actually listening?
+    port_active = is_port_in_use()
+    
+    if PID_FILE.exists():
+        try:
+            pid = int(PID_FILE.read_text().strip())
+            os.kill(pid, 0)  # Check process exists
+            if port_active:
+                return True
+            # Process exists but port not listening — model may still be loading
+            # Give it the benefit of the doubt if process is <30s old
+            return True
+        except (ValueError, ProcessLookupError, PermissionError):
+            # PID file stale — clean up
+            if PID_FILE.exists():
+                PID_FILE.unlink()
+    
+    # No valid PID file, but port is in use (server started externally)
+    if port_active:
+        pid = get_pid_on_port()
+        if pid:
+            PID_FILE.write_text(str(pid))
+            return True
+    
+    return False
 
 def get_server_pid():
     """Get the server PID if running."""
-    if not PID_FILE.exists():
-        return None
+    # Prefer port-based PID discovery
+    pid = get_pid_on_port()
+    if pid:
+        # Keep PID file in sync
+        PID_FILE.write_text(str(pid))
+        return pid
+    
+    if PID_FILE.exists():
+        try:
+            return int(PID_FILE.read_text().strip())
+        except (ValueError, FileNotFoundError):
+            pass
+    return None
+
+def kill_stale_server(port=DEFAULT_PORT):
+    """Kill any process occupying the port. Returns (killed, message)."""
+    pid = get_pid_on_port()
+    if pid is None:
+        return True, "No stale process found"
+    
     try:
-        return int(PID_FILE.read_text().strip())
-    except (ValueError, FileNotFoundError):
-        return None
+        os.kill(pid, signal.SIGTERM)
+        # Wait for graceful shutdown
+        for _ in range(20):
+            time.sleep(0.25)
+            if not is_port_in_use(port):
+                if PID_FILE.exists():
+                    PID_FILE.unlink()
+                return True, f"Killed stale server (PID {pid})"
+        
+        # Force kill
+        os.kill(pid, signal.SIGKILL)
+        time.sleep(0.5)
+        if PID_FILE.exists():
+            PID_FILE.unlink()
+        return True, f"Force-killed stale server (PID {pid})"
+    except ProcessLookupError:
+        if PID_FILE.exists():
+            PID_FILE.unlink()
+        return True, "Stale process already gone"
+    except PermissionError:
+        return False, f"Permission denied killing PID {pid}"
+    except Exception as e:
+        return False, f"Failed to kill stale server: {e}"
 
 def start_server():
     """Start the TTS server."""
-    if is_server_running():
+    # Check if already running (port + PID)
+    if is_server_running() and is_port_in_use():
         pid = get_server_pid()
         return True, f"Server already running (PID: {pid})"
+
+    # If PID exists but port is free, the old process died — clean up
+    if is_server_running() and not is_port_in_use():
+        # Model might still be loading — wait briefly
+        for _ in range(6):  # 3 seconds
+            time.sleep(0.5)
+            if is_port_in_use():
+                pid = get_server_pid()
+                return True, f"Server started (PID: {pid})"
+        # Still not listening — kill stale PID
+        if PID_FILE.exists():
+            pid_val = PID_FILE.read_text().strip()
+            try:
+                os.kill(int(pid_val), signal.SIGKILL)
+            except (ValueError, ProcessLookupError, PermissionError):
+                pass
+            PID_FILE.unlink()
+
+    # Port in use but PID file missing/invalid — kill the orphan
+    if is_port_in_use() and not PID_FILE.exists():
+        killed, msg = kill_stale_server()
+        if not killed:
+            return False, f"Port {DEFAULT_PORT} in use by unknown process: {msg}"
+        # Wait for port to free
+        for _ in range(10):
+            time.sleep(0.3)
+            if not is_port_in_use():
+                break
+        else:
+            return False, f"Port {DEFAULT_PORT} still in use after killing stale process"
 
     # Determine Python executable
     python_exe = str(VENV_PYTHON) if VENV_PYTHON.exists() else sys.executable
 
     # Start the server as a background process
-    log_handle = open(LOG_FILE, "a")
+    # Use Popen with file handles (auto-closed after fork, no FD leak)
+    try:
+        stdout_fh = open(LOG_FILE, "a")
+        stderr_fh = open(LOG_FILE, "a")
+    except OSError as e:
+        return False, f"Failed to open log file: {e}"
 
     try:
         process = subprocess.Popen(
             [python_exe, str(SERVER_SCRIPT)],
             cwd=str(BACKEND_DIR),
-            stdout=log_handle,
-            stderr=log_handle,
-            start_new_session=True  # Detach from parent process
+            stdout=stdout_fh,
+            stderr=stderr_fh,
+            start_new_session=True,  # Detach from parent process
         )
+        # Pown the FDs — Popen handles closing after child inherits them
+        stdout_fh.close()
+        stderr_fh.close()
+    except Exception as e:
+        stdout_fh.close()
+        stderr_fh.close()
+        return False, f"Failed to start server: {str(e)}"
 
-        # Save PID
-        PID_FILE.write_text(str(process.pid))
+    # Save PID
+    PID_FILE.write_text(str(process.pid))
 
-        # Wait a moment and check if it started successfully
-        time.sleep(2)
-
-        # Check if process is still running
+    # Wait for server to actually bind the port (model loading takes time)
+    start_time = time.time()
+    max_wait = 30  # seconds
+    
+    while time.time() - start_time < max_wait:
+        time.sleep(0.5)
+        # Check if process is still alive
         try:
             os.kill(process.pid, 0)
-            return True, f"Server started (PID: {process.pid})"
         except ProcessLookupError:
             return False, "Server failed to start. Check server.log for details."
-
-    except Exception as e:
-        return False, f"Failed to start server: {str(e)}"
+        # Check if port is now listening
+        if is_port_in_use():
+            return True, f"Server started (PID: {process.pid})"
+    
+    # Process alive but not listening yet — might still be loading model
+    try:
+        os.kill(process.pid, 0)
+        return True, f"Server starting (PID: {process.pid}, model loading...)"
+    except ProcessLookupError:
+        if PID_FILE.exists():
+            PID_FILE.unlink()
+        return False, "Server failed to start. Check server.log for details."
 
 def stop_server():
     """Stop the TTS server."""
     if not is_server_running():
+        # Make sure port is actually free
+        if is_port_in_use():
+            killed, msg = kill_stale_server()
+            return killed, msg if not killed else "Server stopped (killed orphan)"
         return True, "Server is not running"
 
     pid = get_server_pid()
     if pid is None:
-        return True, "Server is not running"
+        # Port in use but no PID — kill by port
+        killed, msg = kill_stale_server()
+        return killed, msg
 
     try:
         # Send SIGTERM for graceful shutdown
         os.kill(pid, signal.SIGTERM)
 
         # Wait for process to terminate
-        for _ in range(10):
-            time.sleep(0.5)
+        for _ in range(20):
+            time.sleep(0.25)
             try:
                 os.kill(pid, 0)
             except ProcessLookupError:
@@ -128,9 +263,17 @@ def stop_server():
                 if PID_FILE.exists():
                     PID_FILE.unlink()
                 return True, "Server stopped successfully"
+            # Check if port is freed
+            if not is_port_in_use():
+                if PID_FILE.exists():
+                    PID_FILE.unlink()
+                return True, "Server stopped successfully"
 
         # Force kill if still running
-        os.kill(pid, signal.SIGKILL)
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
         time.sleep(0.5)
 
         if PID_FILE.exists():
@@ -149,12 +292,16 @@ def stop_server():
 
 def get_status():
     """Get the server status."""
+    port_active = is_port_in_use()
     running = is_server_running()
     pid = get_server_pid() if running else None
     return {
         "running": running,
+        "port_active": port_active,
         "pid": pid,
-        "message": f"Server running (PID: {pid})" if running else "Server not running"
+        "message": f"Server running (PID: {pid})" if running and port_active
+                   else f"Server starting (PID: {pid})" if running
+                   else "Server not running"
     }
 
 def main():
@@ -180,8 +327,10 @@ def main():
                 send_response(False, f"Unknown command: {command}")
 
         except Exception as e:
-            send_response(False, f"Error: {str(e)}")
-            break
+            try:
+                send_response(False, f"Error: {str(e)}")
+            except Exception:
+                break
 
 if __name__ == "__main__":
     main()

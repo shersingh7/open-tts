@@ -1,13 +1,27 @@
 #!/bin/bash
-# Install launch agent for auto-starting the TTS server on login
+# Install launch agent for auto-starting the Open TTS server on login
 
 set -e
 
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
-PLIST_NAME="com.qwen-tts.server"
+PLIST_NAME="com.open-tts.server"
 PLIST_PATH="$HOME/Library/LaunchAgents/$PLIST_NAME.plist"
 
-echo "Installing Qwen3-TTS launch agent..."
+echo "Installing Open TTS launch agent..."
+
+# Unload old plist if it exists (migration from old name)
+OLD_PLIST_NAME="com.qwen-tts.server"
+OLD_PLIST_PATH="$HOME/Library/LaunchAgents/$OLD_PLIST_NAME.plist"
+if [ -f "$OLD_PLIST_PATH" ]; then
+    launchctl unload "$OLD_PLIST_PATH" 2>/dev/null || true
+    rm "$OLD_PLIST_PATH"
+    echo "✓ Removed old launch agent (com.qwen-tts.server)"
+fi
+
+# Unload current if exists
+if [ -f "$PLIST_PATH" ]; then
+    launchctl unload "$PLIST_PATH" 2>/dev/null || true
+fi
 
 # Create the plist file
 cat > "$PLIST_PATH" << EOF
@@ -27,7 +41,7 @@ cat > "$PLIST_PATH" << EOF
     <key>RunAtLoad</key>
     <true/>
     <key>KeepAlive</key>
-    <true/>
+    <false/>
     <key>StandardOutPath</key>
     <string>$SCRIPT_DIR/stdout.log</string>
     <key>StandardErrorPath</key>
@@ -43,7 +57,7 @@ launchctl load "$PLIST_PATH" 2>/dev/null || true
 
 echo "✓ Launch agent loaded"
 echo ""
-echo "The TTS server will now start automatically on login."
+echo "The Open TTS server will start on login (but won't auto-restart if it crashes)."
 echo "To start it now: launchctl start $PLIST_NAME"
 echo "To stop it: launchctl stop $PLIST_NAME"
 echo "To uninstall: ./uninstall_launch_agent.sh"
