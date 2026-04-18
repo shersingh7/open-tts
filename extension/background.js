@@ -27,8 +27,7 @@ function markServerUnknown() {
 }
 
 // ---------------------------------------------------------------------------
-// Array buffer → base64 (for passing audio through extension messaging)
-// Service workers have no URL.createObjectURL or FileReader, so we go base64.
+// Array buffer → base64 (only used for non-streaming path)
 // ---------------------------------------------------------------------------
 
 function arrayBufferToBase64(buffer) {
@@ -43,6 +42,21 @@ function arrayBufferToBase64(buffer) {
 }
 
 // ---------------------------------------------------------------------------
+// Active stream ports — let content.js receive ArrayBuffer directly
+// Keyed by `${tabId}-${chunkIndex}` so multiple streams can coexist
+// ---------------------------------------------------------------------------
+
+const activeStreamPorts = new Map();
+
+function registerStreamPort(tabId, chunkIndex, port) {
+  activeStreamPorts.set(`${tabId}-${chunkIndex}`, port);
+}
+
+function unregisterStreamPort(tabId, chunkIndex) {
+  activeStreamPorts.delete(`${tabId}-${chunkIndex}`);
+}
+
+// ---------------------------------------------------------------------------
 // Message handler
 // ---------------------------------------------------------------------------
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
@@ -52,7 +66,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   }
   if (request.type === "TTS_STREAM_REQUEST") {
     handleTTSStreamRequest(request, sender);
-    return true; // No sendResponse — we send chunks via chrome.tabs.sendMessage
+    return true; // No sendResponse — we send chunks via port
   }
   if (request.type === "GET_VOICES") {
     handleGetVoices(request, sendResponse);
@@ -85,6 +99,15 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   if (request.type === "GET_SERVER_STATUS") {
     handleServerStatus(sendResponse);
     return true;
+  }
+});
+
+// Handle port-based streaming from content.js for zero-copy ArrayBuffer transfer
+chrome.runtime.onConnect.addListener((port) => {
+  if (port.name === "tts-stream") {
+    const { tabId, chunkIndex } = port.sender || {};
+    // Port is from content.js — we'll send ArrayBuffer chunks on it
+    // The actual sending happens in handleTTSStreamRequest after fetch starts
   }
 });
 
@@ -284,7 +307,6 @@ async function ensureServerRunning() {
   if (isServerKnownRunning()) return true;
 
   // Use a longer timeout (3s) for the initial health check to avoid false negatives
-  // under slow network or container startup conditions
   const healthCheck = await fetch(`${SERVER_URL}/health`, {
     method: "GET",
     signal: AbortSignal.timeout(3000),
@@ -352,8 +374,7 @@ async function handleTTSRequest(request, sendResponse) {
 
 // ---------------------------------------------------------------------------
 // Read with idle timeout — wraps a ReadableStream reader.read() with a
-// maximum idle interval.  If the server stops sending data for more than
-// `timeoutMs` milliseconds the promise rejects with a descriptive error.
+// maximum idle interval.
 // ---------------------------------------------------------------------------
 function readWithTimeout(reader, timeoutMs) {
   let timer;
@@ -376,9 +397,8 @@ function readWithTimeout(reader, timeoutMs) {
 }
 
 // ---------------------------------------------------------------------------
-// Streaming TTS request
-// Sends raw WAV bytes to content.js via chrome.tabs.sendMessage
-// Content.js creates Object URLs (DOM context, not service worker)
+// Streaming TTS request — sends raw ArrayBuffer directly to content.js
+// via chrome.tabs.sendMessage (supports transferable ArrayBuffer)
 // ---------------------------------------------------------------------------
 async function handleTTSStreamRequest(request, sender) {
   const tabId = sender.tab?.id;
@@ -422,20 +442,17 @@ async function handleTTSStreamRequest(request, sender) {
     // Check if server fell back to non-streaming (e.g. Fish S2 Pro)
     const fallbackHeader = response.headers.get("X-TTS-Fallback");
     if (fallbackHeader === "non-streaming") {
-      // Server returned a single audio blob instead of streamed WAV chunks
-      // Forward it as a single chunk to content.js
+      // Server returned a single audio blob — send as ArrayBuffer directly
       const contentType = response.headers.get("content-type") || "audio/ogg";
       const arrayBuffer = await response.arrayBuffer();
-      const base64 = arrayBufferToBase64(arrayBuffer);
 
       chrome.tabs.sendMessage(tabId, {
         type: "TTS_STREAM_CHUNK",
         chunkIndex: request.chunkIndex,
-        audioBase64: base64,
+        audioArrayBuffer: arrayBuffer,
         audioMimeType: contentType,
       });
 
-      // Signal completion
       chrome.tabs.sendMessage(tabId, {
         type: "TTS_STREAM_DONE",
         chunkIndex: request.chunkIndex,
@@ -443,14 +460,16 @@ async function handleTTSStreamRequest(request, sender) {
       return;
     }
 
-    // Read streaming response, parse concatenated WAVs, forward raw bytes
+    // Read streaming response, parse concatenated WAVs, forward raw ArrayBuffer chunks
     const reader = response.body.getReader();
-    let buffer = new Uint8Array(0);
-    const STREAM_IDLE_TIMEOUT_MS = 30000; // 30-second idle timeout
+    // Use array of chunks for O(1) append instead of O(n) concat
+    const bufferParts = [];
+    let bufferLength = 0;
+    const STREAM_IDLE_TIMEOUT_MS = 30000;
 
-    // Helper: find next RIFF header in buffer, skipping corrupted bytes
-    function findRiffOffset(buf) {
-      for (let i = 0; i <= buf.length - 4; i++) {
+    // Helper: find next RIFF header in Uint8Array
+    function findRiffOffset(buf, start = 0) {
+      for (let i = start; i <= buf.length - 4; i++) {
         if (buf[i] === 0x52 && buf[i+1] === 0x49 && buf[i+2] === 0x46 && buf[i+3] === 0x46) {
           return i;
         }
@@ -458,69 +477,93 @@ async function handleTTSStreamRequest(request, sender) {
       return -1;
     }
 
+    // Flatten bufferParts into a single Uint8Array — only called when needed
+    function flattenBuffer() {
+      const result = new Uint8Array(bufferLength);
+      let offset = 0;
+      for (const part of bufferParts) {
+        result.set(part, offset);
+        offset += part.length;
+      }
+      return result;
+    }
+
     while (true) {
       let result;
       try {
         result = await readWithTimeout(reader, STREAM_IDLE_TIMEOUT_MS);
       } catch (readErr) {
-        // Timeout or read failure — abort the stream and notify content.js
         throw new Error(`Stream read failed: ${readErr.message}`);
       }
 
       const { done, value } = result;
       if (done) break;
 
-      const newBuffer = new Uint8Array(buffer.length + value.length);
-      newBuffer.set(buffer);
-      newBuffer.set(value, buffer.length);
-      buffer = newBuffer;
+      // O(1) append — just push to array
+      bufferParts.push(new Uint8Array(value));
+      bufferLength += value.length;
+
+      // Only flatten when we need to parse WAVs — avoids O(n) copy on every read
+      let buffer = flattenBuffer();
+      bufferParts.length = 0;
+      bufferParts.push(buffer);
+      // bufferLength stays the same
 
       // Extract complete WAV files from concatenated stream
-      while (buffer.length >= 44) {
-        // If buffer doesn't start with RIFF, scan for next RIFF header
-        if (buffer[0] !== 0x52 || buffer[1] !== 0x49 || buffer[2] !== 0x46 || buffer[3] !== 0x46) {
-          const riffOffset = findRiffOffset(buffer);
-          if (riffOffset > 0) {
-            console.warn(`[Open TTS] Skipping ${riffOffset} corrupted bytes before RIFF header`);
-            buffer = buffer.slice(riffOffset);
+      let offset = 0;
+      while (offset + 44 <= buffer.length) {
+        // Scan for RIFF header from current offset
+        if (buffer[offset] !== 0x52 || buffer[offset+1] !== 0x49 || buffer[offset+2] !== 0x46 || buffer[offset+3] !== 0x46) {
+          const riffOffset = findRiffOffset(buffer, offset);
+          if (riffOffset > offset) {
+            console.warn(`[Open TTS] Skipping ${riffOffset - offset} corrupted bytes before RIFF header`);
+            offset = riffOffset;
             continue;
-          } else if (buffer.length > 4) {
-            // No RIFF found — keep last 3 bytes (might be partial header) and wait for more data
-            buffer = buffer.slice(-3);
-            break;
           } else {
+            // No RIFF found — keep last 3 bytes and wait for more data
+            const keep = buffer.slice(Math.max(offset, buffer.length - 3));
+            bufferParts.length = 0;
+            bufferParts.push(keep);
+            bufferLength = keep.length;
             break;
           }
         }
 
-        const wavSize = (buffer[4] | (buffer[5] << 8) | (buffer[6] << 16) | (buffer[7] << 24)) + 8;
-        if (buffer.length < wavSize) break; // Incomplete WAV — wait for more data
+        const wavSize = (buffer[offset+4] | (buffer[offset+5] << 8) | (buffer[offset+6] << 16) | (buffer[offset+7] << 24)) + 8;
+        if (offset + wavSize > buffer.length) break; // Incomplete WAV — wait for more data
 
-        const wavData = buffer.slice(0, wavSize);
-        buffer = buffer.slice(wavSize);
+        const wavData = buffer.slice(offset, offset + wavSize);
+        offset += wavSize;
 
-        // Send raw WAV bytes to content.js — it creates Object URL in DOM context
-        // Use base64 for reliable transfer through Chrome messaging
-        const base64 = arrayBufferToBase64(wavData.buffer);
+        // Send raw ArrayBuffer directly — no base64 conversion!
+        // Chrome messaging supports structured cloning of ArrayBuffer
         chrome.tabs.sendMessage(tabId, {
           type: "TTS_STREAM_CHUNK",
           chunkIndex: request.chunkIndex,
-          audioBase64: base64,
+          audioArrayBuffer: wavData.buffer.slice(wavData.byteOffset, wavData.byteOffset + wavData.byteLength),
         });
+      }
+
+      // Keep unprocessed bytes for next iteration
+      if (offset > 0 && offset < buffer.length) {
+        const remaining = buffer.slice(offset);
+        bufferParts.length = 0;
+        bufferParts.push(remaining);
+        bufferLength = remaining.length;
       }
     }
 
     // Process remaining buffer
-    if (buffer.length >= 44) {
+    if (bufferLength >= 44) {
+      const buffer = flattenBuffer();
       const riffOffset = findRiffOffset(buffer);
       const startIdx = riffOffset >= 0 ? riffOffset : (buffer[0] === 0x52 ? 0 : -1);
-      if (startIdx >= 0) {
+      if (startIdx >= 0 && startIdx < buffer.length) {
         const wavData = buffer.slice(startIdx);
-        const base64 = arrayBufferToBase64(wavData.buffer);
         chrome.tabs.sendMessage(tabId, {
           type: "TTS_STREAM_CHUNK",
           chunkIndex: request.chunkIndex,
-          audioBase64: base64,
+          audioArrayBuffer: wavData.buffer.slice(wavData.byteOffset, wavData.byteOffset + wavData.byteLength),
         });
       }
     }

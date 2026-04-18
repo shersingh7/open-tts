@@ -28,7 +28,7 @@ WARMUP_TEXT = os.getenv("OPEN_TTS_WARMUP_TEXT", "Warmup")
 DEFAULT_MODEL_ID = os.getenv("OPEN_TTS_DEFAULT_MODEL", "qwen3-tts")
 DEFAULT_AUDIO_FORMAT = os.getenv("OPEN_TTS_AUDIO_FORMAT", "opus")
 OPUS_BITRATE = os.getenv("OPEN_TTS_OPUS_BITRATE", "64k")
-STREAMING_INTERVAL = float(os.getenv("OPEN_TTS_STREAMING_INTERVAL", "0.5"))
+STREAMING_INTERVAL = float(os.getenv("OPEN_TTS_STREAMING_INTERVAL", "0.25"))
 
 # ---------------------------------------------------------------------------
 # Model registry
@@ -322,33 +322,41 @@ class SynthesizeRequest(BaseModel):
 
 def _synthesize_sync(model, gen_kwargs, model_id, request_voice, lang_code,
                      audio_format: str = DEFAULT_AUDIO_FORMAT) -> tuple:
-    """Blocking synthesize — acquires gpu_lock, runs generation, returns audio."""
+    """Blocking synthesize — acquires gpu_lock, runs generation, returns audio.
+    Uses iterative consumption to avoid materializing all chunks in RAM at once."""
     acquired = gpu_lock.acquire(timeout=30)
     if not acquired:
         raise HTTPException(status_code=503, detail="GPU busy — all inference slots taken. Please retry.")
 
     try:
         gen_start = _time.perf_counter()
-        chunks = list(model.generate(**gen_kwargs))
-        if not chunks:
+        audio_parts = []
+        first_sample_rate = None
+        first_rtf = 0
+        for result in model.generate(**gen_kwargs):
+            if first_sample_rate is None:
+                first_sample_rate = result.sample_rate
+                first_rtf = getattr(result, 'real_time_factor', 0)
+            audio_parts.append(np.asarray(result.audio, dtype=np.float32))
+        if not audio_parts:
             raise ValueError("No audio generated")
         gen_elapsed = _time.perf_counter() - gen_start
 
-        sample_rate = chunks[0].sample_rate
-        audio_parts = [np.asarray(chunk.audio, dtype=np.float32) for chunk in chunks]
+        sample_rate = first_sample_rate
         audio = np.concatenate(audio_parts, axis=0) if len(audio_parts) > 1 else audio_parts[0]
+        # Free intermediate list before encoding to reduce peak RAM
+        del audio_parts
 
         encode_start = _time.perf_counter()
         audio_bytes, mime_type = _encode_audio(audio, sample_rate, fmt=audio_format)
         encode_elapsed = _time.perf_counter() - encode_start
 
-        first = chunks[0]
         headers = {
             "X-TTS-Engine": "open-tts",
             "X-TTS-Model": model_id,
             "X-TTS-Voice": request_voice,
             "X-TTS-Lang": lang_code or "auto",
-            "X-TTS-RTF": f"{getattr(first, 'real_time_factor', 0):.3f}",
+            "X-TTS-RTF": f"{first_rtf:.3f}",
             "X-TTS-Gen-Time": f"{gen_elapsed:.3f}",
             "X-TTS-Encode-Time": f"{encode_elapsed:.3f}",
         }
