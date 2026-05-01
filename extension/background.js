@@ -1,4 +1,4 @@
-const SERVER_URL = "http://127.0.0.1:8000";
+const SERVER_URL     = "http://127.0.0.1:8000";
 const NATIVE_HOST_NAME = "com.open_tts.native_host";
 
 // ── Server-known-running cache ───────────────────────────────────
@@ -34,18 +34,31 @@ function arrayBufferToBase64(buffer) {
   return btoa(binary);
 }
 
-// ── Message handler ──────────────────────────────────────────────
+// ── Message handler ─────────────────────────────────────────────
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   const type = request.type;
+
+  // SPEAK / STOP / PAUSE / RESUME are handled directly by offscreen.js
+  // so we pass them through when they originate from content.js.
+  if (["SPEAK","STOP","PAUSE","RESUME"].includes(type)) {
+    // Forward to offscreen document (all extension contexts get the broadcast,
+    // but offscreen.js is the only one that actually handles these types.)
+    // We still need to return true so content.js's await doesn't hang.
+    chrome.runtime.sendMessage(request).then(sendResponse).catch(() => sendResponse({}));
+    return true;
+  }
+
+  if (type === "STOP_TTS") {
+    // Popup requested stop — tell offscreen to stop, content to clean up
+    chrome.runtime.sendMessage({ type: "STOP" }).catch(() => {});
+    sendResponse({ stopped: true });
+    return true;
+  }
+
   if (type === "TTS_REQUEST") {
     handleTTSRequest(request, sendResponse);
     return true;
   }
-    if (type === "TTS_BATCH_REQUEST") {
-      // Dead code — content.js now fetches directly to avoid MV3 SW lifetime kill
-      sendResponse({ success: false, error: "Deprecated — content.js uses direct fetch." });
-      return true;
-    }
   if (type === "GET_VOICES") {
     handleGetVoices(request, sendResponse);
     return true;
@@ -80,7 +93,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   }
 });
 
-// ── Native messaging ───────────────────────────────────────────
+// ── Native messaging ─────────────────────────────────────────────
 function sendNativeMessage(command) {
   return new Promise((resolve, reject) => {
     chrome.runtime.sendNativeMessage(
@@ -88,10 +101,7 @@ function sendNativeMessage(command) {
       { command },
       (response) => {
         const err = chrome.runtime.lastError;
-        if (err) {
-          reject(new Error(err.message));
-          return;
-        }
+        if (err) { reject(new Error(err.message)); return; }
         resolve(response);
       }
     );
@@ -151,10 +161,7 @@ async function waitForServerReady(timeoutMs = 30000) {
       });
       if (response.ok) {
         const data = await response.json();
-        if (data.model_loaded) {
-          markServerKnownRunning();
-          return true;
-        }
+        if (data.model_loaded) { markServerKnownRunning(); return true; }
       }
     } catch {}
     await new Promise((r) => setTimeout(r, 500));
@@ -178,36 +185,7 @@ async function fetchJson(path, options = {}) {
   return maybeJson;
 }
 
-// ── Retry helper ───────────────────────────────────────────────
-async function fetchWithRetry(url, options = {}, retries = 1, delayMs = 1000) {
-  let lastError;
-  for (let attempt = 0; attempt <= retries; attempt++) {
-    try {
-      const response = await fetch(url, {
-        ...options,
-        signal: options.signal ?? AbortSignal.timeout(options.timeoutMs ?? 30000),
-      });
-      if (response.ok) {
-        markServerKnownRunning();
-        return response;
-      }
-      if (response.status >= 400 && response.status < 500) {
-        markServerUnknown();
-        const maybeJson = await response.json().catch(() => ({}));
-        throw new Error(maybeJson?.detail || `Server error ${response.status}`);
-      }
-      lastError = new Error(`Server error ${response.status}`);
-      markServerUnknown();
-    } catch (err) {
-      markServerUnknown();
-      lastError = err;
-    }
-    if (attempt < retries) await new Promise(r => setTimeout(r, delayMs));
-  }
-  throw lastError;
-}
-
-// ── Health / Models / Voices ────────────────────────────────────
+// ── Health / Models / Voices ───────────────────────────────────
 async function handleHealth(sendResponse) {
   try {
     const data = await fetchJson("/health");
@@ -246,7 +224,7 @@ async function handleGetVoices(request, sendResponse) {
   }
 }
 
-// ── Ensure server running ───────────────────────────────────────
+// ── Ensure server running ──────────────────────────────────────
 async function ensureServerRunning() {
   if (isServerKnownRunning()) return true;
 
@@ -266,7 +244,7 @@ async function ensureServerRunning() {
   return await waitForServerReady(30000);
 }
 
-// ── Single-chunk TTS (popup preview) ────────────────────────────
+// ── Single-chunk TTS (popup preview) ─────────────────────────
 async function handleTTSRequest(request, sendResponse) {
   try {
     const serverOk = await ensureServerRunning();
@@ -284,11 +262,11 @@ async function handleTTSRequest(request, sendResponse) {
     };
     if (request.model) body.model = request.model;
 
-    const response = await fetchWithRetry(`${SERVER_URL}/v1/synthesize`, {
+    const response = await fetch(`${SERVER_URL}/v1/synthesize`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
-      timeoutMs: 300000,
+      signal: AbortSignal.timeout(300000),
     });
 
     if (!response.ok) {
@@ -298,7 +276,7 @@ async function handleTTSRequest(request, sendResponse) {
 
     markServerKnownRunning();
     const arrayBuffer = await response.arrayBuffer();
-    const contentType = response.headers.get("content-type") || "audio/ogg";
+    const contentType = response.headers.get("content-type") || "audio/wav";
     const base64 = arrayBufferToBase64(arrayBuffer);
     const dataUrl = `data:${contentType};base64,${base64}`;
 
@@ -308,14 +286,4 @@ async function handleTTSRequest(request, sendResponse) {
     markServerUnknown();
     sendResponse({ success: false, error: error.message });
   }
-}
-
-// ── Batch TTS — DEAD CODE (content.js fetches directly now) ──────
-// async function handleTTSBatchRequest(request, sendResponse) {
-//   try {
-//     ...
-//     keep function body here until fully tested, but it's disconnected from the router.
-// }
-async function handleTTSBatchRequest(request, sendResponse) {
-  sendResponse({ success: false, error: "Deprecated — content.js uses direct fetch." });
 }

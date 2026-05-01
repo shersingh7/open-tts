@@ -1,13 +1,14 @@
 {
   "manifest_version": 3,
   "name": "Open TTS",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "description": "Local multi-model text-to-speech using MLX on Apple Silicon. Supports Qwen3-TTS and Fish Audio S2 Pro.",
   "permissions": [
     "activeTab",
     "scripting",
     "storage",
-    "nativeMessaging"
+    "nativeMessaging",
+    "offscreen"
   ],
   "host_permissions": [
     "http://127.0.0.1:8000/*"
