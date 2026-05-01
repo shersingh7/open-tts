@@ -347,6 +347,16 @@ class BatchSynthesizeRequest(BaseModel):
     format: str = "opus"
 
 
+class StreamBatchSynthesizeRequest(BaseModel):
+    """Request for streaming batch synthesis — one HTTP call, all chunks."""
+    texts: List[str] = Field(..., min_length=1, max_length=50)
+    voice: str = "ryan"
+    speed: float = Field(1.0, ge=0.5, le=3.0)
+    language: str = "Auto"
+    instruct: Optional[str] = None
+    model: Optional[str] = None
+
+
 # ---------------------------------------------------------------------------
 # Sync synthesis helpers — both use gpu_lock for serialized GPU access
 # ---------------------------------------------------------------------------
@@ -972,6 +982,141 @@ async def synthesize_batch(request: BatchSynthesizeRequest):
         "total_time": total_time,
         "error_count": error_count,
     }
+
+
+# ---------------------------------------------------------------------------
+# Streaming batch endpoint — binary frames, single HTTP call + single gpu_lock
+# Frame format per chunk:
+#   [4 bytes: header-json length N]
+#   [N bytes: UTF-8 JSON header {"index":i, "error":...}]
+#   [4 bytes: audio-wav length M]
+#   [M bytes: WAV data (or 0 if error)]
+# Followed by terminal frame: {"done": true}
+# ---------------------------------------------------------------------------
+
+def _streaming_batch_generator_sync(model, base_kwargs, texts, model_id, voice, lang_code):
+    """Sync generator — yields binary frames.
+    Acquires gpu_lock once for all texts."""
+    import json, struct
+    acquired = gpu_lock.acquire(timeout=120)
+    if not acquired:
+        hdr = json.dumps({"index": 0, "error": "GPU busy — timed out waiting for GPU lock"}).encode("utf-8")
+        yield struct.pack("<I", len(hdr)) + hdr + struct.pack("<I", 0)
+        return
+
+    try:
+        total_gen_start = _time.perf_counter()
+        for idx, text in enumerate(texts):
+            chunk_start = _time.perf_counter()
+            deadline = chunk_start + GEN_TIMEOUT_SECONDS
+            gen_kwargs = {**base_kwargs, "text": text}
+
+            try:
+                audio_parts = []
+                first_sample_rate = None
+
+                for result in model.generate(**gen_kwargs):
+                    if _time.perf_counter() > deadline:
+                        raise TimeoutError(f"Chunk {idx} timed out after {GEN_TIMEOUT_SECONDS}s")
+                    audio = _try_asarray_f32(result.audio)
+                    audio_parts.append(audio)
+                    if first_sample_rate is None:
+                        first_sample_rate = result.sample_rate
+
+                if not audio_parts:
+                    raise ValueError(f"Chunk {idx}: no audio generated")
+
+                # Concatenate all audio parts
+                audio = np.concatenate(audio_parts, axis=0) if len(audio_parts) > 1 else audio_parts[0]
+                del audio_parts
+
+                wav_bytes = _encode_wav_fast(audio, first_sample_rate)
+                gen_elapsed = _time.perf_counter() - chunk_start
+
+                hdr = json.dumps({
+                    "index": idx,
+                    "sample_rate": first_sample_rate,
+                    "gen_time": round(gen_elapsed, 3),
+                    "final": True,
+                }).encode("utf-8")
+                yield struct.pack("<I", len(hdr)) + hdr + struct.pack("<I", len(wav_bytes)) + wav_bytes
+
+            except Exception as exc:
+                print(f"[StreamBatch] Chunk {idx} failed: {exc}")
+                hdr = json.dumps({"index": idx, "error": str(exc)}).encode("utf-8")
+                yield struct.pack("<I", len(hdr)) + hdr + struct.pack("<I", 0)
+
+        total_elapsed = _time.perf_counter() - total_gen_start
+        print(f"[StreamBatch] All {len(texts)} chunks done in {total_elapsed:.1f}s")
+
+    finally:
+        gpu_lock.release()
+
+
+async def _async_streaming_batch_wrapper(model, base_kwargs, texts, model_id, voice, lang_code):
+    """Async wrapper — runs sync generator in thread pool, yields frames."""
+    loop = asyncio.get_running_loop()
+    gen = _streaming_batch_generator_sync(model, base_kwargs, texts, model_id, voice, lang_code)
+    while True:
+        try:
+            frame = await asyncio.wait_for(
+                loop.run_in_executor(None, next, gen),
+                timeout=30,
+            )
+            yield frame
+        except asyncio.TimeoutError:
+            print("[StreamBatch] Timeout waiting for next frame")
+            break
+        except StopAsyncIteration:
+            break
+        except StopIteration:
+            break
+
+
+@app.post("/v1/synthesize-stream-batch")
+async def synthesize_stream_batch(request: StreamBatchSynthesizeRequest):
+    """Streaming batch synthesis — one HTTP call, one gpu_lock, multiple chunks.
+    Returns binary frames: [4-byte header-len][JSON header][4-byte audio-len][audio bytes]."""
+    if not request.texts:
+        raise HTTPException(status_code=400, detail="texts array cannot be empty")
+    if len(request.texts) > 50:
+        raise HTTPException(status_code=400, detail="Maximum 50 texts per batch request")
+
+    dummy = SynthesizeRequest(
+        text=request.texts[0],
+        voice=request.voice,
+        speed=request.speed,
+        language=request.language,
+        instruct=request.instruct,
+        model=request.model,
+        stream=False,
+        format="opus",
+    )
+    try:
+        base_kwargs, model_id, lang_code, model = _build_base_gen_kwargs(dummy, dummy.text)
+    except HTTPException:
+        raise
+
+    async def _response_body():
+        async for frame in _async_streaming_batch_wrapper(
+            model, base_kwargs, request.texts, model_id, request.voice, lang_code
+        ):
+            yield frame
+        # Terminal frame
+        import json, struct
+        hdr = json.dumps({"done": True}).encode("utf-8")
+        yield struct.pack("<I", len(hdr)) + hdr + struct.pack("<I", 0)
+
+    return StreamingResponse(
+        _response_body(),
+        media_type="application/octet-stream",
+        headers={
+            "X-TTS-Engine": "open-tts",
+            "X-TTS-Model": model_id,
+            "X-TTS-Stream-Batch": "true",
+            "Cache-Control": "no-cache",
+        },
+    )
 
 
 # ---------------------------------------------------------------------------

@@ -274,6 +274,17 @@ function requestStreamAudio(text, settings, chunkIndex) {
   });
 }
 
+function requestStreamBatchAudio(texts, settings) {
+  chrome.runtime.sendMessage({
+    type: "TTS_STREAM_BATCH_REQUEST",
+    texts,
+    voice: settings.voice || "ryan",
+    speed: settings.speed || 1.0,
+    language: settings.language || "Auto",
+    model: settings.model || "qwen3-tts",
+  });
+}
+
 // ---------------------------------------------------------------------------
 // Web Audio API gapless scheduling -- reuse AudioContext
 // ---------------------------------------------------------------------------
@@ -472,13 +483,20 @@ async function onSpeakClick(event) {
     // vs 5+ seconds waiting for full generation in non-streaming mode
     isStreamActive = true;
 
+    // Batch path: single HTTP call for all chunks (faster, one gpu_lock)
+    if (chunks.length > 1) {
+      requestStreamBatchAudio(chunks, settings);
+    }
+
     for (let i = 0; i < chunks.length; i++) {
       if (runId !== speakRunId || queue.isStopped) return;
 
       setBusy(true, `Generating ${i + 1}/${chunks.length}...`);
 
-      // Start streaming for this chunk
-      requestStreamAudio(chunks[i], settings, i);
+      // Start streaming for this chunk (only in single-chunk mode)
+      if (chunks.length === 1) {
+        requestStreamAudio(chunks[i], settings, i);
+      }
 
       // Wait for this chunk's stream to complete
       try {

@@ -68,6 +68,10 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     handleTTSStreamRequest(request, sender);
     return true; // No sendResponse — we send chunks via port
   }
+  if (request.type === "TTS_STREAM_BATCH_REQUEST") {
+    handleTTSStreamBatchRequest(request, sender);
+    return true; // No sendResponse — we send chunks via port
+  }
   if (request.type === "GET_VOICES") {
     handleGetVoices(request, sendResponse);
     return true;
@@ -581,5 +585,203 @@ async function handleTTSStreamRequest(request, sender) {
       chunkIndex: request.chunkIndex,
       error: error.message || "Unknown streaming error",
     });
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Streaming batch handler — parses binary frames, forwards as TTS_STREAM_CHUNK
+// ---------------------------------------------------------------------------
+async function handleTTSStreamBatchRequest(request, sender) {
+  const tabId = sender.tab?.id;
+  if (!tabId) return;
+
+  try {
+    const serverOk = await ensureServerRunning();
+    if (!serverOk) {
+      chrome.tabs.sendMessage(tabId, {
+        type: "TTS_STREAM_ERROR",
+        chunkIndex: 0,
+        error: "Server not running or failed to start. Try restarting the server manually.",
+      });
+      return;
+    }
+
+    const body = JSON.stringify({
+      texts: request.texts,
+      voice: request.voice,
+      speed: request.speed,
+      language: request.language || "Auto",
+      model: request.model,
+    });
+
+    const response = await fetchWithRetry(`${SERVER_URL}/v1/synthesize-stream-batch`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body,
+      timeoutMs: 300000,
+    });
+
+    if (!response.ok) {
+      const maybeJson = await response.json().catch(() => ({}));
+      throw new Error(maybeJson?.detail || `Server error ${response.status}`);
+    }
+
+    markServerKnownRunning();
+
+    const reader = response.body.getReader();
+    const bufferParts = [];
+    let bufferLength = 0;
+    const STREAM_IDLE_TIMEOUT_MS = 30000;
+
+    function flattenBuffer() {
+      const result = new Uint8Array(bufferLength);
+      let offset = 0;
+      for (const part of bufferParts) {
+        result.set(part, offset);
+        offset += part.length;
+      }
+      return result;
+    }
+
+    while (true) {
+      let result;
+      try {
+        result = await readWithTimeout(reader, STREAM_IDLE_TIMEOUT_MS);
+      } catch (readErr) {
+        throw new Error(`Stream read failed: ${readErr.message}`);
+      }
+
+      const { done, value } = result;
+      if (done) break;
+
+      bufferParts.push(new Uint8Array(value));
+      bufferLength += value.length;
+
+      let buffer = flattenBuffer();
+      bufferParts.length = 0;
+      bufferParts.push(buffer);
+
+      // Parse binary frames: [4-byte header-len][JSON header][4-byte audio-len][audio]
+      let offset = 0;
+      while (offset + 8 <= buffer.length) {
+        const headerLen = new DataView(buffer.buffer, buffer.byteOffset + offset).getUint32(0, true);
+        if (offset + 4 + headerLen + 4 > buffer.length) break; // Incomplete header
+
+        const headerBytes = buffer.slice(offset + 4, offset + 4 + headerLen);
+        const headerStr = new TextDecoder().decode(headerBytes);
+        let header;
+        try {
+          header = JSON.parse(headerStr);
+        } catch (e) {
+          throw new Error(`Failed to parse frame header: ${e.message}`);
+        }
+
+        if (header.done) {
+          // Terminal frame
+          offset += 4 + headerLen + 4;
+          continue;
+        }
+
+        const audioLen = new DataView(buffer.buffer, buffer.byteOffset + offset + 4 + headerLen).getUint32(0, true);
+        if (offset + 4 + headerLen + 4 + audioLen > buffer.length) break; // Incomplete audio
+
+        const chunkIndex = header.index;
+
+        if (header.error) {
+          chrome.tabs.sendMessage(tabId, {
+            type: "TTS_STREAM_ERROR",
+            chunkIndex,
+            error: header.error,
+          });
+        } else if (audioLen > 0) {
+          const audioData = buffer.slice(offset + 4 + headerLen + 4, offset + 4 + headerLen + 4 + audioLen);
+          chrome.tabs.sendMessage(tabId, {
+            type: "TTS_STREAM_CHUNK",
+            chunkIndex,
+            audioArrayBuffer: audioData.buffer.slice(audioData.byteOffset, audioData.byteOffset + audioData.byteLength),
+            audioMimeType: "audio/wav",
+          });
+
+          if (header.final) {
+            chrome.tabs.sendMessage(tabId, {
+              type: "TTS_STREAM_DONE",
+              chunkIndex,
+            });
+          }
+        }
+
+        offset += 4 + headerLen + 4 + audioLen;
+      }
+
+      // Keep unprocessed bytes for next iteration
+      if (offset > 0 && offset < buffer.length) {
+        const remaining = buffer.slice(offset);
+        bufferParts.length = 0;
+        bufferParts.push(remaining);
+        bufferLength = remaining.length;
+      }
+    }
+
+    // Process remaining buffer for any trailing frames
+    if (bufferLength >= 8) {
+      const buffer = flattenBuffer();
+      let offset = 0;
+      while (offset + 8 <= buffer.length) {
+        const headerLen = new DataView(buffer.buffer, buffer.byteOffset + offset).getUint32(0, true);
+        if (offset + 4 + headerLen + 4 > buffer.length) break;
+
+        const headerBytes = buffer.slice(offset + 4, offset + 4 + headerLen);
+        let header;
+        try {
+          header = JSON.parse(new TextDecoder().decode(headerBytes));
+        } catch (e) { break; }
+
+        if (header.done) {
+          offset += 4 + headerLen + 4;
+          continue;
+        }
+
+        const audioLen = new DataView(buffer.buffer, buffer.byteOffset + offset + 4 + headerLen).getUint32(0, true);
+        if (offset + 4 + headerLen + 4 + audioLen > buffer.length) break;
+
+        const chunkIndex = header.index;
+        const audioData = buffer.slice(offset + 4 + headerLen + 4, offset + 4 + headerLen + 4 + audioLen);
+        if (audioLen > 0) {
+          chrome.tabs.sendMessage(tabId, {
+            type: "TTS_STREAM_CHUNK",
+            chunkIndex,
+            audioArrayBuffer: audioData.buffer.slice(audioData.byteOffset, audioData.byteOffset + audioData.byteLength),
+          });
+        }
+
+        if (header.final) {
+          chrome.tabs.sendMessage(tabId, {
+            type: "TTS_STREAM_DONE",
+            chunkIndex,
+          });
+        }
+
+        offset += 4 + headerLen + 4 + audioLen;
+      }
+    }
+
+    // Ensure all chunks get a DONE signal even if server didn't send final frames
+    for (let i = 0; i < (request.texts?.length || 0); i++) {
+      chrome.tabs.sendMessage(tabId, {
+        type: "TTS_STREAM_DONE",
+        chunkIndex: i,
+      });
+    }
+
+  } catch (error) {
+    console.error("[Open TTS Background] Batch stream error:", error);
+    markServerUnknown();
+    for (let i = 0; i < (request.texts?.length || 0); i++) {
+      chrome.tabs.sendMessage(tabId, {
+        type: "TTS_STREAM_ERROR",
+        chunkIndex: i,
+        error: error.message || "Unknown batch streaming error",
+      });
+    }
   }
 }
