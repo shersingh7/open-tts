@@ -1,26 +1,16 @@
 let widget = null;
-let currentAudio = null;
 let selectedText = "";
 let speakRunId = 0;
 let isSpeaking = false;
 let isPaused = false;
-
-// Web Audio API for gapless streaming playback
-let audioContext = null;
-let nextPlayTime = 0;
-let activeSourceCount = 0;
-let isStreamActive = false;
-let activeAudioQueue = null;
-let currentPlaybackRate = 1.0;
-let activeSources = new Set();
+let audioQueue = [];          // Array of Audio elements (sequential playback)
+let audioIndex = 0;           // Index of currently playing chunk
+let pendingCount = 0;         // How many chunks are still generating
 
 const MAX_SELECTION_CHARS = 200000;
-const CHUNK_TARGET_CHARS = 4000; // Bumped from 2000 -- fewer chunks = fewer round-trips
-const STREAM_THRESHOLD_CHARS = 0; // Always stream -- first audio in ~250ms instead of waiting for full generation
+const CHUNK_TARGET_CHARS = 4000;
 
-// ---------------------------------------------------------------------------
-// Widget
-// ---------------------------------------------------------------------------
+// ─── Widget ──────────────────────────────────────────────────────
 
 function removeLegacyWidget() {
   document.querySelectorAll("#qwen-tts-icon-container").forEach(n => n.remove());
@@ -96,42 +86,18 @@ function flashError(message) {
   setTimeout(() => { widget?.classList.remove("error"); setLabel("Speak"); }, 3000);
 }
 
-// ---------------------------------------------------------------------------
-// Audio cleanup -- reuse AudioContext, just stop sources
-// ---------------------------------------------------------------------------
-
-function stopStreamPlayback() {
-  for (const source of activeSources) {
-    try { source.stop(); } catch(e) {}
-    try { source.disconnect(); } catch(e) {}
-  }
-  activeSources.clear();
-  activeSourceCount = 0;
-  nextPlayTime = 0;
-  isStreamActive = false;
-}
-
-function closeAudioContext() {
-  if (audioContext && audioContext.state !== "closed") {
-    audioContext.close().catch(() => {});
-    audioContext = null;
-  }
-}
+// ─── Audio cleanup ───────────────────────────────────────────────
 
 function stopAllAudio() {
-  if (currentAudio) {
-    currentAudio.pause();
-    if (currentAudio._objectUrl) URL.revokeObjectURL(currentAudio._objectUrl);
-    currentAudio.src = "";
-    currentAudio = null;
+  for (const a of audioQueue) {
+    try { a.pause(); a.src = ""; } catch (e) {}
   }
-  stopStreamPlayback();
-  closeAudioContext();
+  audioQueue = [];
+  audioIndex = 0;
+  pendingCount = 0;
 }
 
-// ---------------------------------------------------------------------------
-// Text splitting -- paragraph-aware, 4000-char target
-// ---------------------------------------------------------------------------
+// ─── Text splitting ────────────────────────────────────────────
 
 function normalizeText(text) {
   return (text || "")
@@ -189,213 +155,179 @@ function splitTextForTTS(text, maxChars = CHUNK_TARGET_CHARS) {
   return out;
 }
 
-// ---------------------------------------------------------------------------
-// ArrayBuffer decode helper -- used for stream chunks from background.js
-// ---------------------------------------------------------------------------
+// ─── Playback ────────────────────────────────────────────────────
 
-function decodeArrayBufferToAudioBuffer(arrayBuffer) {
-  const ctx = getAudioContext();
-  // Slice to create an owned copy (some ArrayBuffers from messaging are detached)
-  const owned = arrayBuffer.slice(0);
-  return ctx.decodeAudioData(owned);
-}
-
-// ---------------------------------------------------------------------------
-// AudioBufferQueue -- per-chunk lifecycle manager
-// ---------------------------------------------------------------------------
-
-class AudioBufferQueue {
-  constructor() {
-    this.buffers = new Map();
-    this.pending = new Map();
-    this.isStopped = false;
-    this.completedCount = 0;
-    this.totalChunks = 0;
-  }
-
-  isReady(idx) { const b = this.buffers.get(idx); return b?.complete; }
-
-  addStreamChunk(idx) {
-    if (this.isStopped) return;
-    if (!this.buffers.has(idx))
-      this.buffers.set(idx, { complete: false });
-  }
-
-  markChunkComplete(idx) {
-    if (this.isStopped) return;
-    if (!this.buffers.has(idx))
-      this.buffers.set(idx, { complete: true });
-    const b = this.buffers.get(idx);
-    if (!b.complete) {
-      b.complete = true;
-      this.completedCount++;
+function playNextChunk(runId) {
+  if (runId !== speakRunId) return;
+  if (audioIndex >= audioQueue.length) {
+    // All done
+    if (pendingCount === 0) {
+      isSpeaking = false;
+      isPaused = false;
+      setBusy(false, "Speak");
     }
-    const p = this.pending.get(idx);
-    if (p) { this.pending.delete(idx); p.resolve(b); }
-  }
-
-  waitForChunk(idx) {
-    const b = this.buffers.get(idx);
-    if (b?.complete) return Promise.resolve(b);
-    if (this.pending.has(idx)) return this.pending.get(idx).promise;
-    let resolve, reject;
-    const promise = new Promise((res, rej) => { resolve = res; reject = rej; });
-    this.pending.set(idx, { promise, resolve, reject });
-    return promise;
-  }
-
-  cleanup(fromIdx) {
-    for (const [idx, b] of this.buffers) {
-      if (idx < fromIdx) this.buffers.delete(idx);
-    }
-  }
-
-  stop() {
-    this.isStopped = true;
-    for (const [idx, p] of this.pending) { if (p) p.reject(new Error("stopped")); }
-    this.buffers.clear();
-    this.pending.clear();
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Audio request helpers
-// ---------------------------------------------------------------------------
-
-function requestStreamAudio(text, settings, chunkIndex) {
-  chrome.runtime.sendMessage({
-    type: "TTS_STREAM_REQUEST",
-    text,
-    voice: settings.voice || "ryan",
-    speed: settings.speed || 1.0,
-    language: settings.language || "Auto",
-    model: settings.model || "qwen3-tts",
-    chunkIndex,
-  });
-}
-
-function requestStreamBatchAudio(texts, settings) {
-  chrome.runtime.sendMessage({
-    type: "TTS_STREAM_BATCH_REQUEST",
-    texts,
-    voice: settings.voice || "ryan",
-    speed: settings.speed || 1.0,
-    language: settings.language || "Auto",
-    model: settings.model || "qwen3-tts",
-  });
-}
-
-// ---------------------------------------------------------------------------
-// Web Audio API gapless scheduling -- reuse AudioContext
-// ---------------------------------------------------------------------------
-
-function getAudioContext() {
-  if (!audioContext || audioContext.state === "closed")
-    audioContext = new (window.AudioContext || window.webkitAudioContext)();
-  return audioContext;
-}
-
-// Schedule a pre-decoded AudioBuffer directly
-function scheduleAudioBuffer(audioBuffer) {
-  const ctx = getAudioContext();
-
-  const source = ctx.createBufferSource();
-  source.buffer = audioBuffer;
-  source.playbackRate.value = Math.max(0.5, Math.min(3.0, currentPlaybackRate));
-  source.connect(ctx.destination);
-
-  const now = ctx.currentTime;
-  if (nextPlayTime < now) nextPlayTime = now + 0.02;
-  source.start(nextPlayTime);
-  nextPlayTime += audioBuffer.duration / currentPlaybackRate;
-
-  activeSourceCount++;
-  activeSources.add(source);
-  source.onended = () => {
-    activeSourceCount--;
-    activeSources.delete(source);
-  };
-
-  return audioBuffer.duration;
-}
-
-function waitForAllAudioToFinish() {
-  return new Promise((resolve) => {
-    const check = setInterval(() => {
-      if (activeSourceCount <= 0) {
-        clearInterval(check);
-        resolve();
-      }
-    }, 200);
-  });
-}
-
-// ---------------------------------------------------------------------------
-// Stream chunk messages from background.js -- direct ArrayBuffer decode
-// ---------------------------------------------------------------------------
-
-chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
-  if (message.type === "STOP_TTS") {
-    stopAllAudio();
-    if (activeAudioQueue) { activeAudioQueue.stop(); activeAudioQueue = null; }
-    isSpeaking = false;
-    isPaused = false;
-    speakRunId++;
-    isStreamActive = false;
-    widget?.classList.remove("paused");
-    setLabel("Speak");
-    if (sendResponse) sendResponse({ stopped: true });
     return;
   }
 
-  if (!activeAudioQueue || !isStreamActive) return;
+  const audio = audioQueue[audioIndex];
+  if (!audio) {
+    audioIndex++;
+    playNextChunk(runId);
+    return;
+  }
 
-  if (message.type === "TTS_STREAM_CHUNK") {
-    const { chunkIndex, audioArrayBuffer, audioBase64, audioMimeType } = message;
+  const onEnded = () => {
+    audio.removeEventListener("ended", onEnded);
+    audio.removeEventListener("error", onError);
+    audioIndex++;
+    playNextChunk(runId);
+  };
 
-    // Prefer raw ArrayBuffer (zero-copy from background.js), fall back to base64
-    const buf = audioArrayBuffer || (audioBase64 ? (() => {
-      const binaryStr = atob(audioBase64);
-      const bytes = new Uint8Array(binaryStr.length);
-      for (let i = 0; i < binaryStr.length; i++) bytes[i] = binaryStr.charCodeAt(i);
-      return bytes.buffer;
-    })() : null);
+  const onError = () => {
+    audio.removeEventListener("ended", onEnded);
+    audio.removeEventListener("error", onError);
+    console.error("[Open TTS] Audio error chunk", audioIndex);
+    audioIndex++;
+    playNextChunk(runId);
+  };
 
-    if (!buf) return;
+  audio.addEventListener("ended", onEnded);
+  audio.addEventListener("error", onError);
 
-    (async () => {
-      try {
-        const ctx = getAudioContext();
-        if (ctx.state === "suspended") await ctx.resume();
+  audio.play().catch(err => {
+    console.error("[Open TTS] Play failed:", err);
+    audioIndex++;
+    playNextChunk(runId);
+  });
 
-        const audioBuffer = await decodeArrayBufferToAudioBuffer(buf);
-        const dur = scheduleAudioBuffer(audioBuffer);
-        if (dur > 0) console.log(`[Open TTS] Scheduled sub-chunk: ${dur.toFixed(1)}s (chunk ${chunkIndex}${audioMimeType ? `, ${audioMimeType}` : ''})`);
-      } catch (e) {
-        console.error("[Open TTS] Stream decode error:", e);
+  setBusy(true, audioIndex + 1 < audioQueue.length || pendingCount > 0
+    ? `Reading ${audioIndex + 1}/${Math.max(audioQueue.length, audioIndex + 1 + pendingCount)}... tap to stop`
+    : "Reading... tap to stop");
+}
+
+// ─── Batch request ──────────────────────────────────────────────
+
+async function requestBatchAudio(texts, settings) {
+  return new Promise((resolve, reject) => {
+    chrome.runtime.sendMessage({
+      type: "TTS_BATCH_REQUEST",
+      texts,
+      voice: settings.voice || "ryan",
+      speed: settings.speed || 1.0,
+      language: settings.language || "Auto",
+      model: settings.model || "qwen3-tts",
+    }, (response) => {
+      const err = chrome.runtime.lastError;
+      if (err) {
+        reject(new Error(err.message));
+        return;
       }
-    })();
+      if (response?.success) resolve(response);
+      else reject(new Error(response?.error || "TTS request failed"));
+    });
+  });
+}
 
-    activeAudioQueue.addStreamChunk(chunkIndex);
+// ─── Main speak handler ─────────────────────────────────────────
+
+async function onSpeakClick(event) {
+  event.preventDefault();
+  event.stopPropagation();
+
+  const text = selectedText?.trim();
+  if (!text) return;
+
+  // Stop / pause / resume logic
+  if (isSpeaking) {
+    const currentAudio = audioQueue[audioIndex];
+    if (currentAudio && !currentAudio.paused && !isPaused) {
+      currentAudio.pause();
+      isPaused = true;
+      widget?.classList.add("paused");
+      setBusy(true, "Paused — tap to resume");
+      return;
+    }
+    if (currentAudio && isPaused) {
+      currentAudio.play().catch(() => {});
+      isPaused = false;
+      widget?.classList.remove("paused");
+      setBusy(true, "Reading... tap to stop");
+      return;
+    }
+    // Full stop
+    speakRunId++;
+    isSpeaking = false;
+    isPaused = false;
+    widget?.classList.remove("paused");
+    stopAllAudio();
+    setBusy(false, "Stopped");
+    return;
   }
 
-  if (message.type === "TTS_STREAM_DONE") {
-    const { chunkIndex } = message;
-    console.log(`[Open TTS] Stream complete for chunk ${chunkIndex}`);
-    activeAudioQueue.markChunkComplete(chunkIndex);
-  }
+  const runId = ++speakRunId;
+  isSpeaking = true;
+  isPaused = false;
+  stopAllAudio();
 
-  if (message.type === "TTS_STREAM_ERROR") {
-    const { chunkIndex, error } = message;
-    console.error(`[Open TTS] Stream error chunk ${chunkIndex}:`, error);
-    const p = activeAudioQueue.pending.get(chunkIndex);
-    if (p) { activeAudioQueue.pending.delete(chunkIndex); p.reject(new Error(error)); }
-  }
-});
+  try {
+    setBusy(true, "Preparing...");
 
-// ---------------------------------------------------------------------------
-// Mouse events
-// ---------------------------------------------------------------------------
+    const serverReady = chrome.runtime.sendMessage({ type: "ENSURE_SERVER" }).catch(() => null);
+    const settings = await chrome.storage.sync.get(["voice", "speed", "language", "model"]);
+    const playbackRate = Number(settings.speed) || 1.0;
+
+    const chunks = splitTextForTTS(text, CHUNK_TARGET_CHARS);
+    if (!chunks.length) throw new Error("Nothing to read");
+
+    await serverReady;
+    pendingCount = chunks.length;
+
+    // Single HTTP call for all chunks — one gpu_lock on server
+    setBusy(true, `Generating ${chunks.length} chunk(s)...`);
+    const batchResult = await requestBatchAudio(chunks, settings);
+
+    pendingCount = 0;
+
+    if (runId !== speakRunId) return; // user stopped
+
+    const results = batchResult.results || [];
+    if (!results.length) throw new Error("No audio returned");
+
+    // Build Audio elements from base64 responses
+    for (let i = 0; i < results.length; i++) {
+      const r = results[i];
+      if (r.error) {
+        console.warn(`[Open TTS] Chunk ${i} error:`, r.error);
+        continue;
+      }
+      if (!r.audio_base64) continue;
+
+      const mime = r.mime_type || "audio/ogg";
+      const dataUrl = `data:${mime};base64,${r.audio_base64}`;
+      const audio = new Audio(dataUrl);
+      audio.playbackRate = playbackRate;
+      audio.preservesPitch = true;
+      audioQueue.push(audio);
+    }
+
+    if (!audioQueue.length) {
+      throw new Error("No playable audio generated");
+    }
+
+    // Start sequential playback
+    audioIndex = 0;
+    playNextChunk(runId);
+
+  } catch (error) {
+    console.error("[Open TTS] Error:", error);
+    if (runId === speakRunId) flashError(error?.message || "Couldn't read. Tap again");
+    isSpeaking = false;
+    isPaused = false;
+    pendingCount = 0;
+  }
+}
+
+// ─── Selection events ────────────────────────────────────────────
 
 document.addEventListener("mouseup", () => {
   const text = window.getSelection()?.toString().trim();
@@ -407,137 +339,17 @@ document.addEventListener("mousedown", (e) => {
   if (widget && !widget.contains(e.target)) hideWidget();
 });
 
-// ---------------------------------------------------------------------------
-// Main speak handler -- ALWAYS uses streaming for instant first-audio
-// ---------------------------------------------------------------------------
+// ─── STOP handler from popup ─────────────────────────────────────
 
-async function onSpeakClick(event) {
-  event.preventDefault();
-  event.stopPropagation();
-
-  const text = selectedText?.trim();
-  if (!text) return;
-
-  // Pause / resume for HTMLAudioElement (used only for non-streaming preview)
-  // For streaming, tap = stop
-  if (isSpeaking) {
-    if (currentAudio && !currentAudio.paused && !isPaused) {
-      currentAudio.pause();
-      isPaused = true;
-      widget?.classList.add("paused");
-      setBusy(true, "Paused - tap to resume");
-      return;
-    }
-    if (currentAudio && isPaused) {
-      await currentAudio.play();
-      isPaused = false;
-      widget?.classList.remove("paused");
-      setBusy(true, "Reading... tap to pause");
-      return;
-    }
-    // Stop everything (streaming or otherwise)
+chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  if (message.type === "STOP_TTS") {
     speakRunId++;
     isSpeaking = false;
     isPaused = false;
     widget?.classList.remove("paused");
     stopAllAudio();
-    if (activeAudioQueue) { activeAudioQueue.stop(); activeAudioQueue = null; }
-    setBusy(false, "Stopped");
-    return;
+    setLabel("Speak");
+    if (sendResponse) sendResponse({ stopped: true });
+    return true;
   }
-
-  const runId = ++speakRunId;
-  isSpeaking = true;
-  isPaused = false;
-  isStreamActive = false;
-  widget?.classList.remove("paused");
-  nextPlayTime = 0;
-  activeSourceCount = 0;
-  activeSources.clear();
-
-  // Eagerly resume AudioContext on user gesture
-  const ctx = getAudioContext();
-  if (ctx.state === "suspended") await ctx.resume();
-
-  const queue = new AudioBufferQueue();
-  activeAudioQueue = queue;
-
-  try {
-    setBusy(true, "Preparing...");
-    // Pre-warm server connection while we prepare chunks
-    const serverReady = chrome.runtime.sendMessage({ type: "ENSURE_SERVER" }).catch(() => null);
-    const settings = await chrome.storage.sync.get(["voice", "speed", "language", "model"]);
-    const playbackRate = Number(settings.speed) || 1.0;
-    currentPlaybackRate = playbackRate;
-
-    const chunks = splitTextForTTS(text, CHUNK_TARGET_CHARS);
-    if (!chunks.length) throw new Error("Nothing to read");
-
-    await serverReady;
-
-    queue.totalChunks = chunks.length;
-    console.log(`[Open TTS] ${chunks.length} chunk(s), ${text.length} chars, speed: ${playbackRate}x`);
-
-    // ---- ALWAYS STREAM ----
-    // Even for short text, streaming gives first-audio in ~250ms
-    // vs 5+ seconds waiting for full generation in non-streaming mode
-    isStreamActive = true;
-
-    // Batch path: single HTTP call for all chunks (faster, one gpu_lock)
-    if (chunks.length > 1) {
-      requestStreamBatchAudio(chunks, settings);
-    }
-
-    for (let i = 0; i < chunks.length; i++) {
-      if (runId !== speakRunId || queue.isStopped) return;
-
-      setBusy(true, `Generating ${i + 1}/${chunks.length}...`);
-
-      // Start streaming for this chunk (only in single-chunk mode)
-      if (chunks.length === 1) {
-        requestStreamAudio(chunks[i], settings, i);
-      }
-
-      // Wait for this chunk's stream to complete
-      try {
-        await queue.waitForChunk(i);
-      } catch (e) {
-        if (queue.isStopped) return;
-        throw e;
-      }
-
-      if (runId !== speakRunId || queue.isStopped) return;
-
-      setBusy(true, chunks.length > 1 ? `Reading ${i + 1}/${chunks.length}... tap to stop` : "Reading... tap to stop");
-
-      // Brief pause to let audio pipeline fill before next chunk request
-      if (i < chunks.length - 1) {
-        await new Promise(r => setTimeout(r, 10));
-      }
-
-      queue.cleanup(i);
-    }
-
-    // All chunks generated and scheduled -- wait for remaining audio to finish
-    if (activeSourceCount > 0) {
-      setBusy(true, "Finishing...");
-      await waitForAllAudioToFinish();
-    }
-
-    if (runId === speakRunId && !queue.isStopped) setBusy(false);
-  } catch (error) {
-    console.error("[Open TTS] Error:", error);
-    if (runId === speakRunId) flashError(error?.message || "Couldn't read. Tap again");
-  } finally {
-    if (runId === speakRunId) {
-      isSpeaking = false;
-      isPaused = false;
-      isStreamActive = false;
-      widget?.classList.remove("paused");
-    }
-    if (activeAudioQueue === queue) {
-      queue.stop();
-      activeAudioQueue = null;
-    }
-  }
-}
+});

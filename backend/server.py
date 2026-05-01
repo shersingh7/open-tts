@@ -1,8 +1,11 @@
 import asyncio
+import base64
 import gc
 import io
+import json
 import os
 import signal
+import struct
 import threading
 import time as _time
 from contextlib import asynccontextmanager
@@ -181,6 +184,13 @@ def _encode_audio(audio: np.ndarray, sample_rate: int,
     """Encode audio array to bytes. Returns (bytes, mime_type)."""
     fmt = fmt if fmt in AUDIO_FORMATS else DEFAULT_AUDIO_FORMAT
     mime = AUDIO_FORMATS[fmt]
+
+    # Fast path: WAV via soundfile (no ffmpeg, no mlx_audio wrapper overhead)
+    if fmt == "wav":
+        buffer = io.BytesIO()
+        sf.write(buffer, audio, sample_rate, format="WAV", subtype="PCM_16")
+        buffer.seek(0)
+        return buffer.read(), mime
 
     try:
         buffer = io.BytesIO()
@@ -480,7 +490,6 @@ def _synthesize_batch_sync(model, base_kwargs, texts, model_id, voice, lang_code
                 audio_bytes, mime_type = _encode_audio(audio, first_sample_rate, fmt=audio_format)
                 encode_elapsed = _time.perf_counter() - encode_start
 
-                import base64
                 results.append({
                     "index": idx,
                     "audio_base64": base64.b64encode(audio_bytes).decode("ascii"),

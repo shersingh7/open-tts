@@ -1,9 +1,7 @@
 #!/usr/bin/env python3
-"""
-Native Messaging Host for Open TTS extension.
-Handles start/stop server commands from the Chrome extension.
-"""
+"""Native Messaging Host for Open TTS extension."""
 
+import fcntl
 import json
 import os
 import signal
@@ -14,7 +12,6 @@ import struct
 import time
 from pathlib import Path
 
-# Get the directory where this script is located
 SCRIPT_DIR = Path(__file__).parent.resolve()
 BACKEND_DIR = SCRIPT_DIR
 SERVER_SCRIPT = BACKEND_DIR / "server.py"
@@ -22,6 +19,33 @@ VENV_PYTHON = BACKEND_DIR / "venv" / "bin" / "python"
 PID_FILE = BACKEND_DIR / ".server.pid"
 LOG_FILE = BACKEND_DIR / "server.log"
 DEFAULT_PORT = int(os.getenv("OPEN_TTS_PORT", "8000"))
+
+# ---------------------------------------------------------------------------
+# PID file lock — prevents concurrent native host races
+# ---------------------------------------------------------------------------
+_pid_fd = None
+
+def _acquire_pid_lock():
+    """Open PID_FILE with an exclusive fcntl lock."""
+    global _pid_fd
+    try:
+        _pid_fd = open(PID_FILE, "a+")
+        fcntl.flock(_pid_fd.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        _pid_fd.seek(0)
+        _pid_fd.truncate()
+        return True
+    except (OSError, IOError):
+        return False
+
+def _release_pid_lock():
+    global _pid_fd
+    if _pid_fd:
+        try:
+            fcntl.flock(_pid_fd.fileno(), fcntl.LOCK_UN)
+            _pid_fd.close()
+        except Exception:
+            pass
+        _pid_fd = None
 
 # ---------------------------------------------------------------------------
 # Native messaging protocol helpers
