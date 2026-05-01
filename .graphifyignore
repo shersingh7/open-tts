@@ -1,0 +1,14 @@
+# Open TTS Graphify Ignore
+venv/
+.cache/
+models/
+*.wav
+*.mp3
+*.ogg
+*.pt
+*.safetensors
+*.bin
+*.onnx
+node_modules/
+.git/
+.DS_Store

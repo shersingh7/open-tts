@@ -29,6 +29,8 @@ DEFAULT_MODEL_ID = os.getenv("OPEN_TTS_DEFAULT_MODEL", "qwen3-tts")
 DEFAULT_AUDIO_FORMAT = os.getenv("OPEN_TTS_AUDIO_FORMAT", "opus")
 OPUS_BITRATE = os.getenv("OPEN_TTS_OPUS_BITRATE", "64k")
 STREAMING_INTERVAL = float(os.getenv("OPEN_TTS_STREAMING_INTERVAL", "0.25"))
+# Maximum seconds a single generation call can run before timeout
+GEN_TIMEOUT_SECONDS = int(os.getenv("OPEN_TTS_GEN_TIMEOUT", "300"))
 
 # ---------------------------------------------------------------------------
 # Model registry
@@ -66,12 +68,13 @@ MODEL_REGISTRY: Dict[str, dict] = {
     },
 }
 
-FISH_VOICE_TAGS = [
+# Set for O(1) lookup — was a list, now a frozenset
+FISH_VOICE_TAGS = frozenset([
     "pause", "emphasis", "laughing", "inhale", "chuckle", "tsk",
     "singing", "excited", "volume up", "echo", "angry", "whisper",
     "screaming", "sad", "shocked", "pitch up", "pitch down",
     "professional broadcast tone",
-]
+])
 
 AUDIO_FORMATS = {
     "opus": "audio/ogg; codecs=opus",
@@ -110,9 +113,7 @@ VOICE_LABELS = {
 
 VOICE_ALIASES = {
     "uncle fu": "uncle_fu",
-    "uncle_fu": "uncle_fu",
     "ono anna": "ono_anna",
-    "ono_anna": "ono_anna",
 }
 
 LANG_ALIASES = {
@@ -215,15 +216,37 @@ class ModelManager:
         self._loading_timeout = 120  # seconds
         self._cached_voices: Dict[str, List[str]] = {}
         self._voice_lower_map: Dict[str, Dict[str, str]] = {}
+        self._warmup_done = threading.Event()
 
     def is_loaded(self, model_id: str) -> bool:
         return self.loaded_model is not None and self.loaded_model_id == model_id
+
+    def is_warm(self) -> bool:
+        """True if the current model has completed warmup."""
+        return self._warmup_done.is_set()
 
     def get_voices_cached(self, model_id: str) -> List[str]:
         return self._cached_voices.get(model_id, [])
 
     def get_voice_lower_map(self, model_id: str) -> Dict[str, str]:
         return self._voice_lower_map.get(model_id, {})
+
+    def _do_warmup(self, model, model_id: str):
+        """Run warmup inference in a background thread so port binds immediately."""
+        reg = MODEL_REGISTRY.get(model_id, {})
+        try:
+            warmup_kwargs = dict(
+                text=WARMUP_TEXT, speed=1.0, verbose=False, max_tokens=128,
+            )
+            if reg.get("has_preset_voices"):
+                warmup_kwargs["voice"] = reg.get("default_voices", ["ryan"])[0]
+                warmup_kwargs["lang_code"] = "en"
+            _ = next(model.generate(**warmup_kwargs))
+            print(f"Warmup complete for {model_id}")
+        except Exception as warmup_exc:
+            print(f"Warmup skipped for {model_id}: {warmup_exc}")
+        finally:
+            self._warmup_done.set()
 
     def get_or_load(self, model_id: str):
         reg = MODEL_REGISTRY.get(model_id)
@@ -254,6 +277,7 @@ class ModelManager:
                 self.loaded_model = None
                 self.loaded_model_id = None
                 self.load_error = None
+                self._warmup_done.clear()
                 _clear_gpu_memory()
 
             model_path = reg["local_dir"]
@@ -275,18 +299,14 @@ class ModelManager:
                     del self._cached_voices[old_id]
                     self._voice_lower_map.pop(old_id, None)
 
-            # Warmup
-            try:
-                warmup_kwargs = dict(
-                    text=WARMUP_TEXT, speed=1.0, verbose=False, max_tokens=128,
-                )
-                if reg.get("has_preset_voices"):
-                    warmup_kwargs["voice"] = reg.get("default_voices", ["ryan"])[0]
-                    warmup_kwargs["lang_code"] = "en"
-                _ = next(self.loaded_model.generate(**warmup_kwargs))
-                print(f"Warmup complete for {model_id}")
-            except Exception as warmup_exc:
-                print(f"Warmup skipped for {model_id}: {warmup_exc}")
+            # Start warmup in background thread — don't block port binding
+            self._warmup_done.clear()
+            warmup_thread = threading.Thread(
+                target=self._do_warmup,
+                args=(self.loaded_model, model_id),
+                daemon=True,
+            )
+            warmup_thread.start()
 
             return self.loaded_model
 
@@ -316,9 +336,29 @@ class SynthesizeRequest(BaseModel):
     stream: bool = False
     format: str = "opus"
 
+
+class BatchSynthesizeRequest(BaseModel):
+    texts: List[str] = Field(..., min_length=1, max_length=50)
+    voice: str = "ryan"
+    speed: float = Field(1.0, ge=0.5, le=3.0)
+    language: str = "Auto"
+    instruct: Optional[str] = None
+    model: Optional[str] = None
+    format: str = "opus"
+
+
 # ---------------------------------------------------------------------------
 # Sync synthesis helpers — both use gpu_lock for serialized GPU access
 # ---------------------------------------------------------------------------
+
+def _try_asarray_f32(arr) -> np.ndarray:
+    """Convert to float32 numpy array — avoids copy if already float32."""
+    if hasattr(arr, 'dtype') and arr.dtype == np.float32:
+        if isinstance(arr, np.ndarray):
+            return arr
+        return np.asarray(arr)
+    return np.asarray(arr, dtype=np.float32)
+
 
 def _synthesize_sync(model, gen_kwargs, model_id, request_voice, lang_code,
                      audio_format: str = DEFAULT_AUDIO_FORMAT) -> tuple:
@@ -330,14 +370,23 @@ def _synthesize_sync(model, gen_kwargs, model_id, request_voice, lang_code,
 
     try:
         gen_start = _time.perf_counter()
+        deadline = gen_start + GEN_TIMEOUT_SECONDS
         audio_parts = []
         first_sample_rate = None
         first_rtf = 0
+
         for result in model.generate(**gen_kwargs):
+            # Enforce generation timeout
+            if _time.perf_counter() > deadline:
+                raise TimeoutError(
+                    f"Generation timed out after {GEN_TIMEOUT_SECONDS}s. "
+                    f"Text was {len(gen_kwargs.get('text', ''))} chars."
+                )
             if first_sample_rate is None:
                 first_sample_rate = result.sample_rate
                 first_rtf = getattr(result, 'real_time_factor', 0)
-            audio_parts.append(np.asarray(result.audio, dtype=np.float32))
+            audio_parts.append(_try_asarray_f32(result.audio))
+
         if not audio_parts:
             raise ValueError("No audio generated")
         gen_elapsed = _time.perf_counter() - gen_start
@@ -363,7 +412,8 @@ def _synthesize_sync(model, gen_kwargs, model_id, request_voice, lang_code,
         return audio_bytes, mime_type, headers
     except Exception as exc:
         # Only null the model on generation-level errors (bad state, corrupt output).
-        # Transient errors (GPU lock timeout, client disconnect) should NOT force a reload.
+        # Transient errors (GPU lock timeout, client disconnect, generation timeout)
+        # should NOT force a reload.
         error_str = str(exc)
         is_transient = (
             "GPU busy" in error_str
@@ -380,7 +430,65 @@ def _synthesize_sync(model, gen_kwargs, model_id, request_voice, lang_code,
         raise
     finally:
         gpu_lock.release()
-        gc.collect()  # Clean up intermediate tensors between requests
+
+
+def _synthesize_batch_sync(model, base_kwargs, texts, model_id, voice, lang_code,
+                           audio_format: str = DEFAULT_AUDIO_FORMAT) -> List[dict]:
+    """Generate multiple texts under a SINGLE gpu_lock acquisition.
+    Returns list of {index, audio_b64, mime_type, gen_time, encode_time, error}.
+    This is the big win: 1 lock acquire for N chunks instead of N."""
+    acquired = gpu_lock.acquire(timeout=60)
+    if not acquired:
+        raise HTTPException(status_code=503, detail="GPU busy — all inference slots taken. Please retry.")
+
+    results = []
+    try:
+        for idx, text in enumerate(texts):
+            chunk_start = _time.perf_counter()
+            deadline = chunk_start + GEN_TIMEOUT_SECONDS
+            gen_kwargs = {**base_kwargs, "text": text}
+
+            try:
+                audio_parts = []
+                first_sample_rate = None
+
+                for result in model.generate(**gen_kwargs):
+                    if _time.perf_counter() > deadline:
+                        raise TimeoutError(f"Chunk {idx} timed out after {GEN_TIMEOUT_SECONDS}s")
+                    if first_sample_rate is None:
+                        first_sample_rate = result.sample_rate
+                    audio_parts.append(_try_asarray_f32(result.audio))
+
+                if not audio_parts:
+                    raise ValueError(f"Chunk {idx}: no audio generated")
+
+                gen_elapsed = _time.perf_counter() - chunk_start
+                audio = np.concatenate(audio_parts, axis=0) if len(audio_parts) > 1 else audio_parts[0]
+                del audio_parts
+
+                encode_start = _time.perf_counter()
+                audio_bytes, mime_type = _encode_audio(audio, first_sample_rate, fmt=audio_format)
+                encode_elapsed = _time.perf_counter() - encode_start
+
+                import base64
+                results.append({
+                    "index": idx,
+                    "audio_base64": base64.b64encode(audio_bytes).decode("ascii"),
+                    "mime_type": mime_type,
+                    "gen_time": round(gen_elapsed, 3),
+                    "encode_time": round(encode_elapsed, 3),
+                    "sample_rate": first_sample_rate,
+                })
+            except Exception as exc:
+                print(f"[Batch] Chunk {idx} failed: {exc}")
+                results.append({
+                    "index": idx,
+                    "error": str(exc),
+                })
+    finally:
+        gpu_lock.release()
+
+    return results
 
 
 def _streaming_wav_generator_sync(model, gen_kwargs, model_id, request_voice, lang_code):
@@ -393,12 +501,15 @@ def _streaming_wav_generator_sync(model, gen_kwargs, model_id, request_voice, la
     total_audio_samples = 0
 
     stream_kwargs = {**gen_kwargs, "stream": True, "streaming_interval": STREAMING_INTERVAL}
+    deadline = gen_start + GEN_TIMEOUT_SECONDS
 
     for result in model.generate(**stream_kwargs):
+        if _time.perf_counter() > deadline:
+            raise TimeoutError(f"Streaming generation timed out after {GEN_TIMEOUT_SECONDS}s")
         if first_chunk_time is None:
             first_chunk_time = _time.perf_counter()
 
-        audio = np.asarray(result.audio, dtype=np.float32)
+        audio = _try_asarray_f32(result.audio)
         total_audio_samples += audio.shape[0]
 
         # Fast WAV encode — no ffmpeg subprocess
@@ -473,11 +584,44 @@ def _build_gen_kwargs(request: SynthesizeRequest) -> tuple:
     return gen_kwargs, model_id, lang_code
 
 
+def _build_base_gen_kwargs(request: SynthesizeRequest, text: str) -> tuple:
+    """Like _build_gen_kwargs but takes explicit text (for batch)."""
+    model_id = request.model or DEFAULT_MODEL_ID
+    if model_id not in MODEL_REGISTRY:
+        raise HTTPException(status_code=404, detail=f"Unknown model: {model_id}")
+    try:
+        model = manager.get_or_load(model_id)
+    except HTTPException:
+        raise
+
+    reg = MODEL_REGISTRY.get(model_id, {})
+    voices = manager.get_voices_cached(model_id)
+    voice_lower_map = manager.get_voice_lower_map(model_id)
+
+    gen_kwargs = dict(
+        speed=float(request.speed),
+        verbose=False,
+        max_tokens=4096,
+    )
+
+    if reg.get("has_preset_voices"):
+        speaker = normalize_voice(request.voice, voices, voice_lower_map) if voices else request.voice
+        gen_kwargs["voice"] = speaker
+        if reg.get("supports_lang_code"):
+            gen_kwargs["lang_code"] = normalize_language(request.language)
+        if request.instruct and reg.get("supports_instruct"):
+            gen_kwargs["instruct"] = request.instruct
+
+    lang_code = gen_kwargs.get("lang_code", "auto")
+    return gen_kwargs, model_id, lang_code, model
+
+
 # ---------------------------------------------------------------------------
 # App lifespan
 # ---------------------------------------------------------------------------
 
 _shutdown_event = None
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -493,6 +637,7 @@ async def lifespan(app: FastAPI):
     signal.signal(signal.SIGTERM, _signal_handler)
     signal.signal(signal.SIGINT, _signal_handler)
 
+    # Load model on startup (warmup happens in background, port binds immediately)
     try:
         manager.get_or_load(DEFAULT_MODEL_ID)
     except HTTPException:
@@ -533,11 +678,14 @@ async def log_requests(request, call_next):
     return await call_next(request)
 
 # ---------------------------------------------------------------------------
-# Endpoints
+# Health response cache — avoids redundant work during polling
 # ---------------------------------------------------------------------------
 
-@app.get("/health")
-async def health():
+_health_cache = {"data": None, "ts": 0.0}
+_HEALTH_CACHE_TTL = 0.5  # 500ms TTL
+
+
+def _build_health_response():
     model = manager.loaded_model
     model_id = manager.loaded_model_id
     supported = manager.get_voices_cached(model_id) if model else []
@@ -546,10 +694,26 @@ async def health():
         "engine": "open-tts",
         "model": model_id or DEFAULT_MODEL_ID,
         "model_loaded": model is not None,
+        "model_warm": manager.is_warm(),
         "load_error": manager.load_error,
         "gpu_lock_held": gpu_lock.locked(),
         "voices": supported,
     }
+
+
+# ---------------------------------------------------------------------------
+# Endpoints
+# ---------------------------------------------------------------------------
+
+@app.get("/health")
+async def health():
+    now = _time.monotonic()
+    if _health_cache["data"] is not None and (now - _health_cache["ts"]) < _HEALTH_CACHE_TTL:
+        return _health_cache["data"]
+    data = _build_health_response()
+    _health_cache["data"] = data
+    _health_cache["ts"] = now
+    return data
 
 
 @app.get("/v1/models")
@@ -588,7 +752,7 @@ async def get_voices():
     voices = manager.get_voices_cached(model_id)
     reg = MODEL_REGISTRY.get(model_id, {})
     if not reg.get("has_preset_voices") and not voices:
-        voices = FISH_VOICE_TAGS
+        voices = list(FISH_VOICE_TAGS)
     return {
         "model": model_id,
         "voices": [
@@ -617,6 +781,8 @@ async def load_model_endpoint(model_id: str = DEFAULT_MODEL_ID, force: bool = Fa
     try:
         manager.get_or_load(model_id)
         voices = manager.get_voices_cached(model_id)
+        # Invalidate health cache after model load
+        _health_cache["data"] = None
         return {
             "success": True,
             "model": model_id,
@@ -734,6 +900,8 @@ async def synthesize(request: SynthesizeRequest):
             headers["X-TTS-Stream"] = "false"
         return Response(content=audio_bytes, media_type=mime_type, headers=headers)
 
+    except TimeoutError as exc:
+        raise HTTPException(status_code=504, detail=str(exc))
     except ValueError as exc:
         raise HTTPException(status_code=500, detail=str(exc))
     except HTTPException:
@@ -751,6 +919,137 @@ async def synthesize(request: SynthesizeRequest):
             print(f"[Synthesize] Generation failed (non-transient): {exc}")
         else:
             print(f"[Synthesize] Transient error, not clearing model: {exc}")
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+# ---------------------------------------------------------------------------
+# Batch synthesize endpoint — single HTTP roundtrip + single gpu_lock
+# for multiple texts. This is the BIG win for multi-chunk scenarios.
+# ---------------------------------------------------------------------------
+
+@app.post("/v1/synthesize-batch")
+async def synthesize_batch(request: BatchSynthesizeRequest):
+    """Generate audio for multiple texts in one HTTP call.
+    Acquires gpu_lock once for all texts. Returns JSON array of base64-encoded
+    audio chunks. Dramatically faster than N separate synthesize calls."""
+    if not request.texts:
+        raise HTTPException(status_code=400, detail="texts array cannot be empty")
+    if len(request.texts) > 50:
+        raise HTTPException(status_code=400, detail="Maximum 50 texts per batch request")
+
+    request_start = _time.perf_counter()
+
+    # Build a dummy SynthesizeRequest to reuse _build_base_gen_kwargs
+    dummy = SynthesizeRequest(
+        text=request.texts[0],  # just a placeholder
+        voice=request.voice,
+        speed=request.speed,
+        language=request.language,
+        instruct=request.instruct,
+        model=request.model,
+        stream=False,
+        format=request.format,
+    )
+
+    try:
+        base_kwargs, model_id, lang_code, model = _build_base_gen_kwargs(dummy, dummy.text)
+    except HTTPException:
+        raise
+
+    # Run all generations under one lock
+    results = await asyncio.to_thread(
+        _synthesize_batch_sync, model, base_kwargs, request.texts,
+        model_id, request.voice, lang_code, request.format,
+    )
+
+    total_time = round(_time.perf_counter() - request_start, 3)
+    error_count = sum(1 for r in results if "error" in r)
+
+    return {
+        "results": results,
+        "model": model_id,
+        "voice": request.voice,
+        "total_time": total_time,
+        "error_count": error_count,
+    }
+
+
+# ---------------------------------------------------------------------------
+# OpenAI-compatible /v1/audio/speech endpoint
+# ---------------------------------------------------------------------------
+
+class SpeechRequest(BaseModel):
+    """OpenAI /v1/audio/speech compatible request."""
+    model: str = DEFAULT_MODEL_ID
+    input: str = Field(..., min_length=1, max_length=10000)
+    voice: str = "ryan"
+    response_format: str = "opus"  # mp3, opus, aac, flac, wav
+    speed: float = Field(1.0, ge=0.5, le=3.0)
+
+    # Extra fields our engine supports but OpenAI doesn't
+    language: str = "Auto"
+    instruct: Optional[str] = None
+
+
+FORMAT_MAP = {
+    "mp3": "mp3",
+    "opus": "opus",
+    "aac": "aac",
+    "flac": "flac",
+    "wav": "wav",
+    "pcm": "wav",
+}
+
+MIME_MAP = {
+    "mp3": "audio/mpeg",
+    "opus": "audio/opus",
+    "aac": "audio/aac",
+    "flac": "audio/flac",
+    "wav": "audio/wav",
+}
+
+
+@app.post("/v1/audio/speech")
+async def openai_speech(request: SpeechRequest):
+    """OpenAI-compatible TTS endpoint.
+    Drops right into Hermes via:
+      tts:
+        provider: openai
+        openai:
+          base_url: http://127.0.0.1:8000/v1
+          model: qwen3-tts
+          voice: ryan
+    """
+    audio_format = FORMAT_MAP.get(request.response_format, "opus")
+
+    synth_req = SynthesizeRequest(
+        text=request.input,
+        voice=request.voice,
+        speed=request.speed,
+        language=request.language,
+        instruct=request.instruct,
+        model=request.model if request.model != "tts-1" else None,  # ignore OpenAI default model name
+        stream=False,
+        format=audio_format,
+    )
+
+    gen_kwargs, model_id, lang_code = _build_gen_kwargs(synth_req)
+    model = manager.loaded_model
+
+    try:
+        audio_bytes, mime_type, headers = await asyncio.to_thread(
+            _synthesize_sync, model, gen_kwargs, model_id, request.voice,
+            lang_code, audio_format,
+        )
+        resp_mime = MIME_MAP.get(audio_format, mime_type)
+        return Response(content=audio_bytes, media_type=resp_mime)
+    except TimeoutError as exc:
+        raise HTTPException(status_code=504, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+    except HTTPException:
+        raise
+    except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 

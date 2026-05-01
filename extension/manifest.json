@@ -12,6 +12,9 @@
   "host_permissions": [
     "http://127.0.0.1:8000/*"
   ],
+  "content_security_policy": {
+    "extension_pages": "script-src 'self'; object-src 'self'; font-src 'self' https://fonts.gstatic.com; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; connect-src 'self' http://127.0.0.1:8000;"
+  },
   "background": {
     "service_worker": "background.js"
   },

@@ -3,60 +3,160 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Open TTS</title>
+  <title>Open TTS — Imperial Edition</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@400;500;600;700;800;900&family=Share+Tech+Mono&display=swap" rel="stylesheet" />
   <link rel="stylesheet" href="popup.css" />
 </head>
-<body>
+<body data-theme="empire">
+  <div class="starfield" aria-hidden="true"></div>
+  <div class="scanlines" aria-hidden="true"></div>
+  <div class="vignette" aria-hidden="true"></div>
+
   <main class="app">
+    <!-- Header -->
     <header class="hero">
-      <img src="icon.png" alt="TTS" class="hero-icon" />
-      <div>
-        <h1>Open TTS</h1>
-        <p>Local. Multi-model. Mac-native.</p>
+      <div class="logo-ring">
+        <svg viewBox="0 0 64 64" class="logo-svg" aria-hidden="true">
+          <defs>
+            <filter id="logoGlow" x="-50%" y="-50%" width="200%" height="200%">
+              <feGaussianBlur stdDeviation="2" result="blur" />
+              <feMerge>
+                <feMergeNode in="blur" />
+                <feMergeNode in="SourceGraphic" />
+              </feMerge>
+            </filter>
+          </defs>
+          <circle cx="32" cy="32" r="30" fill="none" stroke="currentColor" stroke-width="2" filter="url(#logoGlow)" />
+          <path d="M32 6 L36 18 L48 14 L44 26 L56 30 L44 34 L48 46 L36 42 L32 54 L28 42 L16 46 L20 34 L8 30 L20 26 L16 14 L28 18 Z" fill="none" stroke="currentColor" stroke-width="1.5" />
+          <circle cx="32" cy="32" r="7" fill="currentColor" filter="url(#logoGlow)" />
+        </svg>
+      </div>
+      <div class="hero-text">
+        <h1>OPEN TTS</h1>
+        <p class="subtitle">IMPERIAL EDITION // LOCAL MULTI-MODEL</p>
+      </div>
+      <div class="theme-switcher" title="Choose your alliance">
+        <button class="theme-btn active" data-theme="empire" aria-label="Empire theme">◈</button>
+        <button class="theme-btn" data-theme="sith" aria-label="Sith theme">✦</button>
+        <button class="theme-btn" data-theme="rebel" aria-label="Rebel theme">✹</button>
       </div>
     </header>
 
-    <section class="card">
-      <div class="server-controls">
-        <button id="startServerBtn" class="server-btn start-btn">▶ Start Server</button>
-        <button id="stopServerBtn" class="server-btn stop-btn" disabled>⏹ Stop Server</button>
+    <!-- System Status -->
+    <section class="panel status-panel">
+      <div class="panel-header">
+        <span class="panel-icon" aria-hidden="true">◈</span>
+        <span class="panel-title">SYSTEM STATUS</span>
+        <span class="breathing-light" id="statusLight" aria-hidden="true"></span>
       </div>
-      <div id="serverStatus" class="server-status">Checking…</div>
+      <div class="server-controls">
+        <button id="startServerBtn" class="btn btn-success">
+          <span class="btn-icon">▶</span> INITIATE
+        </button>
+        <button id="stopServerBtn" class="btn btn-danger" disabled>
+          <span class="btn-icon">■</span> TERMINATE
+        </button>
+      </div>
+      <div id="serverStatus" class="server-readout mono">Scanning...</div>
     </section>
 
-    <section class="card">
-      <label for="model">Model</label>
-      <select id="model">
-        <option value="" disabled selected>Loading models…</option>
-      </select>
+    <!-- Configuration -->
+    <section class="panel">
+      <div class="panel-header">
+        <span class="panel-icon" aria-hidden="true">⚙</span>
+        <span class="panel-title">CONFIGURATION</span>
+      </div>
 
-      <label for="voice">Voice</label>
-      <select id="voice">
-        <option value="" disabled selected>Select model first</option>
-      </select>
+      <div class="field-group">
+        <label for="model">MODEL</label>
+        <select id="model" class="sw-select">
+          <option value="" disabled selected>Loading models...</option>
+        </select>
+        <div class="model-meta" id="modelMeta">—</div>
+      </div>
 
-      <label for="language">Language</label>
-      <select id="language">
-        <option value="Auto">Auto detect</option>
-        <option value="en">English</option>
-        <option value="zh">Chinese</option>
-        <option value="ja">Japanese</option>
-        <option value="ko">Korean</option>
-      </select>
+      <div class="field-group">
+        <label for="voice">VOICE</label>
+        <select id="voice" class="sw-select">
+          <option value="" disabled selected>Select model first</option>
+        </select>
+      </div>
 
-      <label for="speed">Speed <span id="speedValue">1.0x</span></label>
-      <input type="range" id="speed" min="0.5" max="3.0" step="0.1" value="1.0" />
+      <div class="field-row">
+        <div class="field-group half">
+          <label for="language">LANGUAGE</label>
+          <select id="language" class="sw-select">
+            <option value="Auto">AUTO-DETECT</option>
+            <option value="en">ENGLISH</option>
+            <option value="zh">CHINESE</option>
+            <option value="ja">JAPANESE</option>
+            <option value="ko">KOREAN</option>
+            <option value="es">SPANISH</option>
+            <option value="fr">FRENCH</option>
+            <option value="de">GERMAN</option>
+            <option value="hi">HINDI</option>
+            <option value="ru">RUSSIAN</option>
+            <option value="it">ITALIAN</option>
+            <option value="pt">PORTUGUESE</option>
+          </select>
+        </div>
+        <div class="field-group half">
+          <label for="speed">SPEED <span id="speedValue" class="mono-badge">1.0x</span></label>
+          <input type="range" id="speed" min="0.5" max="3.0" step="0.1" value="1.0" class="sw-slider" />
+        </div>
+      </div>
     </section>
 
-    <section class="card">
-      <label for="previewText">Preview text</label>
-      <textarea id="previewText" rows="3">Hello! Open TTS is ready. Multiple local models running entirely on your Mac.</textarea>
-      <button id="previewBtn">▶ Play preview</button>
+    <!-- Synthesis -->
+    <section class="panel">
+      <div class="panel-header">
+        <span class="panel-icon" aria-hidden="true">✦</span>
+        <span class="panel-title">SYNTHESIS</span>
+        <span id="charCount" class="mono-badge">0 chars</span>
+      </div>
+      <div class="textarea-wrap">
+        <textarea id="previewText" rows="3" placeholder="Enter transmission..."></textarea>
+        <button class="copy-btn" id="copyTextBtn" title="Copy to clipboard" aria-label="Copy text">
+          <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
+        </button>
+      </div>
+      <button id="previewBtn" class="btn btn-primary lightsaber-btn">
+        <span class="blade" aria-hidden="true"></span>
+        <span class="btn-text">EXECUTE TRANSMISSION</span>
+      </button>
+
+      <!-- Audio Visualizer -->
+      <div class="viz-wrap">
+        <canvas id="visualizer" width="340" height="44"></canvas>
+        <div class="viz-overlay mono" id="vizOverlay">STANDBY</div>
+      </div>
     </section>
 
+    <!-- Transmission Log -->
+    <section class="panel history-panel" id="historyPanel">
+      <div class="panel-header collapsible" id="historyToggle" tabindex="0" role="button" aria-expanded="true">
+        <span class="panel-icon" aria-hidden="true">◉</span>
+        <span class="panel-title">TRANSMISSION LOG</span>
+        <span class="badge" id="historyCount">0</span>
+        <span class="chevron" aria-hidden="true">▼</span>
+      </div>
+      <div class="history-list" id="historyList"></div>
+      <div class="history-actions">
+        <button class="btn btn-ghost btn-sm" id="clearHistory">PURGE LOG</button>
+      </div>
+    </section>
+
+    <!-- Footer -->
     <footer>
-      <div id="status" class="status disconnected">Checking local server…</div>
-      <div id="modelInfo" class="meta">—</div>
+      <div id="status" class="connection-status disconnected">SCANNING LOCAL SERVER...</div>
+      <div id="modelInfo" class="footer-meta">—</div>
+      <div class="footer-hud">
+        <span id="genCount" class="mono">GEN: 000</span>
+        <span class="mono separator">|</span>
+        <span id="latency" class="mono">LAT: --ms</span>
+      </div>
     </footer>
   </main>
 

@@ -13,10 +13,22 @@ let isStreamActive = false;
 let activeAudioQueue = null;
 let currentPlaybackRate = 1.0;
 let activeSources = new Set();
+let pendingDecodes = 0; // Track active decodeAudioData calls for clean shutdown
 
 const MAX_SELECTION_CHARS = 200000;
-const CHUNK_TARGET_CHARS = 4000; // Bumped from 2000 -- fewer chunks = fewer round-trips
-const STREAM_THRESHOLD_CHARS = 0; // Always stream -- first audio in ~250ms instead of waiting for full generation
+const CHUNK_TARGET_CHARS = 4000;
+const STREAM_THRESHOLD_CHARS = 0; // Always stream — first audio ~250ms
+
+// ---------------------------------------------------------------------------
+// Text normalizer — precompiled regex for performance
+// ---------------------------------------------------------------------------
+
+const RE_ZERO_WIDTH = /[\u200B-\u200D\uFEFF]/g;
+const RE_WHITESPACE = /\s+/g;
+
+function normalizeText(text) {
+  return (text || "").replace(RE_ZERO_WIDTH, "").replace(RE_WHITESPACE, " ").trim();
+}
 
 // ---------------------------------------------------------------------------
 // Widget
@@ -97,7 +109,7 @@ function flashError(message) {
 }
 
 // ---------------------------------------------------------------------------
-// Audio cleanup -- reuse AudioContext, just stop sources
+// Audio cleanup
 // ---------------------------------------------------------------------------
 
 function stopStreamPlayback() {
@@ -107,6 +119,7 @@ function stopStreamPlayback() {
   }
   activeSources.clear();
   activeSourceCount = 0;
+  pendingDecodes = 0;
   nextPlayTime = 0;
   isStreamActive = false;
 }
@@ -130,15 +143,8 @@ function stopAllAudio() {
 }
 
 // ---------------------------------------------------------------------------
-// Text splitting -- paragraph-aware, 4000-char target
+// Text splitting — paragraph-aware
 // ---------------------------------------------------------------------------
-
-function normalizeText(text) {
-  return (text || "")
-    .replace(/[\u200B-\u200D\uFEFF]/g, "")
-    .replace(/\s+/g, " ")
-    .trim();
-}
 
 function splitTextForTTS(text, maxChars = CHUNK_TARGET_CHARS) {
   const cleaned = normalizeText(text);
@@ -190,41 +196,26 @@ function splitTextForTTS(text, maxChars = CHUNK_TARGET_CHARS) {
 }
 
 // ---------------------------------------------------------------------------
-// ArrayBuffer decode helper -- used for stream chunks from background.js
-// ---------------------------------------------------------------------------
-
-function decodeArrayBufferToAudioBuffer(arrayBuffer) {
-  const ctx = getAudioContext();
-  // Slice to create an owned copy (some ArrayBuffers from messaging are detached)
-  const owned = arrayBuffer.slice(0);
-  return ctx.decodeAudioData(owned);
-}
-
-// ---------------------------------------------------------------------------
-// AudioBufferQueue -- per-chunk lifecycle manager
+// AudioBufferQueue — per-chunk lifecycle manager
 // ---------------------------------------------------------------------------
 
 class AudioBufferQueue {
   constructor() {
-    this.buffers = new Map();
-    this.pending = new Map();
+    this.buffers = new Map();     // idx -> { complete: bool }
+    this.pending = new Map();     // idx -> { promise, resolve, reject }
     this.isStopped = false;
     this.completedCount = 0;
     this.totalChunks = 0;
   }
 
-  isReady(idx) { const b = this.buffers.get(idx); return b?.complete; }
-
   addStreamChunk(idx) {
     if (this.isStopped) return;
-    if (!this.buffers.has(idx))
-      this.buffers.set(idx, { complete: false });
+    if (!this.buffers.has(idx)) this.buffers.set(idx, { complete: false });
   }
 
   markChunkComplete(idx) {
     if (this.isStopped) return;
-    if (!this.buffers.has(idx))
-      this.buffers.set(idx, { complete: true });
+    if (!this.buffers.has(idx)) this.buffers.set(idx, { complete: true });
     const b = this.buffers.get(idx);
     if (!b.complete) {
       b.complete = true;
@@ -235,6 +226,7 @@ class AudioBufferQueue {
   }
 
   waitForChunk(idx) {
+    if (this.isStopped) return Promise.reject(new Error("stopped"));
     const b = this.buffers.get(idx);
     if (b?.complete) return Promise.resolve(b);
     if (this.pending.has(idx)) return this.pending.get(idx).promise;
@@ -245,37 +237,23 @@ class AudioBufferQueue {
   }
 
   cleanup(fromIdx) {
-    for (const [idx, b] of this.buffers) {
+    for (const [idx] of this.buffers) {
       if (idx < fromIdx) this.buffers.delete(idx);
     }
   }
 
   stop() {
     this.isStopped = true;
-    for (const [idx, p] of this.pending) { if (p) p.reject(new Error("stopped")); }
+    for (const [, p] of this.pending) {
+      try { p.reject(new Error("stopped")); } catch(_) {}
+    }
     this.buffers.clear();
     this.pending.clear();
   }
 }
 
 // ---------------------------------------------------------------------------
-// Audio request helpers
-// ---------------------------------------------------------------------------
-
-function requestStreamAudio(text, settings, chunkIndex) {
-  chrome.runtime.sendMessage({
-    type: "TTS_STREAM_REQUEST",
-    text,
-    voice: settings.voice || "ryan",
-    speed: settings.speed || 1.0,
-    language: settings.language || "Auto",
-    model: settings.model || "qwen3-tts",
-    chunkIndex,
-  });
-}
-
-// ---------------------------------------------------------------------------
-// Web Audio API gapless scheduling -- reuse AudioContext
+// Web Audio API gapless scheduling
 // ---------------------------------------------------------------------------
 
 function getAudioContext() {
@@ -284,7 +262,6 @@ function getAudioContext() {
   return audioContext;
 }
 
-// Schedule a pre-decoded AudioBuffer directly
 function scheduleAudioBuffer(audioBuffer) {
   const ctx = getAudioContext();
 
@@ -308,25 +285,42 @@ function scheduleAudioBuffer(audioBuffer) {
   return audioBuffer.duration;
 }
 
-function waitForAllAudioToFinish() {
-  return new Promise((resolve) => {
+function waitForAllAudioToFinish(timeoutMs = 30000) {
+  return new Promise((resolve, reject) => {
+    const startedAt = Date.now();
     const check = setInterval(() => {
-      if (activeSourceCount <= 0) {
+      if (activeSourceCount <= 0 && pendingDecodes <= 0) {
         clearInterval(check);
         resolve();
+        return;
       }
-    }, 200);
+      if (Date.now() - startedAt > timeoutMs) {
+        clearInterval(check);
+        reject(new Error("Audio playback timed out"));
+      }
+    }, 100);
   });
 }
 
 // ---------------------------------------------------------------------------
-// Stream chunk messages from background.js -- direct ArrayBuffer decode
+// ArrayBuffer decode helper
+// ---------------------------------------------------------------------------
+
+function decodeArrayBufferToAudioBuffer(arrayBuffer) {
+  const ctx = getAudioContext();
+  const owned = arrayBuffer.slice(0); // owned copy
+  pendingDecodes++;
+  return ctx.decodeAudioData(owned).finally(() => { pendingDecodes--; });
+}
+
+// ---------------------------------------------------------------------------
+// Message handlers from background
 // ---------------------------------------------------------------------------
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message.type === "STOP_TTS") {
     stopAllAudio();
-    if (activeAudioQueue) { activeAudioQueue.stop(); activeAudioQueue = null; }
+    if (activeAudioQueue && !activeAudioQueue.isStopped) { activeAudioQueue.stop(); activeAudioQueue = null; }
     isSpeaking = false;
     isPaused = false;
     speakRunId++;
@@ -337,12 +331,11 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return;
   }
 
-  if (!activeAudioQueue || !isStreamActive) return;
-
+  // ---- Streaming sub-chunk from background.js ----
   if (message.type === "TTS_STREAM_CHUNK") {
     const { chunkIndex, audioArrayBuffer, audioBase64, audioMimeType } = message;
+    if (!activeAudioQueue || activeAudioQueue.isStopped) return;
 
-    // Prefer raw ArrayBuffer (zero-copy from background.js), fall back to base64
     const buf = audioArrayBuffer || (audioBase64 ? (() => {
       const binaryStr = atob(audioBase64);
       const bytes = new Uint8Array(binaryStr.length);
@@ -356,10 +349,13 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       try {
         const ctx = getAudioContext();
         if (ctx.state === "suspended") await ctx.resume();
+        if (activeAudioQueue?.isStopped) return;
 
         const audioBuffer = await decodeArrayBufferToAudioBuffer(buf);
+        if (activeAudioQueue?.isStopped) return;
+
         const dur = scheduleAudioBuffer(audioBuffer);
-        if (dur > 0) console.log(`[Open TTS] Scheduled sub-chunk: ${dur.toFixed(1)}s (chunk ${chunkIndex}${audioMimeType ? `, ${audioMimeType}` : ''})`);
+        if (dur > 0) console.log(`[Open TTS] Scheduled: ${dur.toFixed(1)}s (chunk ${chunkIndex}${audioMimeType ? `, ${audioMimeType}` : ''})`);
       } catch (e) {
         console.error("[Open TTS] Stream decode error:", e);
       }
@@ -370,17 +366,41 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
   if (message.type === "TTS_STREAM_DONE") {
     const { chunkIndex } = message;
-    console.log(`[Open TTS] Stream complete for chunk ${chunkIndex}`);
-    activeAudioQueue.markChunkComplete(chunkIndex);
+    console.log(`[Open TTS] Stream done for chunk ${chunkIndex}`);
+    activeAudioQueue?.markChunkComplete(chunkIndex);
   }
 
   if (message.type === "TTS_STREAM_ERROR") {
     const { chunkIndex, error } = message;
     console.error(`[Open TTS] Stream error chunk ${chunkIndex}:`, error);
-    const p = activeAudioQueue.pending.get(chunkIndex);
+    const p = activeAudioQueue?.pending.get(chunkIndex);
     if (p) { activeAudioQueue.pending.delete(chunkIndex); p.reject(new Error(error)); }
   }
+
+  // ---- BATCH result from background.js ----
+  if (message.type === "TTS_BATCH_RESULT") {
+    const { batchId, result } = message;
+    console.log(`[Open TTS] Batch result received: ${result.results.length} items`);
+    if (window._batchCallbacks && window._batchCallbacks[batchId]) {
+      window._batchCallbacks[batchId](null, result);
+      delete window._batchCallbacks[batchId];
+    }
+  }
+
+  if (message.type === "TTS_BATCH_ERROR") {
+    const { batchId, error } = message;
+    console.error(`[Open TTS] Batch error:`, error);
+    if (window._batchCallbacks && window._batchCallbacks[batchId]) {
+      window._batchCallbacks[batchId](new Error(error), null);
+      delete window._batchCallbacks[batchId];
+    }
+  }
 });
+
+// ---------------------------------------------------------------------------
+// Batch callback registry
+// ---------------------------------------------------------------------------
+window._batchCallbacks = window._batchCallbacks || {};
 
 // ---------------------------------------------------------------------------
 // Mouse events
@@ -397,7 +417,46 @@ document.addEventListener("mousedown", (e) => {
 });
 
 // ---------------------------------------------------------------------------
-// Main speak handler -- ALWAYS uses streaming for instant first-audio
+// BATCH pipeline — single HTTP call for all chunks. The BIG speedup.
+// ---------------------------------------------------------------------------
+
+function requestBatchAudio(texts, settings, batchId) {
+  return new Promise((resolve, reject) => {
+    window._batchCallbacks[batchId] = (err, result) => {
+      if (err) reject(err);
+      else resolve(result);
+    };
+
+    chrome.runtime.sendMessage({
+      type: "TTS_BATCH_REQUEST",
+      texts,
+      voice: settings.voice || "ryan",
+      speed: settings.speed || 1.0,
+      language: settings.language || "Auto",
+      model: settings.model || "qwen3-tts",
+      batchId,
+    });
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Single-chunk streaming request
+// ---------------------------------------------------------------------------
+
+function requestStreamAudio(text, settings, chunkIndex) {
+  chrome.runtime.sendMessage({
+    type: "TTS_STREAM_REQUEST",
+    text,
+    voice: settings.voice || "ryan",
+    speed: settings.speed || 1.0,
+    language: settings.language || "Auto",
+    model: settings.model || "qwen3-tts",
+    chunkIndex,
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Main speak handler
 // ---------------------------------------------------------------------------
 
 async function onSpeakClick(event) {
@@ -407,8 +466,7 @@ async function onSpeakClick(event) {
   const text = selectedText?.trim();
   if (!text) return;
 
-  // Pause / resume for HTMLAudioElement (used only for non-streaming preview)
-  // For streaming, tap = stop
+  // Handle pause / resume / stop
   if (isSpeaking) {
     if (currentAudio && !currentAudio.paused && !isPaused) {
       currentAudio.pause();
@@ -424,13 +482,13 @@ async function onSpeakClick(event) {
       setBusy(true, "Reading... tap to pause");
       return;
     }
-    // Stop everything (streaming or otherwise)
+    // Stop everything
     speakRunId++;
     isSpeaking = false;
     isPaused = false;
     widget?.classList.remove("paused");
     stopAllAudio();
-    if (activeAudioQueue) { activeAudioQueue.stop(); activeAudioQueue = null; }
+    if (activeAudioQueue && !activeAudioQueue.isStopped) { activeAudioQueue.stop(); activeAudioQueue = null; }
     setBusy(false, "Stopped");
     return;
   }
@@ -448,12 +506,9 @@ async function onSpeakClick(event) {
   const ctx = getAudioContext();
   if (ctx.state === "suspended") await ctx.resume();
 
-  const queue = new AudioBufferQueue();
-  activeAudioQueue = queue;
-
   try {
     setBusy(true, "Preparing...");
-    // Pre-warm server connection while we prepare chunks
+    // Pre-warm server while we prepare
     const serverReady = chrome.runtime.sendMessage({ type: "ENSURE_SERVER" }).catch(() => null);
     const settings = await chrome.storage.sync.get(["voice", "speed", "language", "model"]);
     const playbackRate = Number(settings.speed) || 1.0;
@@ -464,49 +519,16 @@ async function onSpeakClick(event) {
 
     await serverReady;
 
-    queue.totalChunks = chunks.length;
     console.log(`[Open TTS] ${chunks.length} chunk(s), ${text.length} chars, speed: ${playbackRate}x`);
 
-    // ---- ALWAYS STREAM ----
-    // Even for short text, streaming gives first-audio in ~250ms
-    // vs 5+ seconds waiting for full generation in non-streaming mode
-    isStreamActive = true;
-
-    for (let i = 0; i < chunks.length; i++) {
-      if (runId !== speakRunId || queue.isStopped) return;
-
-      setBusy(true, `Generating ${i + 1}/${chunks.length}...`);
-
-      // Start streaming for this chunk
-      requestStreamAudio(chunks[i], settings, i);
-
-      // Wait for this chunk's stream to complete
-      try {
-        await queue.waitForChunk(i);
-      } catch (e) {
-        if (queue.isStopped) return;
-        throw e;
-      }
-
-      if (runId !== speakRunId || queue.isStopped) return;
-
-      setBusy(true, chunks.length > 1 ? `Reading ${i + 1}/${chunks.length}... tap to stop` : "Reading... tap to stop");
-
-      // Brief pause to let audio pipeline fill before next chunk request
-      if (i < chunks.length - 1) {
-        await new Promise(r => setTimeout(r, 10));
-      }
-
-      queue.cleanup(i);
+    // ---- ROUTING: Batch for multi-chunk, streaming for single-chunk ----
+    if (chunks.length >= 2) {
+      await _speakBatch(chunks, settings, runId);
+    } else {
+      await _speakStream(chunks, settings, runId);
     }
 
-    // All chunks generated and scheduled -- wait for remaining audio to finish
-    if (activeSourceCount > 0) {
-      setBusy(true, "Finishing...");
-      await waitForAllAudioToFinish();
-    }
-
-    if (runId === speakRunId && !queue.isStopped) setBusy(false);
+    if (runId === speakRunId) setBusy(false);
   } catch (error) {
     console.error("[Open TTS] Error:", error);
     if (runId === speakRunId) flashError(error?.message || "Couldn't read. Tap again");
@@ -517,9 +539,134 @@ async function onSpeakClick(event) {
       isStreamActive = false;
       widget?.classList.remove("paused");
     }
-    if (activeAudioQueue === queue) {
-      queue.stop();
+    if (activeAudioQueue) {
+      if (!activeAudioQueue.isStopped) activeAudioQueue.stop();
       activeAudioQueue = null;
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// BATCH path — one HTTP call, one gpu_lock acquisition for ALL chunks
+// Saves N-1 round-trips and N-1 lock acquires
+// ---------------------------------------------------------------------------
+
+async function _speakBatch(chunks, settings, runId) {
+  isStreamActive = true;
+  const queue = new AudioBufferQueue();
+  activeAudioQueue = queue;
+  queue.totalChunks = chunks.length;
+
+  setBusy(true, `Generating 1/${chunks.length}...`);
+
+  const batchId = `batch-${runId}-${Date.now()}`;
+
+  let batchResult;
+  try {
+    batchResult = await requestBatchAudio(chunks, settings, batchId);
+  } catch (err) {
+    throw new Error(`Batch generation failed: ${err.message}`);
+  }
+
+  if (runId !== speakRunId || queue.isStopped) return;
+
+  const totalTime = batchResult.total_time || 0;
+  const errorCount = batchResult.error_count || 0;
+  console.log(`[Open TTS] Batch done in ${totalTime}s, ${errorCount} errors`);
+
+  // Schedule all results for playback
+  for (const item of batchResult.results || []) {
+    if (runId !== speakRunId || queue.isStopped) return;
+
+    if (item.error) {
+      console.error(`[Open TTS] Batch chunk ${item.index} error: ${item.error}`);
+      queue.markChunkComplete(item.index);
+      continue;
+    }
+
+    if (!item.audio_base64) {
+      queue.markChunkComplete(item.index);
+      continue;
+    }
+
+    setBusy(true, `Reading ${item.index + 1}/${chunks.length}...`);
+
+    try {
+      const binaryStr = atob(item.audio_base64);
+      const bytes = new Uint8Array(binaryStr.length);
+      for (let i = 0; i < binaryStr.length; i++) bytes[i] = binaryStr.charCodeAt(i);
+
+      if (runId !== speakRunId || queue.isStopped) return;
+
+      const ctx = getAudioContext();
+      if (ctx.state === "suspended") await ctx.resume();
+
+      if (runId !== speakRunId || queue.isStopped) return;
+
+      const audioBuffer = await decodeArrayBufferToAudioBuffer(bytes.buffer);
+      if (runId !== speakRunId || queue.isStopped) return;
+
+      const dur = scheduleAudioBuffer(audioBuffer);
+      console.log(`[Open TTS] Scheduled batch chunk ${item.index}: ${dur.toFixed(1)}s`);
+    } catch (e) {
+      console.error(`[Open TTS] Batch chunk ${item.index} decode error:`, e);
+    }
+
+    queue.markChunkComplete(item.index);
+  }
+
+  // Wait for all audio to finish playing
+  if (activeSourceCount > 0) {
+    setBusy(true, "Finishing...");
+    try {
+      await waitForAllAudioToFinish(120000);
+    } catch (e) {
+      console.error("[Open TTS] Playback timeout:", e);
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// SINGLE-CHUNK streaming path — for short text
+// ---------------------------------------------------------------------------
+
+async function _speakStream(chunks, settings, runId) {
+  isStreamActive = true;
+  const queue = new AudioBufferQueue();
+  activeAudioQueue = queue;
+  queue.totalChunks = chunks.length;
+
+  for (let i = 0; i < chunks.length; i++) {
+    if (runId !== speakRunId || queue.isStopped) return;
+
+    setBusy(true, `Generating ${i + 1}/${chunks.length}...`);
+
+    requestStreamAudio(chunks[i], settings, i);
+
+    try {
+      await queue.waitForChunk(i);
+    } catch (e) {
+      if (queue.isStopped) return;
+      throw e;
+    }
+
+    if (runId !== speakRunId || queue.isStopped) return;
+
+    setBusy(true, chunks.length > 1 ? `Reading ${i + 1}/${chunks.length}...` : "Reading... tap to stop");
+
+    if (i < chunks.length - 1) {
+      await new Promise(r => setTimeout(r, 10));
+    }
+
+    queue.cleanup(i);
+  }
+
+  if (activeSourceCount > 0) {
+    setBusy(true, "Finishing...");
+    try {
+      await waitForAllAudioToFinish(60000);
+    } catch (e) {
+      console.error("[Open TTS] Stream playback timeout:", e);
     }
   }
 }
