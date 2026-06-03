@@ -157,8 +157,8 @@ async function ensureServer() {
 async function* streamBatch(texts, voice, speed, lang, model, signal) {
   const body = {
     texts,
-    voice: voice || "ryan",
-    speed: Number(speed) || 1.0,
+    voice: voice || "af_bella",
+    speed: Number(speed) || 1.5,
     language: lang || "Auto",
   };
   if (model) body.model = model;
@@ -336,8 +336,8 @@ async function doSpeakFallback(text, settings) {
 
     const body = {
       texts: chunks,
-      voice: settings.voice || "ryan",
-      speed: Number(settings.speed) || 1.0,
+      voice: settings.voice || "af_bella",
+      speed: Number(settings.speed) || 1.5,
       language: settings.language || "Auto",
       format: "wav",
     };

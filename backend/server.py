@@ -28,7 +28,7 @@ from pydantic import BaseModel, Field
 HOST = os.getenv("OPEN_TTS_HOST", "127.0.0.1")
 PORT = int(os.getenv("OPEN_TTS_PORT", "8000"))
 WARMUP_TEXT = os.getenv("OPEN_TTS_WARMUP_TEXT", "Warmup")
-DEFAULT_MODEL_ID = os.getenv("OPEN_TTS_DEFAULT_MODEL", "qwen3-tts")
+DEFAULT_MODEL_ID = os.getenv("OPEN_TTS_DEFAULT_MODEL", "kokoro")
 DEFAULT_AUDIO_FORMAT = os.getenv("OPEN_TTS_AUDIO_FORMAT", "wav")
 OPUS_BITRATE = os.getenv("OPEN_TTS_OPUS_BITRATE", "64k")
 STREAMING_INTERVAL = float(os.getenv("OPEN_TTS_STREAMING_INTERVAL", "0.25"))
@@ -68,6 +68,24 @@ MODEL_REGISTRY: Dict[str, dict] = {
         "supports_ref_audio": True,
         "has_preset_voices": False,
         "default_voices": [],
+    },
+    "kokoro": {
+        "hf_id": "mlx-community/Kokoro-82M-bf16",
+        "local_dir": "models/kokoro-82M",
+        "display_name": "Kokoro TTS",
+        "description": "Ultra-fast lightweight TTS (82M) via MLX",
+        "tier": 0,
+        "default_voice": "af_bella",
+        "supports_lang_code": False,
+        "supports_instruct": False,
+        "supports_ref_audio": False,
+        "has_preset_voices": True,
+        "default_voices": [
+            "af_bella", "af_sarah", "af_nova", "af_heart", "af_jessica",
+            "af_alloy", "af_sky", "af_river", "af_aoede", "af_kore",
+            "am_adam", "am_echo", "am_eric", "am_fenrir", "am_liam",
+            "am_michael", "am_onyx", "am_puck", "am_santa",
+        ],
     },
 }
 
@@ -112,6 +130,26 @@ VOICE_LABELS = {
     "aiden": "Aiden",
     "ono_anna": "Ono Anna",
     "sohee": "Sohee",
+    # Kokoro voices
+    "af_heart": "Heart",
+    "af_bella": "Bella",
+    "af_sarah": "Sarah",
+    "af_nova": "Nova",
+    "af_jessica": "Jessica",
+    "af_kore": "Kore",
+    "af_sky": "Sky",
+    "af_alloy": "Alloy",
+    "af_aoede": "Aoede",
+    "af_river": "River",
+    "am_adam": "Adam",
+    "am_echo": "Echo",
+    "am_eric": "Eric (M)",
+    "am_fenrir": "Fenrir",
+    "am_liam": "Liam",
+    "am_michael": "Michael",
+    "am_onyx": "Onyx",
+    "am_puck": "Puck",
+    "am_santa": "Santa",
 }
 
 VOICE_ALIASES = {
@@ -179,11 +217,71 @@ def get_model_voices(model_obj, model_id: str) -> List[str]:
     return reg.get("default_voices", [])
 
 
+def _apply_speed_via_ffmpeg(audio: np.ndarray, sample_rate: int,
+                            speed: float) -> np.ndarray:
+    """Apply ffmpeg atempo to change audio speed without pitch shift.
+    atempo range is 0.5-2.0; chain multiple filters for higher speeds.
+    """
+    import subprocess
+    import tempfile
+
+    if speed == 1.0:
+        return audio
+
+    # Normalize float32 [-1,1] → int16 for ffmpeg
+    audio_int16 = (audio * 32767).astype(np.int16)
+
+    # Build atempo filter chain (clamped to valid range)
+    target = speed
+    filters = []
+    while target < 0.5:
+        filters.append("atempo=0.5")
+        target /= 0.5
+    while target > 2.0:
+        filters.append("atempo=2.0")
+        target /= 2.0
+    filters.append(f"atempo={target:.3f}")
+    filter_expr = ",".join(filters)
+
+    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp_in:
+        sf.write(tmp_in.name, audio_int16, sample_rate, format="WAV", subtype="PCM_16")
+        tmp_in_name = tmp_in.name
+
+    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp_out:
+        tmp_out_name = tmp_out.name
+
+    try:
+        subprocess.run(
+            ["ffmpeg", "-y", "-i", tmp_in_name, "-filter:a", filter_expr,
+             "-ac", "1", "-ar", str(sample_rate), tmp_out_name],
+            capture_output=True, check=True, timeout=60,
+        )
+        sped_up, sr = sf.read(tmp_out_name, dtype=np.float32)
+        # sf.read returns mono as 1D array; ensure shape consistency
+        if sped_up.ndim == 1:
+            return sped_up
+        return sped_up[:, 0]  # take first channel if stereo
+    except Exception as exc:
+        print(f"Warning: ffmpeg speed adjustment failed ({exc}), returning original audio")
+        return audio
+    finally:
+        import os
+        os.unlink(tmp_in_name)
+        try:
+            os.unlink(tmp_out_name)
+        except OSError:
+            pass
+
+
 def _encode_audio(audio: np.ndarray, sample_rate: int,
-                  fmt: str = DEFAULT_AUDIO_FORMAT) -> tuple:
+                  fmt: str = DEFAULT_AUDIO_FORMAT, speed: float = 1.0) -> tuple:
     """Encode audio array to bytes. Returns (bytes, mime_type)."""
     fmt = fmt if fmt in AUDIO_FORMATS else DEFAULT_AUDIO_FORMAT
     mime = AUDIO_FORMATS[fmt]
+
+    # Apply speed adjustment if needed (Qwen3-TTS ignores the speed param)
+    if speed != 1.0:
+        audio = _apply_speed_via_ffmpeg(audio, sample_rate, speed)
 
     # Fast path: WAV via soundfile (no ffmpeg, no mlx_audio wrapper overhead)
     if fmt == "wav":
@@ -416,8 +514,11 @@ def _synthesize_sync(model, gen_kwargs, model_id, request_voice, lang_code,
         # Free intermediate list before encoding to reduce peak RAM
         del audio_parts
 
+        # Extract speed for post-processing (Qwen3-TTS ignores speed param)
+        gen_speed = gen_kwargs.get("speed", 1.0)
+
         encode_start = _time.perf_counter()
-        audio_bytes, mime_type = _encode_audio(audio, sample_rate, fmt=audio_format)
+        audio_bytes, mime_type = _encode_audio(audio, sample_rate, fmt=audio_format, speed=gen_speed)
         encode_elapsed = _time.perf_counter() - encode_start
 
         headers = {
@@ -486,8 +587,10 @@ def _synthesize_batch_sync(model, base_kwargs, texts, model_id, voice, lang_code
                 audio = np.concatenate(audio_parts, axis=0) if len(audio_parts) > 1 else audio_parts[0]
                 del audio_parts
 
+                gen_speed = gen_kwargs.get("speed", 1.0)
+
                 encode_start = _time.perf_counter()
-                audio_bytes, mime_type = _encode_audio(audio, first_sample_rate, fmt=audio_format)
+                audio_bytes, mime_type = _encode_audio(audio, first_sample_rate, fmt=audio_format, speed=gen_speed)
                 encode_elapsed = _time.perf_counter() - encode_start
 
                 results.append({

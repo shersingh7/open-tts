@@ -32,9 +32,9 @@ const latencyEl = document.getElementById("latency");
 const themeBtns = document.querySelectorAll(".theme-btn");
 
 const DEFAULTS = {
-  model: "qwen3-tts",
-  voice: "ryan",
-  speed: 1.0,
+  model: "kokoro",
+  voice: "af_bella",
+  speed: 1.5,
   language: "Auto",
   previewText: "Hello! Open TTS is ready. Multiple local models running entirely on your Mac.",
   theme: "empire",
@@ -506,7 +506,7 @@ function wireEvents() {
 }
 
 function updateLanguageVisibility(modelId) {
-  if (modelId === "fish-s2-pro") {
+  if (modelId === "fish-s2-pro" || modelId === "kokoro") {
     languageSelect.disabled = true;
     languageSelect.value = "Auto";
   } else {
@@ -516,6 +516,7 @@ function updateLanguageVisibility(modelId) {
 
 function updateModelMeta(modelId) {
   const meta = {
+    "kokoro": "Kokoro 82M — Ultra-fast local MLX",
     "qwen3-tts": "Qwen3-TTS 1.7B — Local MLX inference",
     "fish-s2-pro": "Fish Audio S2 Pro — High quality",
   };
@@ -587,7 +588,7 @@ async function refreshHealth() {
     const response = await runtimeMessage({ type: "GET_HEALTH" });
     if (response?.success && response?.data?.model_loaded) {
       const model = response.data.model || DEFAULTS.model;
-      const reg = { "qwen3-tts": "Qwen3-TTS 1.7B", "fish-s2-pro": "Fish Audio S2 Pro" };
+      const reg = { "kokoro": "Kokoro 82M", "qwen3-tts": "Qwen3-TTS 1.7B", "fish-s2-pro": "Fish Audio S2 Pro" };
       setStatus(true, `Connected — ${reg[model] || model}`);
       modelInfo.textContent = `Model: ${reg[model] || model}`;
       updateModelMeta(model);

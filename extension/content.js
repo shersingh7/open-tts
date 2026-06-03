@@ -143,10 +143,10 @@ async function onSpeakClick(e) {
     const settings = await new Promise((resolve) => {
       chrome.storage.sync.get(["voice", "speed", "language", "model"], (data) => {
         resolve({
-          voice: data.voice || "ryan",
-          speed: Number(data.speed) || 1.0,
+          voice: data.voice || "af_bella",
+          speed: Number(data.speed) || 1.5,
           language: data.language || "Auto",
-          model: data.model || "qwen3-tts",
+          model: data.model || "kokoro",
         });
       });
     });

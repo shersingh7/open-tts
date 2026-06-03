@@ -265,7 +265,7 @@ async function handleGetModels(sendResponse) {
 
 async function handleLoadModel(request, sendResponse) {
   try {
-    const modelId = request.modelId || "qwen3-tts";
+    const modelId = request.modelId || "kokoro";
     const data = await fetchJson(`/v1/load-model?model_id=${encodeURIComponent(modelId)}`, { method: "POST" });
     sendResponse({ success: true, data });
   } catch (error) {
