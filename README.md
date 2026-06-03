@@ -2,28 +2,30 @@
 
 > Apple Silicon Only — This project uses MLX, which requires an M1/M2/M3/M4 Mac. Not compatible with Intel Macs, Windows, or Linux.
 
-Multi-model, fully local text-to-speech on Apple Silicon. Switch between Qwen3-TTS and Fish Audio S2 Pro — both running MLX-optimized inference with zero cloud calls.
+Multi-model, fully local text-to-speech on Apple Silicon. Switch between **Kokoro**, Qwen3-TTS, and Fish Audio S2 Pro — all running MLX-optimized inference with zero cloud calls.
 
 ## Features
 
-- **Multi-Model** — Switch between Qwen3-TTS and Fish Audio S2 Pro on the fly
-- **Streaming** — Progressive audio delivery: hear audio in <0.5s while the rest generates (Qwen3-TTS)
-- **Fast** — MLX-optimized for Apple Silicon (M1/M2/M3/M4), RTF ~2.5x on M2 Pro
+- **Multi-Model** — Switch between Kokoro, Qwen3-TTS, and Fish Audio S2 Pro on the fly
+- **Fast** — Kokoro delivers RTF ~0.05x on M2 Pro (~10x faster than Qwen3); all models are MLX-optimized for Apple Silicon
+- **Ultra-Lightweight** — Kokoro is only 82M parameters (~170 MB), loads instantly, no download wait
 - **Private** — All processing happens locally, no cloud API
 - **Model Swap** — One model in VRAM at a time; swap on demand from the extension
 - **Auto-Recovery** — Model reload on failure, request retry on transient errors, server cache invalidation
-- **Multiple Voices** — 9 built-in voices for Qwen3 (Serena, Vivian, Ryan, etc.), SSML voice tags for Fish S2 Pro
-- **Multilingual** — English, Chinese, Japanese, Korean, and auto-detect (Qwen3)
+- **Multiple Voices** — 19 voices for Kokoro (Bella, Sarah, Eric, etc.), 9 for Qwen3, SSML tags for Fish
+- **Speed at Synthesis** — Kokoro applies speed during generation (natural-sounding 0.5x–3.0x); Qwen3 applies it client-side via playbackRate
+- **Multilingual** — English, Chinese, Japanese, Korean, and auto-detect (Qwen3); Kokoro supports multiple languages via single-letter lang codes
 - **Chrome Extension** — Select text on any page and click to hear it
 - **Server Control** — Start/Stop server directly from the extension popup
 - **Gapless Playback** — Web Audio API scheduling with playbackRate support (0.5x–3.0x)
 
 ## Models
 
-| Model | Size | Sample Rate | Voices | Streaming | Strengths |
-|-------|------|-------------|--------|-----------|-----------|
-| Qwen3-TTS (8-bit) | 2.9 GB | 24 kHz | 9 preset + instruct | ✅ Supported | Multilingual, fast, streaming |
-| Fish S2 Pro (8-bit) | 6.3 GB | 44.1 kHz | SSML voice tags | ❌ Not supported | High-fidelity, voice cloning ready |
+| Model | Size | Sample Rate | Voices | Speed Applied | Strengths |
+|-------|------|-------------|--------|---------------|-----------|
+| **Kokoro (bf16)** | 170 MB | 24 kHz | 19 preset | At synthesis (natural) | Ultra-fast, lightweight, high quality |
+| Qwen3-TTS (8-bit) | 2.9 GB | 24 kHz | 9 preset + instruct | Client-side (playbackRate) | Multilingual, streaming support |
+| Fish S2 Pro (8-bit) | 6.3 GB | 44.1 kHz | SSML voice tags | Not supported | High-fidelity, voice cloning ready |
 
 Only one model is loaded at a time. Swap instantly from the extension or API.
 
@@ -54,8 +56,8 @@ chmod +x setup.sh
 
 This will:
 - Create a Python virtual environment
-- Install dependencies (mlx-audio >= 0.4.2)
-- Download both models (Qwen3-TTS 8-bit + Fish S2 Pro 8-bit)
+- Install dependencies (mlx-audio >= 0.4.2, kokoro-mlx)
+- Download models (Kokoro bf16 + Qwen3-TTS 8-bit + Fish S2 Pro 8-bit)
 
 ### 2. Install Chrome Extension
 
@@ -81,7 +83,7 @@ When prompted, enter your Chrome extension ID (visible on `chrome://extensions/`
 ### 4. Use It
 
 1. Click the extension icon in Chrome
-2. Select your **model** (Qwen3-TTS or Fish S2 Pro)
+2. Select your **model** (Kokoro, Qwen3-TTS, or Fish S2 Pro)
 3. Click **"▶ Start Server"** — wait for "Server running" status
 4. Select any text on any webpage and click the speaker icon to hear it
 5. Click **"⏹ Stop Server"** when done
@@ -108,10 +110,10 @@ The server will start at `http://127.0.0.1:8000`
 ### Settings
 
 Click the extension icon to:
-- **Select model** — Qwen3-TTS or Fish S2 Pro (auto-swaps on demand)
-- **Select voice** — 9 preset voices for Qwen3, SSML voice tags for Fish
-- **Select language** — Auto, English, Chinese, Japanese, Korean (Qwen3 only)
-- **Adjust speed** — 0.5x - 3.0x (applied via playbackRate)
+- **Select model** — Kokoro, Qwen3-TTS, or Fish S2 Pro (auto-swaps on demand)
+- **Select voice** — 19 preset voices for Kokoro (Bella default), 9 for Qwen3, SSML tags for Fish
+- **Select language** — Auto, English, Chinese, Japanese, Korean (Qwen3 only; Kokoro uses internal lang codes)
+- **Adjust speed** — 0.5x - 3.0x (Kokoro: natural speed at synthesis; Qwen3: playbackRate)
 
 ## Auto-Start on Login (macOS)
 
@@ -156,6 +158,12 @@ curl -X POST "http://127.0.0.1:8000/v1/load-model?model_id=qwen3-tts&force=true"
 ### Example: Synthesize Speech (Non-Streaming)
 
 ```bash
+# Kokoro with preset voice (default)
+curl -X POST http://127.0.0.1:8000/v1/synthesize \
+  -H "Content-Type: application/json" \
+  -d '{"text": "Hello, this is a test.", "model": "kokoro", "voice": "af_bella", "speed": 1.5}' \
+  --output output.wav
+
 # Qwen3-TTS with preset voice
 curl -X POST http://127.0.0.1:8000/v1/synthesize \
   -H "Content-Type: application/json" \
@@ -178,7 +186,7 @@ curl -X POST http://127.0.0.1:8000/v1/synthesize \
   --output stream.wav
 ```
 
-Streaming returns concatenated WAV segments. Each segment is a valid WAV file. First audio arrives in ~0.5s.
+Streaming returns concatenated WAV segments. Each segment is a valid WAV file. First audio arrives in ~0.5s. **Note:** Kokoro and Fish S2 Pro do not support streaming; non-streaming WAV/Opus is used instead.
 
 Audio formats: `opus` (default), `mp3`, `wav`.
 
@@ -188,12 +196,12 @@ Environment variables:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `OPEN_TTS_DEFAULT_MODEL` | `qwen3-tts` | Model to load at startup |
+| `OPEN_TTS_DEFAULT_MODEL` | `kokoro` | Model to load at startup |
 | `OPEN_TTS_HOST` | `127.0.0.1` | Server host |
 | `OPEN_TTS_PORT` | `8000` | Server port |
 | `OPEN_TTS_AUDIO_FORMAT` | `opus` | Default output format |
 | `OPEN_TTS_OPUS_BITRATE` | `64k` | Opus encoding bitrate |
-| `OPEN_TTS_STREAMING_INTERVAL` | `0.5` | Seconds between streaming chunks |
+| `OPEN_TTS_STREAMING_INTERVAL` | `0.5` | Seconds between streaming chunks (Qwen3 only) |
 
 ## Architecture
 
@@ -227,16 +235,17 @@ backend/
   server.py           # FastAPI server (multi-model, lazy loading, streaming)
   native_host.py      # Native messaging host for extension (start/stop/status)
   requirements.txt    # Python dependencies
-  setup.sh            # Setup script (downloads both models)
+  setup.sh            # Setup script (downloads all models)
   models/             # Downloaded model files
-    qwen3-tts-8bit/
-    fish-audio-s2-pro-8bit/
+    kokoro-82M/         # Kokoro 82M bf16 (~170 MB)
+    qwen3-tts-8bit/     # Qwen3-TTS 8-bit (~2.9 GB)
+    fish-audio-s2-pro-8bit/  # Fish S2 Pro 8-bit (~6.3 GB)
   install_native_host.sh   # Install native host for Start/Stop buttons
   install_launch_agent.sh  # Auto-start on login
   uninstall_launch_agent.sh # Remove launch agent
   uninstall_native_host.sh # Remove native host
 extension/
-  manifest.json       # Chrome extension config (Open TTS v2.0.0)
+  manifest.json       # Chrome extension config (Open TTS v2.3.0)
   background.js       # Service worker (TTS requests, streaming, retry, server management)
   content.js          # Content script (widget, Web Audio API, chunk scheduling)
   popup.html/js/css   # Extension popup with model selector
@@ -266,7 +275,11 @@ If you see "Native messaging error" when clicking Start/Stop:
 - Try manual download:
   ```bash
   pip install huggingface-hub
+  # Kokoro (lightweight, loads instantly)
+  huggingface-cli download mlx-community/Kokoro-82M-bf16 --local-dir backend/models/kokoro-82M
+  # Qwen3-TTS (2.9 GB)
   huggingface-cli download mlx-community/Qwen3-TTS-12Hz-1.7B-CustomVoice-8bit --local-dir backend/models/qwen3-tts-8bit
+  # Fish S2 Pro (6.3 GB)
   huggingface-cli download mlx-community/fish-audio-s2-pro-8bit --local-dir backend/models/fish-audio-s2-pro-8bit
   ```
 
@@ -287,8 +300,10 @@ This is a known Python multiprocessing issue, not our bug. Safe to ignore.
 
 ## Credits
 
-- Models: [Qwen3-TTS](https://huggingface.co/mlx-community/Qwen3-TTS-12Hz-1.7B-CustomVoice-8bit), [Fish Audio S2 Pro](https://huggingface.co/mlx-community/fish-audio-s2-pro-8bit)
-- Framework: [MLX Audio](https://github.com/Blaiziinger/mlx-audio)
+- **Kokoro**: [mlx-community/Kokoro-82M-bf16](https://huggingface.co/mlx-community/Kokoro-82M-bf16) — Ultra-fast lightweight TTS
+- **Qwen3-TTS**: [mlx-community/Qwen3-TTS-12Hz-1.7B-CustomVoice-8bit](https://huggingface.co/mlx-community/Qwen3-TTS-12Hz-1.7B-CustomVoice-8bit)
+- **Fish S2 Pro**: [mlx-community/fish-audio-s2-pro-8bit](https://huggingface.co/mlx-community/fish-audio-s2-pro-8bit)
+- **Framework**: [MLX Audio](https://github.com/Blaiziinger/mlx-audio), [Kokoro-MLX](https://github.com/severian42/Kokoro-MLX)
 
 ## License
 
