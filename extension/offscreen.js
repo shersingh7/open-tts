@@ -1,18 +1,5 @@
-// Open TTS — Offscreen Document (v2.3.0)
-// Runs at chrome-extension:// origin = autoplay always allowed.
-// Handles full synthesis + Web Audio playback.
-//
-// PIPELINE v2.3: Streaming batch → progressive decode → gapless playback
-// Instead of the old "batch → decode all → play all" (15s+ dead silence),
-// we now use the streaming batch binary protocol:
-//   1. Send all chunks to /v1/synthesize-stream-batch in one HTTP call
-//   2. Server generates + returns chunks one-by-one (single gpu_lock hold)
-//   3. We decode each chunk as it arrives and schedule it on the AudioContext
-//   4. User hears chunk 0 after ~5s instead of ~15s
-//
-// Speed is applied at synthesis time by the server — we do NOT re-apply
-// playbackRate to avoid double-speed (X^2) effect.
-// ──────────────────────────────────────────────────────────────
+// Open TTS v3.0 — Offscreen Document
+// Audio playback + server streaming. Runs at chrome-extension:// origin.
 
 const SERVER_URL = "http://127.0.0.1:8000";
 const CHUNK_TARGET = 8000;
@@ -26,26 +13,12 @@ let scheduledCount = 0;
 let endedCount = 0;
 let abortCtl = null;
 let isSpeaking = false;
-let isPaused = false;
 
-// ── Server health cache (offscreen-process level) ────────────
-// Avoids redundant /health fetches between SPEAK calls.
-let _serverKnownOk = false;
-let _serverKnownAt = 0;
-const SERVER_CACHE_TTL = 5 * 60 * 1000; // 5 min
+// ─── Audio ───────────────────────────────────────────
 
-function isServerCached() {
-  return _serverKnownOk && (Date.now() - _serverKnownAt < SERVER_CACHE_TTL);
-}
-function markServerOk() { _serverKnownOk = true; _serverKnownAt = Date.now(); }
-function markServerStale() { _serverKnownOk = false; }
-
-// ───── Audio helpers ──────────────────────────────────────────
-
-function getAudioContext() {
-  if (!audioCtx || audioCtx.state === "closed") {
+function getAudioCtx() {
+  if (!audioCtx || audioCtx.state === "closed")
     audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-  }
   return audioCtx;
 }
 
@@ -56,289 +29,243 @@ function resetPlayback() {
   activeSources.clear();
   scheduledCount = 0;
   endedCount = 0;
-  // DO NOT close AudioContext — reuse it. Saves 100-500ms per SPEAK.
-  // Just reset the scheduling timeline.
   nextStartTime = 0;
 }
 
-// ───── Notify background (→ content.js) ──────────────────────
+// ─── Messaging ───────────────────────────────────────
 
-function status(label) { chrome.runtime.sendMessage({ type: "TTS_STATUS", label }).catch(() => {}); }
-function done() { chrome.runtime.sendMessage({ type: "TTS_DONE" }).catch(() => {}); }
-function errMsg(message) { chrome.runtime.sendMessage({ type: "TTS_ERROR", message }).catch(() => {}); }
+const notify = (type, extra = {}) => chrome.runtime.sendMessage({ type, ...extra }).catch(() => {});
 
-// ───── Text chunking ─────────────────────────────────────────
+// ─── Text chunking ───────────────────────────────────
 
-function norm(t) {
-  return (t || "").replace(/[\u200B-\u200D\uFEFF]/g, "").replace(/\s+/g, " ").trim();
-}
+function norm(t) { return (t || "").replace(/[\u200B-\u200D\uFEFF]/g, "").replace(/\s+/g, " ").trim(); }
 
-function splitText(text, maxChars = CHUNK_TARGET) {
-  const cleaned = norm(text);
-  if (!cleaned) return [];
-  if (cleaned.length <= maxChars) return [cleaned];
+function splitText(text, max = CHUNK_TARGET) {
+  const clean = norm(text);
+  if (!clean) return [];
+  if (clean.length <= max) return [clean];
   const out = [];
   const flush = c => { if (c.trim()) out.push(c.trim()); };
-  for (const para of cleaned.split(/\n\n+/)) {
+
+  for (const para of clean.split(/\n\n+/)) {
     if (!para.trim()) continue;
-    if (para.length > maxChars) {
+    if (para.length > max) {
       for (const sent of para.split(/(?<=[.!?])\s+/)) {
         if (!sent) continue;
-        if (sent.length > maxChars) {
+        if (sent.length > max) {
           let buf = "";
           for (const w of sent.split(" ")) {
             if (!w) continue;
             const next = buf ? `${buf} ${w}` : w;
-            if (next.length > maxChars && buf) { flush(buf); buf = w; }
+            if (next.length > max && buf) { flush(buf); buf = w; }
             else buf = next;
           }
           if (buf) flush(buf);
         } else {
           const last = out[out.length - 1];
           const cand = last ? `${last} ${sent}` : sent;
-          if (cand.length <= maxChars) out[out.length - 1] = cand;
+          if (cand.length <= max) out[out.length - 1] = cand;
           else out.push(sent);
         }
       }
     } else {
       const last = out[out.length - 1];
       const cand = last ? `${last}\n\n${para}` : para;
-      if (cand.length <= maxChars) out[out.length - 1] = cand;
+      if (cand.length <= max) out[out.length - 1] = cand;
       else out.push(para);
     }
   }
   return out;
 }
 
-// ───── Server ────────────────────────────────────────────────
+// ─── Server health ───────────────────────────────────
+
+let _serverOk = false, _serverAt = 0;
+const SERVER_TTL = 5 * 60 * 1000;
 
 async function ensureServer() {
-  if (isServerCached()) return true;
-
+  if (_serverOk && Date.now() - _serverAt < SERVER_TTL) return true;
   try {
     const r = await fetch(`${SERVER_URL}/health`, { signal: AbortSignal.timeout(2000) });
-    if (!r.ok) { markServerStale(); return false; }
-    const d = await r.json();
-    if (d.model_loaded) { markServerOk(); return true; }
+    if (r.ok) { const d = await r.json(); if (d.model_loaded) { _serverOk = true; _serverAt = Date.now(); return true; } }
   } catch (_) {}
-
-  // Server not responding — ask background.js to start it
   try {
-    const startResult = await new Promise((resolve) => {
-      chrome.runtime.sendMessage({ type: "ENSURE_SERVER" }, (resp) => {
-        resolve(resp);
-      });
-    });
+    const startResult = await new Promise(resolve => chrome.runtime.sendMessage({ type: "ENSURE_SERVER" }, resolve));
     if (startResult?.success) {
       for (let i = 0; i < 60; i++) {
         await new Promise(r => setTimeout(r, 500));
         try {
           const r = await fetch(`${SERVER_URL}/health`, { signal: AbortSignal.timeout(2000) });
-          if (r.ok) {
-            const d = await r.json();
-            if (d.model_loaded) { markServerOk(); return true; }
-          }
+          if (r.ok) { const d = await r.json(); if (d.model_loaded) { _serverOk = true; _serverAt = Date.now(); return true; } }
         } catch (_) {}
       }
     }
   } catch (_) {}
-  markServerStale();
   return false;
 }
 
-// ───── Streaming batch binary protocol ───────────────────────
-// Server sends frames progressively — per model.generate() iteration:
-//   [4 bytes: header-json length N, little-endian uint32]
-//   [N bytes: UTF-8 JSON header {index, sample_rate, gen_time, final, error}]
-//   [4 bytes: audio-wav length M, little-endian uint32]
-//   [M bytes: WAV data (0 if error or final-marker)]
-// Multiple frames per text index (sub-chunks stream as generated).
-// header.final=true with audioLen=0 = last sub-chunk for that index.
-// Terminal frame: header has {"done": true}
+// ─── Streaming batch protocol ─────────────────────────
+// Frame: [4-byte header-len][JSON header][4-byte audio-len][audio bytes]
+// Terminal frame: header {done: true}
 
-async function* streamBatch(texts, voice, speed, lang, model, signal) {
+async function* streamBatch(texts, settings, signal) {
   const body = {
     texts,
-    voice: voice || "af_bella",
-    speed: Number(speed) || 1.5,
-    language: lang || "Auto",
+    voice: settings.voice || "af_bella",
+    speed: Number(settings.speed) || 1.5,
+    language: settings.language || "Auto",
   };
-  if (model) body.model = model;
+  if (settings.model) body.model = settings.model;
 
-  const response = await fetch(`${SERVER_URL}/v1/synthesize-stream-batch`, {
+  const r = await fetch(`${SERVER_URL}/v1/synthesize-stream-batch`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
     signal: signal || AbortSignal.timeout(MAX_TIMEOUT),
   });
-
-  if (!response.ok) {
-    const err = await response.json().catch(() => ({}));
-    throw new Error(err.detail || `Server error ${response.status}`);
+  if (!r.ok) {
+    const err = await r.json().catch(() => ({}));
+    throw new Error(err.detail || `Server error ${r.status}`);
   }
 
-  const reader = response.body.getReader();
+  const reader = r.body.getReader();
   let buf = new Uint8Array(0);
 
   while (true) {
-    const { value, done: streamDone } = await reader.read();
+    const { value, done: rd } = await reader.read();
     if (value) {
       const merged = new Uint8Array(buf.length + value.length);
       merged.set(buf);
       merged.set(value, buf.length);
       buf = merged;
     }
-    if (streamDone && buf.length === 0) break;
+    if (rd && buf.length === 0) break;
 
-    // Parse complete frames from buf
     while (buf.length >= 4) {
-      const headerLen = new DataView(buf.buffer, buf.byteOffset, 4).getUint32(0, true);
-      if (buf.length < 4 + headerLen + 4) break;
+      const hdrLen = new DataView(buf.buffer, buf.byteOffset, 4).getUint32(0, true);
+      if (buf.length < 4 + hdrLen + 4) break;
 
-      const headerBytes = buf.slice(4, 4 + headerLen);
-      const header = JSON.parse(new TextDecoder().decode(headerBytes));
+      const hdr = JSON.parse(new TextDecoder().decode(buf.slice(4, 4 + hdrLen)));
+      const audioLenOff = 4 + hdrLen;
+      const audioLen = new DataView(buf.buffer, buf.byteOffset + audioLenOff, 4).getUint32(0, true);
+      const audioOff = audioLenOff + 4;
 
-      if (header.done) {
-        reader.cancel().catch(() => {});
-        return;
-      }
+      if (buf.length < audioOff + audioLen) break;
+      const audioData = buf.slice(audioOff, audioOff + audioLen);
+      buf = buf.slice(audioOff + audioLen);
 
-      const audioLenOffset = 4 + headerLen;
-      const audioLen = new DataView(buf.buffer, buf.byteOffset + audioLenOffset, 4).getUint32(0, true);
-      const audioOffset = audioLenOffset + 4;
-
-      if (buf.length < audioOffset + audioLen) break;
-
-      const audioBytes = buf.slice(audioOffset, audioOffset + audioLen);
-      buf = buf.slice(audioOffset + audioLen);
-
-      if (header.error) {
-        yield { error: header.error, index: header.index };
-      } else if (audioLen > 0) {
-        yield { audio: audioBytes, index: header.index, sample_rate: header.sample_rate, final: false };
-      } else if (header.final) {
-        // Final marker for this index (no audio data) — just signal completion
-        yield { final: true, index: header.index };
+      if (hdr.done) { reader.cancel().catch(() => {}); return; }
+      if (hdr.error) { yield { error: hdr.error, index: hdr.index }; continue; }
+      if (audioLen > 0) {
+        yield {
+          audio: audioData,
+          index: hdr.index,
+          sampleRate: hdr.sample_rate,
+          applyPlaybackRate: hdr.apply_playback_rate || false,
+          playbackRate: hdr.playback_rate || 1.0,
+        };
       }
     }
 
-    if (streamDone) break;
+    if (rd) break;
   }
 }
 
-// ───── Decode + schedule progressively ───────────────────────
+// ─── Decode + schedule ───────────────────────────────
 
-async function decodeWavBytes(wavBytes) {
-  // decodeAudioData needs an ArrayBuffer, not Uint8Array
-  const ab = wavBytes.buffer.slice(wavBytes.byteOffset, wavBytes.byteOffset + wavBytes.byteLength);
-  return getAudioContext().decodeAudioData(ab);
+async function decodeWav(bytes) {
+  const ab = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
+  return getAudioCtx().decodeAudioData(ab);
 }
 
-function scheduleBuffer(buf, index, total) {
-  const ctx = getAudioContext();
+function scheduleBuffer(buf, playbackRate = 1.0) {
+  const ctx = getAudioCtx();
   if (ctx.state === "suspended") ctx.resume();
 
-  // Gapless scheduling: if we're past the last scheduled end time, start there;
-  // otherwise (first chunk or after a long gap), start from now + lead time.
   const startAt = Math.max(nextStartTime, ctx.currentTime + AUDIO_LEAD);
-
   const src = ctx.createBufferSource();
   src.buffer = buf;
-  src.playbackRate.value = 1.0; // server applies speed
+  src.playbackRate.value = playbackRate;
   src.connect(ctx.destination);
   src.start(startAt);
-  nextStartTime = startAt + buf.duration;
+  nextStartTime = startAt + (buf.duration / playbackRate);
   activeSources.add(src);
   scheduledCount++;
 
   src.onended = () => {
     activeSources.delete(src);
     endedCount++;
-    if (scheduledCount > 1) {
-      status(`Reading ${endedCount}/${scheduledCount}... tap to stop`);
-    }
-    if (endedCount >= scheduledCount) { isSpeaking = false; done(); }
+    if (endedCount >= scheduledCount) { isSpeaking = false; notify("TTS_DONE"); }
   };
 }
 
-// ───── Main pipeline (streaming batch) ──────────────────────
+// ─── Main pipeline ────────────────────────────────────
 
 async function doSpeak(text, settings) {
   isSpeaking = true;
-  isPaused = false;
   resetPlayback();
   abortCtl = new AbortController();
 
   try {
-    status("Preparing...");
+    notify("TTS_STATUS", { label: "Preparing..." });
     const chunks = splitText(text, CHUNK_TARGET);
     if (!chunks.length) throw new Error("Nothing to read");
 
-    const serverOk = await ensureServer();
-    if (!serverOk) throw new Error("Server not running");
+    if (!await ensureServer()) throw new Error("Server not running");
 
-    status(`Generating ${chunks.length} chunk(s)...`);
+    notify("TTS_STATUS", { label: `Generating ${chunks.length} chunk(s)...` });
 
+    let decoded = 0;
+    let started = false;
     let totalChunks = chunks.length;
-    let decodedCount = 0;
-    let anyDecoded = false;
 
-    for await (const frame of streamBatch(
-      chunks, settings.voice, settings.speed,
-      settings.language, settings.model, abortCtl.signal
-    )) {
-      if (frame.error) {
-        console.error("[TTS Offscreen] Chunk", frame.index, "error:", frame.error);
-        continue;
-      }
-      if (frame.final) continue; // just a completion marker, no audio
-
+    for await (const frame of streamBatch(chunks, settings, abortCtl.signal)) {
+      if (frame.error) { console.error("[TTS]", frame.index, frame.error); continue; }
       if (!frame.audio) continue;
 
       try {
-        const audioBuf = await decodeWavBytes(frame.audio);
-        decodedCount++;
-        if (!anyDecoded) {
-          anyDecoded = true;
-          // First sub-chunk decoded — user hears audio immediately!
-          status(totalChunks > 1 ? `Reading 1/${totalChunks}... tap to stop` : "Reading... tap to stop");
+        const audioBuf = await decodeWav(frame.audio);
+        decoded++;
+
+        if (!started) {
+          started = true;
+          notify("TTS_STATUS", { label: totalChunks > 1 ? `Reading 1/${totalChunks}... tap to stop` : "Reading... tap to stop" });
         }
-        scheduleBuffer(audioBuf, decodedCount, totalChunks);
+
+        // Apply playback rate from the frame header
+        // Kokoro: server already applied speed natively, playbackRate = 1.0
+        // Qwen3/Fish: server generated at 1x, we speed up playback
+        const rate = frame.applyPlaybackRate ? (frame.playbackRate || 1.0) : 1.0;
+        scheduleBuffer(audioBuf, rate);
       } catch (e) {
-        console.error("[TTS Offscreen] Decode sub-chunk", frame.index, e);
+        console.error("[TTS] Decode error:", e);
       }
     }
 
-    if (!anyDecoded) throw new Error("No playable audio generated");
-
-    markServerOk();
+    if (!decoded) throw new Error("No playable audio generated");
+    _serverOk = true; _serverAt = Date.now();
 
   } catch (err) {
-    if (err.name === "AbortError") { done(); return; }
-    console.error("[TTS Offscreen] Pipeline error:", err);
-    isSpeaking = false; resetPlayback(); markServerStale();
-    errMsg(err.message || "Generation failed");
+    if (err.name === "AbortError") { notify("TTS_DONE"); return; }
+    console.error("[TTS] Pipeline:", err);
+    isSpeaking = false; resetPlayback();
+    notify("TTS_ERROR", { message: err.message || "Generation failed" });
   }
 }
 
-// ───── Fallback: non-streaming batch pipeline ───────────────
-// Used if streaming batch endpoint fails (e.g. older server)
+// ─── Fallback: non-streaming batch ───────────────────
 
 async function doSpeakFallback(text, settings) {
   isSpeaking = true;
-  isPaused = false;
   resetPlayback();
   abortCtl = new AbortController();
 
   try {
-    status("Preparing...");
+    notify("TTS_STATUS", { label: "Preparing..." });
     const chunks = splitText(text, CHUNK_TARGET);
     if (!chunks.length) throw new Error("Nothing to read");
 
-    const serverOk = await ensureServer();
-    if (!serverOk) throw new Error("Server not running");
-
-    status(`Generating ${chunks.length} chunk(s)...`);
+    if (!await ensureServer()) throw new Error("Server not running");
 
     const body = {
       texts: chunks,
@@ -355,90 +282,86 @@ async function doSpeakFallback(text, settings) {
       body: JSON.stringify(body),
       signal: abortCtl.signal || AbortSignal.timeout(MAX_TIMEOUT),
     });
-
-    if (!r.ok) {
-      const err = await r.json().catch(() => ({}));
-      throw new Error(err.detail || `Server error ${r.status}`);
-    }
+    if (!r.ok) { const e = await r.json().catch(() => ({})); throw new Error(e.detail || `Server error ${r.status}`); }
 
     const batch = await r.json();
     const results = batch.results || [];
     if (!results.length) throw new Error("No audio returned");
 
-    // Progressive decode: decode in order, schedule each as it's ready
-    status("Loading audio...");
-    const bufs = [];
+    notify("TTS_STATUS", { label: "Loading audio..." });
+
+    // Determine playback rate
+    const modelId = settings.model || "kokoro";
+    const modelInfo = await getModelInfo(modelId);
+    const applyRate = modelInfo && !modelInfo.supports_native_speed;
+    const rate = applyRate ? (Number(settings.speed) || 1.5) : 1.0;
+
+    let started = false;
     for (let i = 0; i < results.length; i++) {
-      const r = results[i];
-      if (r.error || !r.audio_base64) { bufs.push(null); continue; }
+      const res = results[i];
+      if (res.error || !res.audio_base64) continue;
       try {
-        const decoded = await decodeChunk(r.audio_base64);
-        bufs.push(decoded);
+        const decoded = await decodeChunk(res.audio_base64);
         if (decoded) {
-          // Schedule immediately — don't wait for remaining chunks
-          if (!bufs.some(Boolean)) {
-            // This is the first successful decode
-            status(results.length > 1 ? `Reading 1/${results.length}... tap to stop` : "Reading... tap to stop");
-          }
-          scheduleBuffer(decoded, i, results.length);
+          if (!started) { started = true; notify("TTS_STATUS", { label: results.length > 1 ? `Reading 1/${results.length}... tap to stop` : "Reading... tap to stop" }); }
+          scheduleBuffer(decoded, rate);
         }
-      } catch (e) {
-        console.error("[TTS Offscreen] decode chunk", i, e);
-        bufs.push(null);
-      }
+      } catch (e) { console.error("[TTS] Decode:", i, e); }
     }
 
-    const playable = bufs.filter(Boolean);
-    if (!playable.length) throw new Error("No playable audio generated");
-    markServerOk();
-
+    if (!started) throw new Error("No playable audio");
   } catch (err) {
-    if (err.name === "AbortError") { done(); return; }
-    console.error("[TTS Offscreen] Pipeline error:", err);
-    isSpeaking = false; resetPlayback(); markServerStale();
-    errMsg(err.message || "Generation failed");
+    if (err.name === "AbortError") { notify("TTS_DONE"); return; }
+    console.error("[TTS] Fallback:", err);
+    isSpeaking = false; resetPlayback();
+    notify("TTS_ERROR", { message: err.message || "Generation failed" });
   }
+}
+
+async function getModelInfo(modelId) {
+  try {
+    const r = await fetch(`${SERVER_URL}/v1/models`);
+    const d = await r.json();
+    return d.models?.find(m => m.id === modelId);
+  } catch (e) { return null; }
 }
 
 async function decodeChunk(b64) {
   const str = atob(b64);
   const bytes = new Uint8Array(str.length);
   for (let i = 0; i < str.length; i++) bytes[i] = str.charCodeAt(i);
-  return getAudioContext().decodeAudioData(bytes.buffer.slice(0));
+  return getAudioCtx().decodeAudioData(bytes.buffer.slice(0));
 }
 
-// ───── Message router ─────────────────────────────────────────
+// ─── Router ───────────────────────────────────────────
 
-chrome.runtime.onMessage.addListener((request, _sender, sendResponse) => {
-  const t = request.type;
+chrome.runtime.onMessage.addListener((req, _sender, sendResponse) => {
+  const t = req.type;
 
   if (t === "SPEAK") {
-    // Try streaming batch first, fall back to regular batch on failure
-    doSpeak(request.text, request.settings || {})
-      .catch((err) => {
-        console.warn("[TTS Offscreen] Streaming batch failed, falling back:", err);
-        return doSpeakFallback(request.text, request.settings || {});
+    doSpeak(req.text, req.settings || {})
+      .catch(err => {
+        console.warn("[TTS] Stream failed, fallback:", err);
+        return doSpeakFallback(req.text, req.settings || {});
       });
     sendResponse({ started: true });
     return true;
   }
+
   if (t === "STOP") {
-    isSpeaking = false; isPaused = false;
-    resetPlayback(); done();
+    isSpeaking = false; resetPlayback(); notify("TTS_DONE");
     sendResponse({ stopped: true });
     return true;
   }
+
   if (t === "PAUSE") {
-    if (audioCtx?.state === "running") {
-      audioCtx.suspend(); isPaused = true; status("Paused — tap to resume");
-    }
+    if (audioCtx?.state === "running") { audioCtx.suspend(); notify("TTS_STATUS", { label: "Paused — tap to resume" }); }
     sendResponse({ paused: true });
     return true;
   }
+
   if (t === "RESUME") {
-    if (audioCtx?.state === "suspended") {
-      audioCtx.resume(); isPaused = false; status("Reading... tap to stop");
-    }
+    if (audioCtx?.state === "suspended") { audioCtx.resume(); notify("TTS_STATUS", { label: "Reading... tap to stop" }); }
     sendResponse({ resumed: true });
     return true;
   }

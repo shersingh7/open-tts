@@ -1,7 +1,4 @@
-/* ═══════════════════════════════════════════════════════════════
-   OPEN TTS — IMPERIAL EDITION
-   Content Script Widget Styles
-   ═══════════════════════════════════════════════════════════════ */
+/* Open TTS v3.0 — Content Script Widget */
 
 #qwen-tts-icon-container {
   display: none !important;
@@ -10,185 +7,99 @@
   pointer-events: none !important;
 }
 
-/* ── Floating Widget ── */
-#qwen-tts-widget {
+#open-tts-widget {
   position: absolute;
   z-index: 2147483646;
   display: flex;
   align-items: center;
   gap: 8px;
-  padding: 6px 12px 6px 7px;
-  border-radius: 10px;
-  background: linear-gradient(135deg, #0f0f16 0%, #1a1a24 100%);
-  border: 1px solid #2a2a3a;
-  box-shadow:
-    0 0 0 1px rgba(255, 26, 26, 0.08),
-    0 8px 28px rgba(0, 0, 0, 0.55),
-    0 0 18px rgba(255, 26, 26, 0.12);
-  color: #e8e8ec;
-  font-family: "Orbitron", "Share Tech Mono", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-  font-size: 11px;
-  font-weight: 700;
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
+  padding: 6px 14px 6px 8px;
+  border-radius: 12px;
+  background: #1a1a22;
+  border: 1px solid #33333f;
+  box-shadow: 0 4px 20px rgba(0, 0, 0, 0.4), 0 0 0 1px rgba(108, 92, 231, 0.08);
+  color: #e4e4ec;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Inter", sans-serif;
+  font-size: 13px;
+  font-weight: 600;
   opacity: 0;
-  transform: translateY(6px) scale(0.95);
+  transform: translateY(4px) scale(0.96);
   pointer-events: none;
-  transition: opacity 160ms ease, transform 160ms ease;
+  transition: opacity 150ms ease, transform 150ms ease;
 }
 
-#qwen-tts-widget.visible {
+#open-tts-widget.visible {
   opacity: 1;
   transform: translateY(0) scale(1);
   pointer-events: auto;
 }
 
-/* ── Button ── */
-#qwen-tts-button {
+#open-tts-button {
   border: none;
-  background: rgba(255, 26, 26, 0.12);
-  width: 30px;
-  height: 30px;
+  background: rgba(108, 92, 231, 0.12);
+  width: 28px;
+  height: 28px;
   border-radius: 50%;
   display: grid;
   place-items: center;
   cursor: pointer;
   padding: 0;
-  transition: background 0.2s ease, box-shadow 0.2s ease;
+  transition: background 0.15s, box-shadow 0.15s;
 }
 
-#qwen-tts-button:hover {
-  background: rgba(255, 26, 26, 0.22);
-  box-shadow: 0 0 12px rgba(255, 26, 26, 0.25);
+#open-tts-button:hover {
+  background: rgba(108, 92, 231, 0.25);
+  box-shadow: 0 0 12px rgba(108, 92, 231, 0.25);
 }
 
-/* ── Glyph (speaker icon) ── */
-.qwen-glyph {
-  position: relative;
-  width: 18px;
-  height: 18px;
-  display: block;
+#open-tts-button svg {
+  width: 14px;
+  height: 14px;
+  color: #6c5ce7;
 }
 
-.qwen-glyph-body {
-  position: absolute;
-  left: 1px;
-  top: 6px;
-  width: 5px;
-  height: 7px;
-  border-radius: 2px;
-  background: #fff;
-}
-
-.qwen-glyph-cone {
-  position: absolute;
-  left: 5px;
-  top: 4px;
-  width: 7px;
-  height: 10px;
-  background: #fff;
-  clip-path: polygon(0 20%, 100% 0, 100% 100%, 0 80%);
-}
-
-.qwen-glyph-wave {
-  position: absolute;
-  border: 2px solid transparent;
-  border-right-color: #fff;
-  border-radius: 50%;
-}
-
-.qwen-glyph-wave.wave1 {
-  width: 8px;
-  height: 8px;
-  right: -1px;
-  top: 5px;
-}
-
-.qwen-glyph-wave.wave2 {
-  width: 13px;
-  height: 13px;
-  right: -4px;
-  top: 2px;
-}
-
-#qwen-tts-label {
-  font-size: 10px;
-  font-weight: 700;
-  letter-spacing: 0.1em;
+#open-tts-label {
+  font-size: 12px;
+  font-weight: 600;
   white-space: nowrap;
-  text-shadow: 0 0 6px rgba(255, 26, 26, 0.3);
+  letter-spacing: 0.01em;
 }
 
-/* ── Busy State ── */
-#qwen-tts-widget.busy #qwen-tts-button {
-  animation: qwen-spin 1s linear infinite;
+/* Busy */
+#open-tts-widget.busy #open-tts-button {
+  animation: tts-spin 0.8s linear infinite;
 }
 
-#qwen-tts-widget.busy {
-  box-shadow:
-    0 0 0 0 rgba(255, 26, 26, 0.45),
-    0 8px 28px rgba(0, 0, 0, 0.55),
-    0 0 18px rgba(255, 26, 26, 0.15);
-  animation: qwen-pulse 1.6s ease-out infinite;
+#open-tts-widget.busy {
+  box-shadow: 0 4px 20px rgba(0, 0, 0, 0.4), 0 0 0 1px rgba(108, 92, 231, 0.2);
+  animation: tts-pulse 1.5s ease-out infinite;
 }
 
-/* ── Error State ── */
-#qwen-tts-widget.error {
-  background: linear-gradient(135deg, #1a0f14 0%, #241218 100%);
-  border-color: rgba(255, 23, 68, 0.4);
-  box-shadow:
-    0 0 0 1px rgba(255, 23, 68, 0.1),
-    0 8px 28px rgba(0, 0, 0, 0.55),
-    0 0 18px rgba(255, 23, 68, 0.18);
+/* Error */
+#open-tts-widget.error {
+  border-color: rgba(255, 71, 87, 0.4);
+  background: #1a1014;
 }
 
-#qwen-tts-widget.error #qwen-tts-label {
+#open-tts-widget.error #open-tts-label {
   color: #ff8a8a;
-  text-shadow: 0 0 6px rgba(255, 23, 68, 0.35);
 }
 
-/* ── Paused State ── */
-#qwen-tts-widget.paused {
-  background: linear-gradient(135deg, #0f1616 0%, #141f24 100%);
-  border-color: rgba(0, 229, 255, 0.25);
-  box-shadow:
-    0 0 0 1px rgba(0, 229, 255, 0.06),
-    0 8px 28px rgba(0, 0, 0, 0.55),
-    0 0 18px rgba(0, 229, 255, 0.1);
-}
-
-#qwen-tts-widget.paused #qwen-tts-button {
+/* Paused */
+#open-tts-widget.paused #open-tts-button {
   animation: none !important;
 }
 
-#qwen-tts-widget.paused #qwen-tts-label {
+#open-tts-widget.paused #open-tts-label {
   color: #a0f0ff;
-  text-shadow: 0 0 6px rgba(0, 229, 255, 0.25);
 }
 
-/* ── Animations ── */
-@keyframes qwen-spin {
+@keyframes tts-spin {
   from { transform: rotate(0deg); }
-  to   { transform: rotate(360deg); }
+  to { transform: rotate(360deg); }
 }
 
-@keyframes qwen-pulse {
-  0% {
-    box-shadow:
-      0 0 0 0 rgba(255, 26, 26, 0.5),
-      0 8px 28px rgba(0, 0, 0, 0.55),
-      0 0 18px rgba(255, 26, 26, 0.15);
-  }
-  70% {
-    box-shadow:
-      0 0 0 10px rgba(255, 26, 26, 0),
-      0 8px 28px rgba(0, 0, 0, 0.55),
-      0 0 18px rgba(255, 26, 26, 0.15);
-  }
-  100% {
-    box-shadow:
-      0 0 0 0 rgba(255, 26, 26, 0),
-      0 8px 28px rgba(0, 0, 0, 0.55),
-      0 0 18px rgba(255, 26, 26, 0.15);
-  }
+@keyframes tts-pulse {
+  0%, 100% { box-shadow: 0 4px 20px rgba(0,0,0,0.4), 0 0 0 0 rgba(108,92,231,0.3); }
+  50% { box-shadow: 0 4px 20px rgba(0,0,0,0.4), 0 0 0 6px rgba(108,92,231,0); }
 }

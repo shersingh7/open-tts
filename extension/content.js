@@ -1,75 +1,57 @@
-// Open TTS — Content Script (v2.3.0)
-// Handles the "Speak" floating widget on selected text.
-// Offscreen document lifecycle is managed by background.js —
-// content scripts don't have access to chrome.offscreen API.
+// Open TTS v3.0 — Content Script
+// Floating "Speak" widget on selected text.
 
 let widget = null;
 let currentRunId = 0;
 let isSpeaking = false;
 let isPaused = false;
-let savedSelection = "";  // Captured on mouseup, survives mousedown
+let savedSelection = "";
+let _lastRect = null;
 
-const MAX_SELECTION_CHARS = 200000;
+const MAX_CHARS = 200000;
 
-// ─── Helpers ─────────────────────────────────────────────────────
-
-function removeLegacyWidget() {
-  document.querySelectorAll("#qwen-tts-icon-container").forEach((n) => n.remove());
+// Remove legacy widgets
+function removeLegacy() {
+  document.querySelectorAll("#qwen-tts-icon-container").forEach(n => n.remove());
 }
-removeLegacyWidget();
-new MutationObserver(() => removeLegacyWidget())
+removeLegacy();
+new MutationObserver(removeLegacy)
   .observe(document.documentElement || document.body, { childList: true, subtree: true });
 
-// ─── Widget creation ─────────────────────────────────────────
+// ─── Widget ──────────────────────────────────────────
 
 function createWidget() {
   const container = document.createElement("div");
-  container.id = "qwen-tts-widget";
+  container.id = "open-tts-widget";
 
   const btn = document.createElement("button");
-  btn.id = "qwen-tts-button";
+  btn.id = "open-tts-button";
   btn.type = "button";
   btn.title = "Read selection aloud";
-
-  const glyph = document.createElement("span");
-  glyph.className = "qwen-glyph";
-  glyph.innerHTML = `
-    <span class="qwen-glyph-body"></span>
-    <span class="qwen-glyph-cone"></span>
-    <span class="qwen-glyph-wave wave1"></span>
-    <span class="qwen-glyph-wave wave2"></span>
-  `;
-  btn.appendChild(glyph);
+  btn.innerHTML = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polygon points="5 3 19 12 5 21 5 3"/></svg>`;
 
   const label = document.createElement("span");
-  label.id = "qwen-tts-label";
+  label.id = "open-tts-label";
   label.textContent = "Speak";
+
   container.appendChild(btn);
   container.appendChild(label);
 
-  // CRITICAL FIX: prevent mousedown on the button from clearing the selection.
-  // Without this, the browser deselects text on mousedown, so getSelection()
-  // returns "" by the time click fires — and the speak button does nothing.
-  btn.addEventListener("mousedown", (e) => {
-    e.preventDefault();
-    e.stopPropagation();
-  }, true);
+  btn.addEventListener("mousedown", (e) => { e.preventDefault(); e.stopPropagation(); }, true);
+  btn.addEventListener("click", onClick);
 
-  btn.addEventListener("click", onSpeakClick);
   document.body.appendChild(container);
   widget = container;
   return container;
 }
 
 function setLabel(text) {
-  const label = widget?.querySelector("#qwen-tts-label");
-  if (label) label.textContent = text;
+  const l = widget?.querySelector("#open-tts-label");
+  if (l) l.textContent = text;
 }
 
-function showWidgetAtSelection() {
+function showWidget() {
   if (!widget) createWidget();
-  // Use saved selection range to position widget — works even if
-  // the user clicked the widget (which would have cleared getSelection)
   if (!_lastRect) return;
   const rect = _lastRect;
   const top = Math.max(window.scrollY + 8, window.scrollY + rect.top - 44);
@@ -91,56 +73,49 @@ function flashError(msg) {
   setTimeout(() => { widget?.classList.remove("error"); setLabel("Speak"); }, 3000);
 }
 
-// ─── Speak / Pause / Resume / Stop ─────────────────────────
-// All messages route through background.js, which owns the offscreen
-// document lifecycle. We never touch chrome.offscreen directly.
+// ─── Messaging ───────────────────────────────────────
 
-function sendToBackground(payload) {
+function send(payload) {
   return new Promise((resolve, reject) => {
-    chrome.runtime.sendMessage(payload, (response) => {
-      const err = chrome.runtime.lastError;
-      if (err) { reject(new Error(err.message)); return; }
-      resolve(response);
+    chrome.runtime.sendMessage(payload, (resp) => {
+      if (chrome.runtime.lastError) { reject(new Error(chrome.runtime.lastError.message)); return; }
+      resolve(resp);
     });
   });
 }
 
-async function onSpeakClick(e) {
+// ─── Click handler ────────────────────────────────────
+
+async function onClick(e) {
   e.preventDefault();
   e.stopPropagation();
 
-  // Use saved selection — NOT window.getSelection() which may be empty
-  // after mousedown on our own button cleared it.
   const text = savedSelection || window.getSelection()?.toString().trim() || "";
   if (!text) return;
 
-  // Toggle off if already playing or pausing
   if (isSpeaking) {
     if (isPaused) {
-      await sendToBackground({ type: "RESUME" }).catch(() => {});
+      await send({ type: "RESUME" }).catch(() => {});
       isPaused = false;
       widget?.classList.remove("paused");
       setBusy(true, "Reading... tap to stop");
       return;
     }
-    // Actually playing — pause
-    await sendToBackground({ type: "PAUSE" }).catch(() => {});
+    await send({ type: "PAUSE" }).catch(() => {});
     isPaused = true;
     widget?.classList.add("paused");
     setBusy(true, "Paused — tap to resume");
     return;
   }
 
-  // Full stop-reset
   currentRunId++;
   isSpeaking = true;
   isPaused = false;
-  const runId = currentRunId;
 
   try {
     setBusy(true, "Generating...");
 
-    const settings = await new Promise((resolve) => {
+    const settings = await new Promise(resolve => {
       chrome.storage.sync.get(["voice", "speed", "language", "model"], (data) => {
         resolve({
           voice: data.voice || "af_bella",
@@ -151,23 +126,16 @@ async function onSpeakClick(e) {
       });
     });
 
-    // background.js will ensure offscreen doc exists, then forward to offscreen.js
-    await sendToBackground({
-      type: "SPEAK",
-      text: text.slice(0, MAX_SELECTION_CHARS),
-      settings,
-    });
+    await send({ type: "SPEAK", text: text.slice(0, MAX_CHARS), settings });
   } catch (err) {
-    if (runId !== currentRunId) return;
-    console.error("[Open TTS] Speak error:", err);
-    flashError(err.message || "Couldn't read. Tap again");
+    flashError(err.message || "Couldn't read");
     isSpeaking = false;
     isPaused = false;
     setBusy(false, "Speak");
   }
 }
 
-// ─── STOP handler from popup ───────────────────────────────────
+// ─── Messages from background ───────────────────────
 
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   if (msg.type === "STOP_TTS") {
@@ -176,7 +144,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     isPaused = false;
     widget?.classList.remove("paused");
     setLabel("Speak");
-    if (sendResponse) sendResponse({ stopped: true });
+    sendResponse({ stopped: true });
     return true;
   }
   if (msg.type === "TTS_STATUS") {
@@ -198,19 +166,15 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   }
 });
 
-// ─── Selection events ──────────────────────────────────────
-
-let _lastRect = null;
+// ─── Selection events ────────────────────────────────
 
 document.addEventListener("mouseup", () => {
   const sel = window.getSelection();
   const text = sel?.toString().trim();
   if (text) {
-    savedSelection = text.slice(0, MAX_SELECTION_CHARS);
-    if (sel.rangeCount > 0) {
-      _lastRect = sel.getRangeAt(0).getBoundingClientRect();
-    }
-    showWidgetAtSelection();
+    savedSelection = text.slice(0, MAX_CHARS);
+    if (sel.rangeCount > 0) _lastRect = sel.getRangeAt(0).getBoundingClientRect();
+    showWidget();
   } else {
     setTimeout(() => {
       if (!window.getSelection()?.toString().trim()) hideWidget();
@@ -219,7 +183,6 @@ document.addEventListener("mouseup", () => {
 });
 
 document.addEventListener("mousedown", (e) => {
-  // Don't hide if clicking our own widget — mousedown is already prevented on the button
   if (widget && widget.contains(e.target)) return;
   hideWidget();
 });
