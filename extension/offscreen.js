@@ -15,9 +15,9 @@
 // ──────────────────────────────────────────────────────────────
 
 const SERVER_URL = "http://127.0.0.1:8000";
-const CHUNK_TARGET = 4000;
+const CHUNK_TARGET = 8000;
 const AUDIO_LEAD = 0.05;
-const MAX_TIMEOUT = 300000;
+const MAX_TIMEOUT = 600000;
 
 let audioCtx = null;
 let nextStartTime = 0;
@@ -147,11 +147,13 @@ async function ensureServer() {
 }
 
 // ───── Streaming batch binary protocol ───────────────────────
-// Server sends frames:
+// Server sends frames progressively — per model.generate() iteration:
 //   [4 bytes: header-json length N, little-endian uint32]
 //   [N bytes: UTF-8 JSON header {index, sample_rate, gen_time, final, error}]
 //   [4 bytes: audio-wav length M, little-endian uint32]
-//   [M bytes: WAV data (0 if error)]
+//   [M bytes: WAV data (0 if error or final-marker)]
+// Multiple frames per text index (sub-chunks stream as generated).
+// header.final=true with audioLen=0 = last sub-chunk for that index.
 // Terminal frame: header has {"done": true}
 
 async function* streamBatch(texts, voice, speed, lang, model, signal) {
@@ -176,7 +178,7 @@ async function* streamBatch(texts, voice, speed, lang, model, signal) {
   }
 
   const reader = response.body.getReader();
-  let buf = new Uint8Array(0); // Accumulated unconsumed bytes
+  let buf = new Uint8Array(0);
 
   while (true) {
     const { value, done: streamDone } = await reader.read();
@@ -188,10 +190,10 @@ async function* streamBatch(texts, voice, speed, lang, model, signal) {
     }
     if (streamDone && buf.length === 0) break;
 
-    // Try to parse complete frames from buf
+    // Parse complete frames from buf
     while (buf.length >= 4) {
       const headerLen = new DataView(buf.buffer, buf.byteOffset, 4).getUint32(0, true);
-      if (buf.length < 4 + headerLen + 4) break; // incomplete frame
+      if (buf.length < 4 + headerLen + 4) break;
 
       const headerBytes = buf.slice(4, 4 + headerLen);
       const header = JSON.parse(new TextDecoder().decode(headerBytes));
@@ -205,7 +207,7 @@ async function* streamBatch(texts, voice, speed, lang, model, signal) {
       const audioLen = new DataView(buf.buffer, buf.byteOffset + audioLenOffset, 4).getUint32(0, true);
       const audioOffset = audioLenOffset + 4;
 
-      if (buf.length < audioOffset + audioLen) break; // incomplete audio
+      if (buf.length < audioOffset + audioLen) break;
 
       const audioBytes = buf.slice(audioOffset, audioOffset + audioLen);
       buf = buf.slice(audioOffset + audioLen);
@@ -213,7 +215,10 @@ async function* streamBatch(texts, voice, speed, lang, model, signal) {
       if (header.error) {
         yield { error: header.error, index: header.index };
       } else if (audioLen > 0) {
-        yield { audio: audioBytes, index: header.index, sample_rate: header.sample_rate };
+        yield { audio: audioBytes, index: header.index, sample_rate: header.sample_rate, final: false };
+      } else if (header.final) {
+        // Final marker for this index (no audio data) — just signal completion
+        yield { final: true, index: header.index };
       }
     }
 
@@ -274,7 +279,6 @@ async function doSpeak(text, settings) {
 
     status(`Generating ${chunks.length} chunk(s)...`);
 
-    // Progressive pipeline: decode and schedule each chunk as it arrives
     let totalChunks = chunks.length;
     let decodedCount = 0;
     let anyDecoded = false;
@@ -287,6 +291,8 @@ async function doSpeak(text, settings) {
         console.error("[TTS Offscreen] Chunk", frame.index, "error:", frame.error);
         continue;
       }
+      if (frame.final) continue; // just a completion marker, no audio
+
       if (!frame.audio) continue;
 
       try {
@@ -294,12 +300,12 @@ async function doSpeak(text, settings) {
         decodedCount++;
         if (!anyDecoded) {
           anyDecoded = true;
-          // First chunk decoded — user hears audio immediately!
+          // First sub-chunk decoded — user hears audio immediately!
           status(totalChunks > 1 ? `Reading 1/${totalChunks}... tap to stop` : "Reading... tap to stop");
         }
         scheduleBuffer(audioBuf, decodedCount, totalChunks);
       } catch (e) {
-        console.error("[TTS Offscreen] Decode chunk", frame.index, e);
+        console.error("[TTS Offscreen] Decode sub-chunk", frame.index, e);
       }
     }
 
