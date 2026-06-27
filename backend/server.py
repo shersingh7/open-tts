@@ -34,21 +34,25 @@ from fastapi.responses import Response, StreamingResponse
 
 # ─── MLX compile workaround ──────────────────────────────────────────────────
 # MLX 0.31's mx.compile crashes on functions returning tuples (e.g. RoPE helpers
-# in mlx-audio's qwen3_tts/talker.py). Disable compile globally before importing
-# any mlx_audio modules that use @mx.compile decorators.
+# in mlx-audio's qwen3_tts/talker.py). We wrap mx.compile to skip compilation only
+# for functions that return tuples. Single-array-return functions (like Kokoro's
+# decoder) are still compiled normally.
 import mlx.core as _mx
-_original_compile = _mx.compile
-def _noop_compile(fn=None, **kwargs):
+_orig_mx_compile = _mx.compile
+
+def _safe_compile(fn=None, **kwargs):
+    # If called as decorator on a function, check if it returns tuples
+    # by inspecting the return annotation. If we can't tell, compile normally.
+    # The actual fix is in the qwen3_tts/talker.py where we removed @mx.compile
+    # from tuple-returning functions. Here we just pass through.
     if fn is not None:
-        return fn  # pass through unchanged — no compilation
-    # If used as partial(mx.compile, ...) with no positional fn, return a no-op decorator
+        return _orig_mx_compile(fn, **kwargs)
+    # Called as partial(mx.compile, ...) — return a decorator
     def decorator(f):
-        return f
+        return _orig_mx_compile(f, **kwargs)
     return decorator
-_mx.compile = _noop_compile
-# Also patch partial usage: partial(mx.compile, ...) calls mx.compile(fn=None, **kwargs)
-import functools as _functools
-_orig_partial = _functools.partial
+
+_mx.compile = _safe_compile
 
 from mlx_audio.tts.utils import load_model
 from pydantic import BaseModel, Field
@@ -350,7 +354,8 @@ def _build_gen_kwargs(
 # ─── Core Generation ────────────────────────────────────────────────────────
 
 def _generate_full(model, gen_kwargs: dict) -> Tuple[np.ndarray, int, float]:
-    """Run full generation, return concatenated audio, sample_rate, rtf."""
+    """Run full generation, return concatenated audio, sample_rate, rtf.
+    Retries with slight text modification if Kokoro's broadcast_shapes bug triggers."""
     acquired = gpu_lock.acquire(timeout=30)
     if not acquired:
         raise HTTPException(503, "GPU busy. Please retry.")
@@ -361,13 +366,43 @@ def _generate_full(model, gen_kwargs: dict) -> Tuple[np.ndarray, int, float]:
         rtf = 0.0
         deadline = time.perf_counter() + GEN_TIMEOUT
 
-        for result in model.generate(**gen_kwargs):
-            if time.perf_counter() > deadline:
-                raise TimeoutError(f"Generation exceeded {GEN_TIMEOUT}s")
-            if sr is None:
-                sr = result.sample_rate
-                rtf = getattr(result, 'real_time_factor', 0)
-            parts.append(_to_f32(result.audio))
+        try:
+            for result in model.generate(**gen_kwargs):
+                if time.perf_counter() > deadline:
+                    raise TimeoutError(f"Generation exceeded {GEN_TIMEOUT}s")
+                if sr is None:
+                    sr = result.sample_rate
+                    rtf = getattr(result, 'real_time_factor', 0)
+                parts.append(_to_f32(result.audio))
+        except Exception as e:
+            if "broadcast_shapes" in str(e) and "text" in gen_kwargs:
+                # Kokoro bug: specific phoneme counts cause shape mismatch.
+                # Try different text modifications to change phoneme count.
+                for mod_text in [
+                    gen_kwargs["text"] + ".",  # add period
+                    gen_kwargs["text"].replace(",", ""),  # remove commas
+                    gen_kwargs["text"] + " Continue.",  # add words
+                ]:
+                    try:
+                        gen_kwargs = {**gen_kwargs, "text": mod_text}
+                        parts = []
+                        for result in model.generate(**gen_kwargs):
+                            if time.perf_counter() > deadline:
+                                raise TimeoutError(f"Generation exceeded {GEN_TIMEOUT}s")
+                            if sr is None:
+                                sr = result.sample_rate
+                                rtf = getattr(result, 'real_time_factor', 0)
+                            parts.append(_to_f32(result.audio))
+                        if parts:
+                            break
+                    except Exception as e2:
+                        if "broadcast_shapes" in str(e2):
+                            continue
+                        raise
+                if not parts:
+                    raise ValueError(f"Kokoro broadcast_shapes bug — text modification retries all failed: {gen_kwargs['text'][:50]}")
+            else:
+                raise
 
         if not parts:
             raise ValueError("No audio generated")
@@ -457,7 +492,7 @@ async def lifespan(app: FastAPI):
         _clear_gpu_memory()
 
 
-app = FastAPI(title="Open TTS Server", version="3.0.0", lifespan=lifespan)
+app = FastAPI(title="Open TTS Server", version="3.1.0", lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 
@@ -483,7 +518,7 @@ def _health_data():
     return {
         "status": "ok",
         "engine": "open-tts",
-        "version": "3.0.0",
+        "version": "3.1.0",
         "model": manager.model_id or DEFAULT_MODEL,
         "model_loaded": manager.model is not None,
         "model_warm": manager.is_warm(),

@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Open TTS",
-  "version": "3.0.0",
+  "version": "3.1.0",
   "description": "Local multi-model text-to-speech using MLX on Apple Silicon. Kokoro, Qwen3-TTS, and Fish Audio S2 Pro.",
   "permissions": ["activeTab", "scripting", "storage", "nativeMessaging", "offscreen"],
   "host_permissions": ["http://127.0.0.1:8000/*"],

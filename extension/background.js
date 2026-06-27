@@ -1,14 +1,6 @@
-// Open TTS v3.0 — Background Service Worker
+// Open TTS v3.1 — Background Service Worker
 const SERVER_URL = "http://127.0.0.1:8000";
 const NATIVE_HOST = "com.open_tts.native_host";
-
-let _serverKnown = false;
-let _serverKnownAt = 0;
-const SERVER_TTL = 5 * 60 * 1000;
-
-function isServerKnown() { return _serverKnown && (Date.now() - _serverKnownAt < SERVER_TTL); }
-function markServerKnown() { _serverKnown = true; _serverKnownAt = Date.now(); }
-function markServerUnknown() { _serverKnown = false; }
 
 // ─── Offscreen lifecycle ─────────────────────────────
 async function ensureOffscreen() {
@@ -36,27 +28,33 @@ async function sendToOffscreen(payload) {
 // ─── Native messaging ─────────────────────────────────
 function nativeMsg(command) {
   return new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => reject(new Error("Native host timeout")), 30000);
     chrome.runtime.sendNativeMessage(NATIVE_HOST, { command }, (resp) => {
+      clearTimeout(timeout);
       if (chrome.runtime.lastError) { reject(new Error(chrome.runtime.lastError.message)); return; }
       resolve(resp);
     });
   });
 }
 
-// ─── Fetch helpers ────────────────────────────────────
-async function fetchJson(path, opts = {}) {
-  const timeout = opts.timeoutMs ?? 10000;
-  const r = await fetch(`${SERVER_URL}${path}`, { ...opts, signal: opts.signal ?? AbortSignal.timeout(timeout) });
-  const data = await r.json().catch(() => ({}));
-  if (!r.ok) { markServerUnknown(); throw new Error(data?.detail || `${r.status}`); }
-  markServerKnown();
-  return data;
+// ─── Server health ────────────────────────────────────
+
+async function fetchHealth(timeoutMs = 3000) {
+  try {
+    const r = await fetch(`${SERVER_URL}/health`, { signal: AbortSignal.timeout(timeoutMs) });
+    if (!r.ok) return null;
+    return await r.json();
+  } catch { return null; }
+}
+
+async function isServerAlive() {
+  const h = await fetchHealth();
+  return h && h.model_loaded;
 }
 
 // ─── Message handler ─────────────────────────────────
 chrome.runtime.onMessage.addListener((req, sender, sendResponse) => {
   if (req._fromBackground) return false;
-
   const type = req.type;
 
   if (["SPEAK", "STOP", "PAUSE", "RESUME"].includes(type)) {
@@ -89,67 +87,124 @@ chrome.runtime.onMessage.addListener((req, sender, sendResponse) => {
 });
 
 // ─── Handlers ─────────────────────────────────────────
+
 async function handleHealth(sendResponse) {
-  try { const data = await fetchJson("/health"); sendResponse({ success: true, data }); }
-  catch (e) { markServerUnknown(); sendResponse({ success: false, error: e.message }); }
+  const data = await fetchHealth(5000);
+  if (data) sendResponse({ success: true, data });
+  else sendResponse({ success: false, error: "Server not reachable" });
 }
 
 async function handleModels(sendResponse) {
-  try { const data = await fetchJson("/v1/models"); sendResponse({ success: true, data }); }
-  catch (e) { sendResponse({ success: false, error: e.message }); }
+  try {
+    const r = await fetch(`${SERVER_URL}/v1/models`, { signal: AbortSignal.timeout(10000) });
+    const data = await r.json();
+    sendResponse({ success: true, data });
+  } catch (e) { sendResponse({ success: false, error: e.message }); }
 }
 
 async function handleLoadModel(req, sendResponse) {
   try {
-    const data = await fetchJson(`/v1/load-model?model_id=${encodeURIComponent(req.modelId || "kokoro")}`, { method: "POST" });
+    const r = await fetch(`${SERVER_URL}/v1/load-model?model_id=${encodeURIComponent(req.modelId || "kokoro")}`, { method: "POST", signal: AbortSignal.timeout(30000) });
+    const data = await r.json();
     sendResponse({ success: true, data });
   } catch (e) { sendResponse({ success: false, error: e.message }); }
 }
 
 async function handleVoices(sendResponse) {
-  try { const data = await fetchJson("/v1/voices"); sendResponse({ success: true, data }); }
-  catch (e) { sendResponse({ success: false, error: e.message }); }
+  try {
+    const r = await fetch(`${SERVER_URL}/v1/voices`, { signal: AbortSignal.timeout(5000) });
+    const data = await r.json();
+    sendResponse({ success: true, data });
+  } catch (e) { sendResponse({ success: false, error: e.message }); }
 }
 
 async function handleStart(sendResponse) {
   try {
-    markServerUnknown();
-    const resp = await nativeMsg("start");
-    sendResponse({ success: resp?.success ?? true, message: resp?.message });
-  } catch (e) { sendResponse({ success: false, error: `Native messaging: ${e.message}` }); }
+    // First check if server is already running
+    const existing = await fetchHealth(2000);
+    if (existing?.model_loaded) {
+      sendResponse({ success: true, message: "Already running", alreadyRunning: true });
+      return;
+    }
+
+    // Try native messaging to start the server
+    let resp;
+    try {
+      resp = await nativeMsg("start");
+    } catch (e) {
+      sendResponse({ success: false, error: `Cannot start server: ${e.message}. Make sure the native host is installed.` });
+      return;
+    }
+
+    if (resp?.success === false) {
+      sendResponse({ success: false, message: resp?.message || "Start failed" });
+      return;
+    }
+
+    // Now poll for server to be fully ready (model_warm, not just model_loaded)
+    for (let i = 0; i < 60; i++) {
+      await new Promise(r => setTimeout(r, 1000));
+      const h = await fetchHealth(3000);
+      if (h?.model_warm) {
+        sendResponse({ success: true, message: `Server ready — ${h.model}`, model: h.model, voices: h.voices });
+        return;
+      }
+      if (h?.model_loaded && i > 30) {
+        // Model loaded but not warm after 30s — probably stuck
+        sendResponse({ success: true, message: `Server ready (warming) — ${h.model}`, model: h.model, voices: h.voices });
+        return;
+      }
+    }
+    sendResponse({ success: false, error: "Server started but model didn't warm up in 60s" });
+  } catch (e) {
+    sendResponse({ success: false, error: e.message });
+  }
 }
 
 async function handleStop(sendResponse) {
   try {
-    markServerUnknown();
     const resp = await nativeMsg("stop");
     sendResponse({ success: resp?.success ?? true, message: resp?.message });
   } catch (e) { sendResponse({ success: false, error: e.message }); }
 }
 
 async function ensureServer() {
-  if (isServerKnown()) return true;
-  const h = await fetch(`${SERVER_URL}/health`, { signal: AbortSignal.timeout(3000) }).catch(() => null);
-  if (h?.ok) { const d = await h.json(); if (d.model_loaded) { markServerKnown(); return true; } }
-  markServerUnknown();
+  // Check if already running and warm
+  const h = await fetchHealth(3000);
+  if (h?.model_warm) return true;
+
+  // Try native messaging
   try {
     const resp = await nativeMsg("start");
     if (resp?.success === false) return false;
   } catch (e) { return false; }
-  // Poll
+
+  // Poll for warm
   for (let i = 0; i < 60; i++) {
-    await new Promise(r => setTimeout(r, 500));
-    try {
-      const r = await fetch(`${SERVER_URL}/health`, { signal: AbortSignal.timeout(2000) });
-      if (r.ok) { const d = await r.json(); if (d.model_loaded) { markServerKnown(); return true; } }
-    } catch (e) {}
+    await new Promise(r => setTimeout(r, 1000));
+    const h = await fetchHealth(2000);
+    if (h?.model_warm) return true;
+    if (h?.model_loaded && i > 30) return true; // accept loaded after 30s
   }
   return false;
 }
 
 async function handleTTS(req, sendResponse) {
   try {
-    if (!await ensureServer()) { sendResponse({ success: false, error: "Server not running" }); return; }
+    // Quick health check — wait for warm
+    const h = await fetchHealth(3000);
+    if (!h?.model_warm) {
+      // Try to start server
+      try { await nativeMsg("start"); } catch (e) { sendResponse({ success: false, error: "Server not running" }); return; }
+      // Wait for warm
+      for (let i = 0; i < 45; i++) {
+        await new Promise(r => setTimeout(r, 1000));
+        const h2 = await fetchHealth(2000);
+        if (h2?.model_warm) break;
+        if (i === 44) { sendResponse({ success: false, error: "Server not ready" }); return; }
+      }
+    }
+
     const body = {
       text: req.text, voice: req.voice, speed: req.speed,
       language: req.language || "Auto", format: "wav",
@@ -166,11 +221,8 @@ async function handleTTS(req, sendResponse) {
       const err = await r.json().catch(() => ({}));
       throw new Error(err?.detail || `Server error ${r.status}`);
     }
-    markServerKnown();
     const buf = await r.arrayBuffer();
     const ct = r.headers.get("content-type") || "audio/wav";
-
-    // Get speed info from headers
     const applyPlaybackRate = r.headers.get("X-TTS-Apply-Playback-Rate") === "true";
     const playbackRate = parseFloat(r.headers.get("X-TTS-Playback-Rate") || "1.0");
 
@@ -182,7 +234,6 @@ async function handleTTS(req, sendResponse) {
       playbackRate,
     });
   } catch (e) {
-    markServerUnknown();
     sendResponse({ success: false, error: e.message });
   }
 }

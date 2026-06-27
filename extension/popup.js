@@ -1,5 +1,5 @@
 /* ═══════════════════════════════════════════════════
-   Open TTS v3.0 — Popup Script
+   Open TTS v3.1 — Popup Script
    ═══════════════════════════════════════════════════ */
 
 // ─── DOM ─────────────────────────────────────────────
@@ -41,28 +41,18 @@ function msg(payload) {
 
 // ─── Status ──────────────────────────────────────────
 
-function setDot(state) {
-  statusDot.className = `dot ${state}`;
-}
+function setDot(state) { statusDot.className = `dot ${state}`; }
 
 function setServerUI(state, message) {
   statusText.textContent = message;
   if (state === "running") {
-    setDot("online");
-    startBtn.disabled = true;
-    stopBtn.disabled = false;
+    setDot("online"); startBtn.disabled = true; stopBtn.disabled = false;
   } else if (state === "stopped") {
-    setDot("offline");
-    startBtn.disabled = false;
-    stopBtn.disabled = true;
+    setDot("offline"); startBtn.disabled = false; stopBtn.disabled = true;
   } else if (state === "loading") {
-    setDot("loading");
-    startBtn.disabled = true;
-    stopBtn.disabled = true;
+    setDot("loading"); startBtn.disabled = true; stopBtn.disabled = true;
   } else {
-    setDot("offline");
-    startBtn.disabled = false;
-    stopBtn.disabled = true;
+    setDot("offline"); startBtn.disabled = false; stopBtn.disabled = true;
   }
 }
 
@@ -72,8 +62,7 @@ const vctx = vizCanvas.getContext("2d");
 
 function resizeViz() {
   const r = vizWrap.getBoundingClientRect();
-  vizCanvas.width = r.width;
-  vizCanvas.height = r.height;
+  vizCanvas.width = r.width; vizCanvas.height = r.height;
 }
 window.addEventListener("resize", resizeViz);
 resizeViz();
@@ -82,7 +71,6 @@ function drawViz(data) {
   const w = vizCanvas.width, h = vizCanvas.height;
   vctx.clearRect(0, 0, w, h);
   const bars = 32, barW = w / bars, gap = 1;
-
   for (let i = 0; i < bars; i++) {
     let val;
     if (data && data.length) {
@@ -104,35 +92,26 @@ function drawViz(data) {
 function startViz(mode = "sim") {
   stopViz();
   vizWrap.classList.add("active");
-
   if (mode === "audio" && previewAudio && audioCtx) {
     try {
       if (!analyser) {
         analyser = audioCtx.createAnalyser();
         analyser.fftSize = 128;
         const src = audioCtx.createMediaElementSource(previewAudio);
-        src.connect(analyser);
-        analyser.connect(audioCtx.destination);
+        src.connect(analyser); analyser.connect(audioCtx.destination);
       }
       const buf = new Uint8Array(analyser.frequencyBinCount);
-      const render = () => {
-        if (!vizRAF) return;
-        analyser.getByteFrequencyData(buf);
-        drawViz(buf);
-        vizRAF = requestAnimationFrame(render);
-      };
+      const render = () => { if (!vizRAF) return; analyser.getByteFrequencyData(buf); drawViz(buf); vizRAF = requestAnimationFrame(render); };
       vizRAF = requestAnimationFrame(render);
       return;
-    } catch (e) { /* fall through to sim */ }
+    } catch (e) {}
   }
-
   const renderSim = () => {
     if (!vizRAF) return;
     const sim = new Uint8Array(32);
     const t = Date.now() / 250;
     for (let i = 0; i < 32; i++) sim[i] = Math.abs(Math.sin(t + i * 0.35)) * 50 + Math.random() * 40;
-    drawViz(sim);
-    vizRAF = requestAnimationFrame(renderSim);
+    drawViz(sim); vizRAF = requestAnimationFrame(renderSim);
   };
   vizRAF = requestAnimationFrame(renderSim);
 }
@@ -154,29 +133,16 @@ async function loadHistory() {
 
 function renderHistory(items) {
   historyCountEl.textContent = items.length;
-  if (!items.length) {
-    historyList.innerHTML = '<div class="history-empty">No history yet</div>';
-    return;
-  }
+  if (!items.length) { historyList.innerHTML = '<div class="history-empty">No history yet</div>'; return; }
   historyList.innerHTML = "";
   [...items].reverse().forEach(item => {
     const el = document.createElement("div");
     el.className = "history-item";
-    el.innerHTML = `
-      <span class="history-text" title="${esc(item.text)}">${esc(truncate(item.text, 30))}</span>
-      <span class="history-time">${fmtTime(item.timestamp)}</span>
-      <button class="icon-btn" data-id="${item.id}" title="Replay">▶</button>
-      <button class="icon-btn del" data-id="${item.id}" title="Delete">✕</button>
-    `;
+    el.innerHTML = `<span class="history-text" title="${esc(item.text)}">${esc(truncate(item.text, 30))}</span><span class="history-time">${fmtTime(item.timestamp)}</span><button class="icon-btn" data-id="${item.id}" title="Replay">▶</button><button class="icon-btn del" data-id="${item.id}" title="Delete">✕</button>`;
     historyList.appendChild(el);
   });
-
-  historyList.querySelectorAll(".icon-btn:not(.del)").forEach(b => {
-    b.addEventListener("click", () => replayHistory(Number(b.dataset.id)));
-  });
-  historyList.querySelectorAll(".icon-btn.del").forEach(b => {
-    b.addEventListener("click", () => deleteHistory(Number(b.dataset.id)));
-  });
+  historyList.querySelectorAll(".icon-btn:not(.del)").forEach(b => b.addEventListener("click", () => replayHistory(Number(b.dataset.id))));
+  historyList.querySelectorAll(".icon-btn.del").forEach(b => b.addEventListener("click", () => deleteHistory(Number(b.dataset.id))));
 }
 
 async function addHistory(entry) {
@@ -198,8 +164,7 @@ async function replayHistory(id) {
   const { ttsHistory = [] } = await localGet(["ttsHistory"]);
   const item = ttsHistory.find(i => i.id === id);
   if (!item) return;
-  previewText.value = item.text;
-  updateCharCount();
+  previewText.value = item.text; updateCharCount();
   await syncSet({ previewText: item.text });
   handleSpeak();
 }
@@ -207,8 +172,6 @@ async function replayHistory(id) {
 function esc(s) { const d = document.createElement("div"); d.textContent = s; return d.innerHTML; }
 function truncate(s, n) { return s.length > n ? s.slice(0, n - 1) + "…" : s; }
 function fmtTime(ts) { const d = new Date(ts); return `${String(d.getHours()).padStart(2,"0")}:${String(d.getMinutes()).padStart(2,"0")}`; }
-
-// ─── Char counter ───────────────────────────────────
 
 function updateCharCount() {
   const len = previewText.value.length;
@@ -220,12 +183,23 @@ function updateCharCount() {
 async function checkServer() {
   try {
     const health = await msg({ type: "GET_HEALTH" });
-    if (health?.success?.data?.model_loaded) {
+    if (health?.success?.data?.model_warm) {
       setServerUI("running", `Connected — ${health.data.model}`);
+      await loadModels();
       return true;
-    } else if (health?.success?.data) {
-      setServerUI("loading", "Loading model...");
-      pollServerReady();
+    } else if (health?.success?.data?.model_loaded) {
+      setServerUI("loading", "Warming up model...");
+      // Poll until warm
+      for (let i = 0; i < 30; i++) {
+        await new Promise(r => setTimeout(r, 1000));
+        const h = await msg({ type: "GET_HEALTH" });
+        if (h?.success?.data?.model_warm) {
+          setServerUI("running", `Connected — ${h.data.model}`);
+          await loadModels();
+          return true;
+        }
+      }
+      setServerUI("stopped", "Server failed to warm up");
       return false;
     }
   } catch (e) {}
@@ -233,27 +207,18 @@ async function checkServer() {
   return false;
 }
 
-function pollServerReady() {
-  let attempts = 0;
-  const interval = setInterval(async () => {
-    if (++attempts > 20) { clearInterval(interval); setServerUI("stopped", "Server failed to start"); return; }
-    try {
-      const h = await msg({ type: "GET_HEALTH" });
-      if (h?.success?.data?.model_loaded) {
-        clearInterval(interval);
-        setServerUI("running", `Connected — ${h.data.model}`);
-        await loadModels();
-      }
-    } catch (e) {}
-  }, 1500);
-}
-
 async function handleStart() {
-  setServerUI("loading", "Starting...");
+  setServerUI("loading", "Starting server...");
   try {
     const resp = await msg({ type: "START_SERVER" });
-    if (resp?.success) pollServerReady();
-    else setServerUI("stopped", resp?.message || "Start failed");
+    if (resp?.success) {
+      setServerUI("loading", `Loading ${resp.model || "model"}...`);
+      // Server is ready — load models
+      await loadModels();
+      setServerUI("running", `Connected — ${resp.model || "kokoro"}`);
+    } else {
+      setServerUI("stopped", resp?.error || resp?.message || "Start failed");
+    }
   } catch (e) {
     setServerUI("stopped", `Error: ${e.message}`);
   }
@@ -268,9 +233,7 @@ async function handleStop() {
       modelSelect.innerHTML = '<option disabled selected>Start server first</option>';
       voiceSelect.innerHTML = '<option disabled selected>Select model first</option>';
     }
-  } catch (e) {
-    setServerUI("stopped", `Error: ${e.message}`);
-  }
+  } catch (e) { setServerUI("stopped", `Error: ${e.message}`); }
 }
 
 // ─── Models / Voices ─────────────────────────────────
@@ -287,8 +250,7 @@ async function loadModels() {
     modelSelect.innerHTML = "";
     data.models.forEach(m => {
       const opt = document.createElement("option");
-      opt.value = m.id;
-      opt.textContent = m.name;
+      opt.value = m.id; opt.textContent = m.name;
       if (m.id === preferred) opt.selected = true;
       modelSelect.appendChild(opt);
     });
@@ -302,9 +264,7 @@ async function loadModels() {
     }
     modelSelect.disabled = false;
     voiceSelect.disabled = false;
-  } catch (e) {
-    console.error("[Open TTS] Load models:", e);
-  }
+  } catch (e) { console.error("[Open TTS] Load models:", e); }
 }
 
 async function loadVoices(modelId) {
@@ -318,8 +278,7 @@ async function loadVoices(modelId) {
   if (modelData?.voices?.length) {
     modelData.voices.forEach(v => {
       const opt = document.createElement("option");
-      opt.value = v.id;
-      opt.textContent = v.name;
+      opt.value = v.id; opt.textContent = v.name;
       if (v.id === prefVoice) opt.selected = true;
       voiceSelect.appendChild(opt);
     });
@@ -352,12 +311,8 @@ async function handleModelChange() {
       updateModelMeta(modelId);
       updateLangVisibility(modelId);
       setServerUI("running", "Connected");
-    } else {
-      setServerUI("error", resp?.error || "Switch failed");
-    }
-  } catch (e) {
-    setServerUI("error", `Error: ${e.message}`);
-  }
+    } else { setServerUI("error", resp?.error || "Switch failed"); }
+  } catch (e) { setServerUI("error", `Error: ${e.message}`); }
 }
 
 // ─── Speak (popup preview) ───────────────────────────
@@ -374,7 +329,6 @@ async function stopAllTabs() {
 
 async function handleSpeak() {
   await stopAllTabs();
-
   if (previewAudio) { previewAudio.pause(); previewAudio.src = ""; previewAudio = null; }
 
   const text = previewText.value.trim();
@@ -400,9 +354,6 @@ async function handleSpeak() {
     latencyEl.textContent = `LAT: ${Math.round(performance.now() - t0)}ms`;
 
     if (resp?.success?.audioData) {
-      // Determine playback rate from server's response headers
-      // For models that support native speed (Kokoro), don't apply playbackRate
-      // For others (Qwen3, Fish), apply playbackRate = speed
       let playbackRate = 1.0;
       const modelId = settings.model || DEFAULTS.model;
       const modelInfo = cachedModels?.data?.models?.find(m => m.id === modelId);
@@ -417,8 +368,7 @@ async function handleSpeak() {
       genCountEl.textContent = `GEN: ${String(genCount).padStart(3, "0")}`;
 
       await addHistory({
-        id: Date.now(),
-        text,
+        id: Date.now(), text,
         voice: settings.voice || DEFAULTS.voice,
         model: settings.model || DEFAULTS.model,
         speed: Number(settings.speed) || DEFAULTS.speed,
@@ -429,22 +379,21 @@ async function handleSpeak() {
       previewAudio.onended = () => { speakBtn.disabled = false; stopViz(); vizText.textContent = "Ready"; };
       previewAudio.onerror = () => { speakBtn.disabled = false; stopViz(); vizText.textContent = "Error"; };
 
+      // Set up audio context for visualizer
+      if (!audioCtx) {
+        try { audioCtx = new AudioContext(); } catch (e) {}
+      }
+
       await previewAudio.play();
     } else {
-      speakBtn.disabled = false;
-      stopViz();
-      vizText.textContent = "Failed";
+      speakBtn.disabled = false; stopViz(); vizText.textContent = "Failed";
       statusText.textContent = resp?.error || "TTS failed";
     }
   } catch (e) {
-    speakBtn.disabled = false;
-    stopViz();
-    vizText.textContent = "Error";
+    speakBtn.disabled = false; stopViz(); vizText.textContent = "Error";
     statusText.textContent = `Error: ${e.message}`;
   }
 }
-
-// ─── Copy ────────────────────────────────────────────
 
 async function handleCopy() {
   try {
@@ -453,8 +402,6 @@ async function handleCopy() {
     setTimeout(() => copyBtn.classList.remove("copied"), 1200);
   } catch (e) {}
 }
-
-// ─── Settings ────────────────────────────────────────
 
 async function loadSettings() {
   const data = await syncGet(["model", "voice", "speed", "language", "previewText"]);
@@ -465,8 +412,6 @@ async function loadSettings() {
   updateCharCount();
 }
 
-// ─── Wire events ────────────────────────────────────
-
 function wireEvents() {
   speedSlider.addEventListener("input", async () => {
     speedVal.textContent = `${speedSlider.value}x`;
@@ -474,33 +419,21 @@ function wireEvents() {
   });
   voiceSelect.addEventListener("change", () => syncSet({ voice: voiceSelect.value }));
   langSelect.addEventListener("change", () => syncSet({ language: langSelect.value }));
-  previewText.addEventListener("input", async () => {
-    updateCharCount();
-    await syncSet({ previewText: previewText.value });
-  });
+  previewText.addEventListener("input", async () => { updateCharCount(); await syncSet({ previewText: previewText.value }); });
   modelSelect.addEventListener("change", handleModelChange);
   speakBtn.addEventListener("click", handleSpeak);
   copyBtn.addEventListener("click", handleCopy);
   startBtn.addEventListener("click", handleStart);
   stopBtn.addEventListener("click", handleStop);
-
-  historyToggle.addEventListener("click", () => {
-    historyPanel.classList.toggle("collapsed");
-  });
-  clearHistoryBtn.addEventListener("click", async () => {
-    await localSet({ ttsHistory: [] });
-    renderHistory([]);
-  });
+  historyToggle.addEventListener("click", () => historyPanel.classList.toggle("collapsed"));
+  clearHistoryBtn.addEventListener("click", async () => { await localSet({ ttsHistory: [] }); renderHistory([]); });
 }
-
-// ─── Init ────────────────────────────────────────────
 
 async function init() {
   await loadSettings();
   loadHistory();
   wireEvents();
-  const up = await checkServer();
-  if (up) await loadModels();
+  await checkServer();
 }
 
 init();
