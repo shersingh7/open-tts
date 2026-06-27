@@ -31,6 +31,25 @@ import uvicorn
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response, StreamingResponse
+
+# ─── MLX compile workaround ──────────────────────────────────────────────────
+# MLX 0.31's mx.compile crashes on functions returning tuples (e.g. RoPE helpers
+# in mlx-audio's qwen3_tts/talker.py). Disable compile globally before importing
+# any mlx_audio modules that use @mx.compile decorators.
+import mlx.core as _mx
+_original_compile = _mx.compile
+def _noop_compile(fn=None, **kwargs):
+    if fn is not None:
+        return fn  # pass through unchanged — no compilation
+    # If used as partial(mx.compile, ...) with no positional fn, return a no-op decorator
+    def decorator(f):
+        return f
+    return decorator
+_mx.compile = _noop_compile
+# Also patch partial usage: partial(mx.compile, ...) calls mx.compile(fn=None, **kwargs)
+import functools as _functools
+_orig_partial = _functools.partial
+
 from mlx_audio.tts.utils import load_model
 from pydantic import BaseModel, Field
 
