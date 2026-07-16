@@ -1,29 +1,34 @@
 #!/bin/bash
 # Install launch agent for auto-starting the Open TTS server on login
-
-set -e
+set -euo pipefail
 
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 PLIST_NAME="com.open-tts.server"
 PLIST_PATH="$HOME/Library/LaunchAgents/$PLIST_NAME.plist"
+PYTHON_BIN="$SCRIPT_DIR/venv/bin/python"
 
-echo "Installing Open TTS launch agent..."
-
-# Unload old plist if it exists (migration from old name)
-OLD_PLIST_NAME="com.qwen-tts.server"
-OLD_PLIST_PATH="$HOME/Library/LaunchAgents/$OLD_PLIST_NAME.plist"
-if [ -f "$OLD_PLIST_PATH" ]; then
-    launchctl unload "$OLD_PLIST_PATH" 2>/dev/null || true
-    rm "$OLD_PLIST_PATH"
-    echo "✓ Removed old launch agent (com.qwen-tts.server)"
+if [[ ! -f "$PYTHON_BIN" ]]; then
+  echo "Error: venv python not found at $PYTHON_BIN — run ./setup.sh"
+  exit 1
 fi
 
-# Unload current if exists
-if [ -f "$PLIST_PATH" ]; then
-    launchctl unload "$PLIST_PATH" 2>/dev/null || true
+if [[ ! -f "$SCRIPT_DIR/server.py" ]]; then
+  echo "Error: server.py missing"
+  exit 1
 fi
 
-# Create the plist file
+UID_NUM="$(id -u)"
+mkdir -p "$(dirname "$PLIST_PATH")"
+OLD_PLIST="$HOME/Library/LaunchAgents/com.qwen-tts.server.plist"
+if [[ -f "$OLD_PLIST" ]]; then
+  launchctl bootout "gui/$UID_NUM" "$OLD_PLIST" 2>/dev/null || true
+  rm -f "$OLD_PLIST"
+fi
+
+if [[ -f "$PLIST_PATH" ]]; then
+  launchctl bootout "gui/$UID_NUM" "$PLIST_PATH" 2>/dev/null || true
+fi
+
 cat > "$PLIST_PATH" << EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -33,8 +38,8 @@ cat > "$PLIST_PATH" << EOF
     <string>$PLIST_NAME</string>
     <key>ProgramArguments</key>
     <array>
-        <string>$SCRIPT_DIR/venv/bin/python</string>
-        <string>server.py</string>
+        <string>$PYTHON_BIN</string>
+        <string>$SCRIPT_DIR/server.py</string>
     </array>
     <key>WorkingDirectory</key>
     <string>$SCRIPT_DIR</string>
@@ -50,14 +55,10 @@ cat > "$PLIST_PATH" << EOF
 </plist>
 EOF
 
-echo "✓ Created $PLIST_PATH"
+plutil -lint "$PLIST_PATH" >/dev/null
+launchctl bootstrap "gui/$UID_NUM" "$PLIST_PATH"
+launchctl kickstart -k "gui/$UID_NUM/$PLIST_NAME"
+launchctl print "gui/$UID_NUM/$PLIST_NAME" >/dev/null
 
-# Load the launch agent
-launchctl load "$PLIST_PATH" 2>/dev/null || true
-
-echo "✓ Launch agent loaded"
-echo ""
-echo "The Open TTS server will start on login (but won't auto-restart if it crashes)."
-echo "To start it now: launchctl start $PLIST_NAME"
-echo "To stop it: launchctl stop $PLIST_NAME"
-echo "To uninstall: ./uninstall_launch_agent.sh"
+echo "✓ Launch agent installed and started: $PLIST_PATH"
+echo "Stop: launchctl bootout gui/$UID_NUM $PLIST_PATH"

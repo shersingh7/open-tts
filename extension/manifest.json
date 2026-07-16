@@ -1,12 +1,12 @@
 {
   "manifest_version": 3,
   "name": "Open TTS",
-  "version": "3.1.0",
+  "version": "3.2.0",
   "description": "Local multi-model text-to-speech using MLX on Apple Silicon. Kokoro, Qwen3-TTS, and Fish Audio S2 Pro.",
-  "permissions": ["activeTab", "scripting", "storage", "nativeMessaging", "offscreen"],
+  "permissions": ["storage", "nativeMessaging", "offscreen"],
   "host_permissions": ["http://127.0.0.1:8000/*"],
   "content_security_policy": {
-    "extension_pages": "script-src 'self'; object-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self' http://127.0.0.1:8000;"
+    "extension_pages": "script-src 'self'; object-src 'self'; style-src 'self'; connect-src 'self' http://127.0.0.1:8000;"
   },
   "background": { "service_worker": "background.js" },
   "action": {
@@ -16,11 +16,7 @@
   "icons": { "16": "icon16.png", "32": "icon32.png", "48": "icon48.png", "128": "icon128.png" },
   "content_scripts": [{
     "matches": ["<all_urls>"],
-    "js": ["content.js"],
+    "js": ["shared/constants-umd.js", "content.js"],
     "css": ["content.css"]
-  }],
-  "web_accessible_resources": [{
-    "resources": ["icon.png"],
-    "matches": ["<all_urls>"]
   }]
 }

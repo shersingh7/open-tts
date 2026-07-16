@@ -6,7 +6,7 @@ import os
 from pathlib import Path
 
 # Add graphify's pipx venv to path if needed
-PIP_PYTHON = "/Users/shersingh/.local/pipx/venvs/graphifyy/bin/python"
+PIP_PYTHON = os.environ.get("GRAPHIFY_PYTHON", "python3")
 OUTPUT_DIR = None  # Will be set from args
 
 def main():

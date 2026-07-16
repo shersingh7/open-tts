@@ -1,0 +1,87 @@
+{
+  "base_url": "http://127.0.0.1:8000",
+  "models": {
+    "qwen3-tts": {
+      "load": {
+        "ok": true,
+        "response": {
+          "success": true,
+          "model": "qwen3-tts",
+          "state": "ready",
+          "voices": [
+            "serena",
+            "vivian",
+            "uncle_fu",
+            "ryan",
+            "aiden",
+            "ono_anna",
+            "sohee",
+            "eric",
+            "dylan"
+          ]
+        }
+      },
+      "speeds": {
+        "0.5": {
+          "ok": true,
+          "status": 200,
+          "bytes": 314924,
+          "sample_rate": 24000,
+          "channels": 1,
+          "duration_seconds": 6.56,
+          "wall_seconds": 2.9891,
+          "content_type": null,
+          "apply_playback_rate": null,
+          "playback_rate": null
+        },
+        "1.5": {
+          "ok": true,
+          "status": 200,
+          "bytes": 318764,
+          "sample_rate": 24000,
+          "channels": 1,
+          "duration_seconds": 6.64,
+          "wall_seconds": 4.0785,
+          "content_type": null,
+          "apply_playback_rate": null,
+          "playback_rate": null
+        },
+        "3.0": {
+          "ok": true,
+          "status": 200,
+          "bytes": 384044,
+          "sample_rate": 24000,
+          "channels": 1,
+          "duration_seconds": 8.0,
+          "wall_seconds": 3.7388,
+          "content_type": null,
+          "apply_playback_rate": null,
+          "playback_rate": null
+        }
+      },
+      "streaming": {
+        "0.5": {
+          "ok": true,
+          "frames": 9,
+          "audio_bytes": 376716,
+          "terminal": true
+        },
+        "1.5": {
+          "ok": true,
+          "frames": 7,
+          "audio_bytes": 311348,
+          "terminal": true
+        },
+        "3.0": {
+          "ok": true,
+          "frames": 6,
+          "audio_bytes": 261384,
+          "terminal": true
+        }
+      },
+      "long_text": null
+    }
+  },
+  "started_at": 1784070606.332064,
+  "finished_at": 1784070811.850042
+}

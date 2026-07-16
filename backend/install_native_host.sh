@@ -1,77 +1,86 @@
 #!/bin/bash
 # Install the native messaging host for Chrome/Chromium
+set -euo pipefail
 
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 NATIVE_HOST_NAME="com.open_tts.native_host"
 NATIVE_HOST_SCRIPT="$SCRIPT_DIR/native_host.py"
 MANIFEST_TEMPLATE="$SCRIPT_DIR/com.open_tts.native_host.json"
+EXTENSION_ID=""
 
-echo "=== Open TTS Native Host Installer ==="
-echo ""
-
-# Get extension ID from user
-echo "Enter your Chrome extension ID (from chrome://extensions/):"
-echo "(Enable 'Developer mode' to see the ID)"
-read -r EXTENSION_ID
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --extension-id)
+      EXTENSION_ID="${2:-}"
+      shift 2
+      ;;
+    -h|--help)
+      echo "Usage: $0 --extension-id <chrome_extension_id>"
+      exit 0
+      ;;
+    *)
+      echo "Unknown option: $1"
+      exit 1
+      ;;
+  esac
+done
 
 if [ -z "$EXTENSION_ID" ]; then
-    echo "Error: Extension ID is required"
-    exit 1
+  echo "Enter your Chrome extension ID (chrome://extensions, Developer mode):"
+  read -r EXTENSION_ID
 fi
 
-# Determine Chrome native messaging host directory
+if [ -z "$EXTENSION_ID" ]; then
+  echo "Error: Extension ID is required"
+  exit 1
+fi
+
+if [[ ! "$EXTENSION_ID" =~ ^[a-p]{32}$ ]]; then
+  echo "Error: invalid Chrome extension ID: $EXTENSION_ID" >&2
+  exit 1
+fi
+
+if [[ ! -x "$SCRIPT_DIR/venv/bin/python" ]] && [[ ! -f "$SCRIPT_DIR/venv/bin/python" ]]; then
+  echo "Error: backend venv missing. Run ./setup.sh first."
+  exit 1
+fi
+
 if [[ "$OSTYPE" == "darwin"* ]]; then
-    # macOS
-    HOST_DIR="$HOME/Library/Application Support/Google/Chrome/NativeMessagingHosts"
-    CHROMIUM_HOST_DIR="$HOME/Library/Application Support/Chromium/NativeMessagingHosts"
+  HOST_DIR="$HOME/Library/Application Support/Google/Chrome/NativeMessagingHosts"
+  CHROME_TESTING_HOST_DIR="$HOME/Library/Application Support/Google/ChromeForTesting/NativeMessagingHosts"
+  CHROMIUM_HOST_DIR="$HOME/Library/Application Support/Chromium/NativeMessagingHosts"
 elif [[ "$OSTYPE" == "linux"* ]]; then
-    # Linux
-    HOST_DIR="$HOME/.config/google-chrome/NativeMessagingHosts"
-    CHROMIUM_HOST_DIR="$HOME/.config/chromium/NativeMessagingHosts"
+  HOST_DIR="$HOME/.config/google-chrome/NativeMessagingHosts"
+  CHROME_TESTING_HOST_DIR="$HOME/.config/google-chrome-for-testing/NativeMessagingHosts"
+  CHROMIUM_HOST_DIR="$HOME/.config/chromium/NativeMessagingHosts"
 else
-    echo "Error: Unsupported OS: $OSTYPE"
-    exit 1
+  echo "Error: Unsupported OS: $OSTYPE"
+  exit 1
 fi
 
-# Create directories if they don't exist
 mkdir -p "$HOST_DIR"
-
-# Create the manifest with proper paths
-MANIFEST_CONTENT=$(cat "$MANIFEST_TEMPLATE" | \
-    sed "s|__PATH__|$NATIVE_HOST_SCRIPT|g" | \
-    sed "s|__EXTENSION_ID__|$EXTENSION_ID|g")
-
+MANIFEST_CONTENT=$(sed "s|__PATH__|$NATIVE_HOST_SCRIPT|g; s|__EXTENSION_ID__|$EXTENSION_ID|g" "$MANIFEST_TEMPLATE")
 MANIFEST_DEST="$HOST_DIR/$NATIVE_HOST_NAME.json"
-echo "$MANIFEST_CONTENT" > "$MANIFEST_DEST"
-
-# Remove old native host if present
-OLD_HOST="$HOST_DIR/com.qwen_tts_mlx.native_host.json"
-if [ -f "$OLD_HOST" ]; then
-    rm "$OLD_HOST"
-    echo "✓ Removed old Qwen3-TTS native host manifest"
-fi
-
-echo ""
-echo "✓ Native messaging host manifest created at:"
-echo "  $MANIFEST_DEST"
-echo ""
-
-# Make native host script executable
+printf '%s\n' "$MANIFEST_CONTENT" > "$MANIFEST_DEST"
 chmod +x "$NATIVE_HOST_SCRIPT"
 
-# Also install for Chromium if directory exists
-if [ -d "$(dirname "$CHROMIUM_HOST_DIR")" ]; then
-    mkdir -p "$CHROMIUM_HOST_DIR"
-    echo "$MANIFEST_CONTENT" > "$CHROMIUM_HOST_DIR/$NATIVE_HOST_NAME.json"
-    echo "✓ Also installed for Chromium"
+OLD_HOST="$HOST_DIR/com.qwen_tts_mlx.native_host.json"
+if [ -f "$OLD_HOST" ]; then
+  rm "$OLD_HOST"
+  echo "✓ Removed legacy native host manifest"
 fi
 
-echo ""
-echo "=== Installation Complete ==="
-echo ""
-echo "Next steps:"
-echo "1. Reload your extension in chrome://extensions/"
-echo "2. Click the extension icon to open the popup"
-echo "3. Use the Start/Stop Server buttons"
-echo ""
-echo "To uninstall, run: ./uninstall_native_host.sh"
+if [ -d "$(dirname "$CHROMIUM_HOST_DIR")" ]; then
+  mkdir -p "$CHROMIUM_HOST_DIR"
+  printf '%s\n' "$MANIFEST_CONTENT" > "$CHROMIUM_HOST_DIR/$NATIVE_HOST_NAME.json"
+  echo "✓ Also installed for Chromium"
+fi
+
+if [ -d "$(dirname "$CHROME_TESTING_HOST_DIR")" ]; then
+  mkdir -p "$CHROME_TESTING_HOST_DIR"
+  printf '%s\n' "$MANIFEST_CONTENT" > "$CHROME_TESTING_HOST_DIR/$NATIVE_HOST_NAME.json"
+  echo "✓ Also installed for Chrome for Testing"
+fi
+
+echo "✓ Native messaging host installed: $MANIFEST_DEST"
+echo "Reload the extension in chrome://extensions/"

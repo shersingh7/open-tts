@@ -1,0 +1,96 @@
+{
+  "base_url": "http://127.0.0.1:8000",
+  "models": {
+    "kokoro": {
+      "load": {
+        "ok": true,
+        "response": {
+          "success": true,
+          "model": "kokoro",
+          "state": "ready",
+          "voices": [
+            "af_bella",
+            "af_sarah",
+            "af_nova",
+            "af_heart",
+            "af_jessica",
+            "af_alloy",
+            "af_sky",
+            "af_river",
+            "af_aoede",
+            "af_kore",
+            "am_adam",
+            "am_echo",
+            "am_eric",
+            "am_fenrir",
+            "am_liam",
+            "am_michael",
+            "am_onyx",
+            "am_puck",
+            "am_santa"
+          ]
+        }
+      },
+      "speeds": {
+        "0.5": {
+          "ok": false,
+          "error": "<HTTPError 500: 'Internal Server Error'>"
+        },
+        "1.0": {
+          "ok": false,
+          "error": "<HTTPError 500: 'Internal Server Error'>"
+        },
+        "1.5": {
+          "ok": true,
+          "status": 200,
+          "bytes": 193244,
+          "sample_rate": 24000,
+          "channels": 1,
+          "duration_seconds": 4.025,
+          "wall_seconds": 0.5055,
+          "content_type": null,
+          "apply_playback_rate": null,
+          "playback_rate": null
+        },
+        "2.0": {
+          "ok": true,
+          "status": 200,
+          "bytes": 160844,
+          "sample_rate": 24000,
+          "channels": 1,
+          "duration_seconds": 3.35,
+          "wall_seconds": 0.2244,
+          "content_type": null,
+          "apply_playback_rate": null,
+          "playback_rate": null
+        },
+        "3.0": {
+          "ok": true,
+          "status": 200,
+          "bytes": 123644,
+          "sample_rate": 24000,
+          "channels": 1,
+          "duration_seconds": 2.575,
+          "wall_seconds": 0.1749,
+          "content_type": null,
+          "apply_playback_rate": null,
+          "playback_rate": null
+        }
+      },
+      "long_text": {
+        "ok": true,
+        "status": 200,
+        "bytes": 4156844,
+        "sample_rate": 24000,
+        "channels": 1,
+        "duration_seconds": 86.6,
+        "wall_seconds": 5.5807,
+        "content_type": null,
+        "apply_playback_rate": null,
+        "playback_rate": null
+      }
+    }
+  },
+  "started_at": 1784067408.731719,
+  "finished_at": 1784067419.398901
+}

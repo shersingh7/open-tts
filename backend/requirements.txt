@@ -1,8 +1,9 @@
-fastapi
-uvicorn
-python-multipart
-soundfile
-numpy
-mlx-audio>=0.4.2
-kokoro-mlx
-huggingface_hub
+fastapi==0.135.3
+uvicorn==0.44.0
+python-multipart==0.0.26
+soundfile==0.13.1
+numpy==2.4.4
+mlx-audio==0.4.5
+kokoro-mlx==0.1.2
+huggingface_hub==1.10.2
+setuptools==81.0.0

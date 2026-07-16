@@ -1,199 +1,240 @@
-/* ═══════════════════════════════════════════════════
-   Open TTS v3.1 — Popup Script
-   ═══════════════════════════════════════════════════ */
+/* Open TTS v3.2 — Popup */
 
-// ─── DOM ─────────────────────────────────────────────
 const $ = (id) => document.getElementById(id);
-const modelSelect = $("model"), voiceSelect = $("voice"), langSelect = $("language");
-const speedSlider = $("speed"), speedVal = $("speedValue");
-const previewText = $("previewText"), charCount = $("charCount");
-const speakBtn = $("speakBtn"), copyBtn = $("copyBtn");
-const startBtn = $("startBtn"), stopBtn = $("stopBtn");
-const statusDot = $("statusDot"), statusText = $("statusText");
+const modelSelect = $("model");
+const voiceSelect = $("voice");
+const langSelect = $("language");
+const instructField = $("instruct");
+const instructWrap = $("instructWrap");
+const fishStyleWrap = $("fishStyleWrap");
+const fishStyleSelect = $("fishStyle");
+const speedSlider = $("speed");
+const speedVal = $("speedValue");
+const previewText = $("previewText");
+const charCount = $("charCount");
+const speakBtn = $("speakBtn");
+const pauseBtn = $("pauseBtn");
+const stopBtnPlayback = $("stopPlaybackBtn");
+const copyBtn = $("copyBtn");
+const startBtn = $("startBtn");
+const stopBtn = $("stopBtn");
+const statusDot = $("statusDot");
+const statusText = $("statusText");
 const modelMeta = $("modelMeta");
-const vizWrap = $("vizWrap"), vizCanvas = $("visualizer"), vizText = $("vizText");
-const historyToggle = $("historyToggle"), historyPanel = $("historyPanel");
-const historyList = $("historyList"), historyCountEl = $("historyCount");
+const progressEl = $("progress");
+const historyToggle = $("historyToggle");
+const historyPanel = $("historyPanel");
+const historyList = $("historyList");
+const historyCountEl = $("historyCount");
 const clearHistoryBtn = $("clearHistory");
-const genCountEl = $("genCount"), latencyEl = $("latency");
+const historyEnabledEl = $("historyEnabled");
+const genCountEl = $("genCount");
+const latencyEl = $("latency");
+const errorBanner = $("errorBanner");
+const errorText = $("errorText");
+const copyDiagnosticsBtn = $("copyDiagnostics");
+const versionEl = $("version");
 
-const DEFAULTS = { model: "kokoro", voice: "af_bella", speed: 1.5, language: "Auto", previewText: "Hello! Open TTS is ready." };
+const { DEFAULTS, MAX_HISTORY } = OpenTTSConstants;
+const { unwrap, makeClientId, makeRunId } = OpenTTSProtocol;
+const { syncGet, syncSet, localGet, localSet, debouncedSyncSet, debouncedLocalSet } = OpenTTSStorage;
 
-let previewAudio = null;
-let audioCtx = null, analyser = null, vizRAF = null;
+let clientId = makeClientId();
+let activeRun = null;
+let playbackState = "idle";
 let genCount = 0;
 let cachedModels = null;
-
-// ─── Storage helpers ─────────────────────────────────
-const syncGet = (keys) => new Promise(r => chrome.storage.sync.get(keys, r));
-const syncSet = (obj) => new Promise(r => chrome.storage.sync.set(obj, r));
-const localGet = (keys) => new Promise(r => chrome.storage.local.get(keys, r));
-const localSet = (obj) => new Promise(r => chrome.storage.local.set(obj, r));
+let voicePrefs = {};
+let historyEnabled = true;
+let pendingHistory = null;
 
 function msg(payload) {
   return new Promise((resolve, reject) => {
     chrome.runtime.sendMessage(payload, (resp) => {
-      if (chrome.runtime.lastError) { reject(new Error(chrome.runtime.lastError.message)); return; }
+      if (chrome.runtime.lastError) {
+        reject(new Error(chrome.runtime.lastError.message));
+        return;
+      }
       resolve(resp);
     });
   });
 }
 
-// ─── Status ──────────────────────────────────────────
+function setDot(state) {
+  statusDot.className = `dot ${state}`;
+  statusDot.setAttribute("aria-label", `Server ${state}`);
+}
 
-function setDot(state) { statusDot.className = `dot ${state}`; }
+function showError(message, diagnostics) {
+  errorText.textContent = message;
+  errorBanner.hidden = false;
+  errorBanner.dataset.diagnostics = diagnostics || message;
+}
+
+function hideError() {
+  errorBanner.hidden = true;
+}
 
 function setServerUI(state, message) {
   statusText.textContent = message;
   if (state === "running") {
-    setDot("online"); startBtn.disabled = true; stopBtn.disabled = false;
+    setDot("online");
+    startBtn.disabled = true;
+    stopBtn.disabled = false;
   } else if (state === "stopped") {
-    setDot("offline"); startBtn.disabled = false; stopBtn.disabled = true;
+    setDot("offline");
+    startBtn.disabled = false;
+    stopBtn.disabled = true;
   } else if (state === "loading") {
-    setDot("loading"); startBtn.disabled = true; stopBtn.disabled = true;
+    setDot("loading");
+    startBtn.disabled = true;
+    stopBtn.disabled = true;
   } else {
-    setDot("offline"); startBtn.disabled = false; stopBtn.disabled = true;
+    setDot("offline");
+    startBtn.disabled = false;
+    stopBtn.disabled = true;
   }
 }
 
-// ─── Visualizer ──────────────────────────────────────
-
-const vctx = vizCanvas.getContext("2d");
-
-function resizeViz() {
-  const r = vizWrap.getBoundingClientRect();
-  vizCanvas.width = r.width; vizCanvas.height = r.height;
-}
-window.addEventListener("resize", resizeViz);
-resizeViz();
-
-function drawViz(data) {
-  const w = vizCanvas.width, h = vizCanvas.height;
-  vctx.clearRect(0, 0, w, h);
-  const bars = 32, barW = w / bars, gap = 1;
-  for (let i = 0; i < bars; i++) {
-    let val;
-    if (data && data.length) {
-      const idx = Math.floor((i / bars) * data.length);
-      val = data[idx] / 255;
-    } else {
-      val = (Math.sin(Date.now() / 200 + i * 0.3) + 1) * 0.08;
-    }
-    const barH = Math.max(2, val * h * 0.85);
-    const x = i * barW, y = (h - barH) / 2;
-    const grad = vctx.createLinearGradient(0, y, 0, y + barH);
-    grad.addColorStop(0, "#6c5ce7");
-    grad.addColorStop(1, "rgba(108,92,231,0.1)");
-    vctx.fillStyle = grad;
-    vctx.fillRect(x + gap/2, y, barW - gap, barH);
-  }
+function setPlaybackUI(state, label) {
+  playbackState = state;
+  progressEl.textContent = label || "";
+  speakBtn.disabled = state === "generating";
+  pauseBtn.disabled = !["playing", "paused"].includes(state);
+  stopBtnPlayback.disabled = state === "idle";
+  pauseBtn.textContent = state === "paused" ? "Resume" : "Pause";
 }
 
-function startViz(mode = "sim") {
-  stopViz();
-  vizWrap.classList.add("active");
-  if (mode === "audio" && previewAudio && audioCtx) {
-    try {
-      if (!analyser) {
-        analyser = audioCtx.createAnalyser();
-        analyser.fftSize = 128;
-        const src = audioCtx.createMediaElementSource(previewAudio);
-        src.connect(analyser); analyser.connect(audioCtx.destination);
-      }
-      const buf = new Uint8Array(analyser.frequencyBinCount);
-      const render = () => { if (!vizRAF) return; analyser.getByteFrequencyData(buf); drawViz(buf); vizRAF = requestAnimationFrame(render); };
-      vizRAF = requestAnimationFrame(render);
-      return;
-    } catch (e) {}
-  }
-  const renderSim = () => {
-    if (!vizRAF) return;
-    const sim = new Uint8Array(32);
-    const t = Date.now() / 250;
-    for (let i = 0; i < 32; i++) sim[i] = Math.abs(Math.sin(t + i * 0.35)) * 50 + Math.random() * 40;
-    drawViz(sim); vizRAF = requestAnimationFrame(renderSim);
-  };
-  vizRAF = requestAnimationFrame(renderSim);
+function esc(s) {
+  const d = document.createElement("div");
+  d.textContent = s;
+  return d.innerHTML;
 }
 
-function stopViz() {
-  if (vizRAF) { cancelAnimationFrame(vizRAF); vizRAF = null; }
-  vctx && vctx.clearRect(0, 0, vizCanvas.width, vizCanvas.height);
-  vizWrap.classList.remove("active");
+function truncate(s, n) {
+  return s.length > n ? `${s.slice(0, n - 1)}…` : s;
 }
 
-// ─── History ─────────────────────────────────────────
-
-const MAX_HISTORY = 20;
-
-async function loadHistory() {
-  const { ttsHistory = [] } = await localGet(["ttsHistory"]);
-  renderHistory(ttsHistory);
+function fmtTime(ts) {
+  const d = new Date(ts);
+  return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
 }
-
-function renderHistory(items) {
-  historyCountEl.textContent = items.length;
-  if (!items.length) { historyList.innerHTML = '<div class="history-empty">No history yet</div>'; return; }
-  historyList.innerHTML = "";
-  [...items].reverse().forEach(item => {
-    const el = document.createElement("div");
-    el.className = "history-item";
-    el.innerHTML = `<span class="history-text" title="${esc(item.text)}">${esc(truncate(item.text, 30))}</span><span class="history-time">${fmtTime(item.timestamp)}</span><button class="icon-btn" data-id="${item.id}" title="Replay">▶</button><button class="icon-btn del" data-id="${item.id}" title="Delete">✕</button>`;
-    historyList.appendChild(el);
-  });
-  historyList.querySelectorAll(".icon-btn:not(.del)").forEach(b => b.addEventListener("click", () => replayHistory(Number(b.dataset.id))));
-  historyList.querySelectorAll(".icon-btn.del").forEach(b => b.addEventListener("click", () => deleteHistory(Number(b.dataset.id))));
-}
-
-async function addHistory(entry) {
-  const { ttsHistory = [] } = await localGet(["ttsHistory"]);
-  ttsHistory.push(entry);
-  if (ttsHistory.length > MAX_HISTORY) ttsHistory.shift();
-  await localSet({ ttsHistory });
-  renderHistory(ttsHistory);
-}
-
-async function deleteHistory(id) {
-  const { ttsHistory = [] } = await localGet(["ttsHistory"]);
-  const filtered = ttsHistory.filter(i => i.id !== id);
-  await localSet({ ttsHistory: filtered });
-  renderHistory(filtered);
-}
-
-async function replayHistory(id) {
-  const { ttsHistory = [] } = await localGet(["ttsHistory"]);
-  const item = ttsHistory.find(i => i.id === id);
-  if (!item) return;
-  previewText.value = item.text; updateCharCount();
-  await syncSet({ previewText: item.text });
-  handleSpeak();
-}
-
-function esc(s) { const d = document.createElement("div"); d.textContent = s; return d.innerHTML; }
-function truncate(s, n) { return s.length > n ? s.slice(0, n - 1) + "…" : s; }
-function fmtTime(ts) { const d = new Date(ts); return `${String(d.getHours()).padStart(2,"0")}:${String(d.getMinutes()).padStart(2,"0")}`; }
 
 function updateCharCount() {
   const len = previewText.value.length;
   charCount.textContent = `${len} char${len !== 1 ? "s" : ""}`;
 }
 
-// ─── Server management ───────────────────────────────
+async function loadHistory() {
+  const data = await localGet(["ttsHistory", "historyEnabled"]);
+  const ttsHistory = data.ttsHistory || [];
+  historyEnabled = data.historyEnabled !== false;
+  historyEnabledEl.checked = historyEnabled;
+  renderHistory(ttsHistory);
+}
+
+function renderHistory(items) {
+  historyCountEl.textContent = String(items.length);
+  historyList.replaceChildren();
+  if (!items.length) {
+    const empty = document.createElement("div");
+    empty.className = "history-empty";
+    empty.textContent = "No history yet — stored locally on this device";
+    historyList.appendChild(empty);
+    return;
+  }
+  [...items].reverse().forEach((item) => {
+    const el = document.createElement("div");
+    el.className = "history-item";
+    el.setAttribute("role", "listitem");
+
+    const textSpan = document.createElement("span");
+    textSpan.className = "history-text";
+    textSpan.title = item.text;
+    textSpan.textContent = truncate(item.text, 30);
+
+    const timeSpan = document.createElement("span");
+    timeSpan.className = "history-time";
+    timeSpan.textContent = fmtTime(item.timestamp);
+
+    const replayBtn = document.createElement("button");
+    replayBtn.className = "icon-btn";
+    replayBtn.type = "button";
+    replayBtn.title = "Replay";
+    replayBtn.setAttribute("aria-label", "Replay history item");
+    replayBtn.dataset.id = item.id;
+    replayBtn.textContent = "▶";
+
+    const delBtn = document.createElement("button");
+    delBtn.className = "icon-btn del";
+    delBtn.type = "button";
+    delBtn.title = "Delete";
+    delBtn.setAttribute("aria-label", "Delete history item");
+    delBtn.dataset.id = item.id;
+    delBtn.textContent = "✕";
+
+    el.append(textSpan, timeSpan, replayBtn, delBtn);
+    historyList.appendChild(el);
+  });
+
+  historyList.querySelectorAll(".icon-btn:not(.del)").forEach((b) => {
+    b.addEventListener("click", () => replayHistory(b.dataset.id));
+  });
+  historyList.querySelectorAll(".icon-btn.del").forEach((b) => {
+    b.addEventListener("click", () => deleteHistory(b.dataset.id));
+  });
+}
+
+async function addHistory(entry) {
+  if (!historyEnabled) return;
+  const { ttsHistory = [] } = await localGet(["ttsHistory"]);
+  ttsHistory.push(entry);
+  while (ttsHistory.length > MAX_HISTORY) ttsHistory.shift();
+  await localSet({ ttsHistory });
+  renderHistory(ttsHistory);
+}
+
+async function deleteHistory(id) {
+  const { ttsHistory = [] } = await localGet(["ttsHistory"]);
+  const filtered = ttsHistory.filter((i) => i.id !== id);
+  await localSet({ ttsHistory: filtered });
+  renderHistory(filtered);
+}
+
+async function replayHistory(id) {
+  const { ttsHistory = [] } = await localGet(["ttsHistory"]);
+  const item = ttsHistory.find((i) => i.id === id);
+  if (!item) return;
+  previewText.value = item.text;
+  updateCharCount();
+  await localSet({ previewText: item.text });
+  handleSpeak();
+}
 
 async function checkServer() {
   try {
-    const health = await msg({ type: "GET_HEALTH" });
-    if (health?.success?.data?.model_warm) {
-      setServerUI("running", `Connected — ${health.data.model}`);
+    const health = unwrap(await msg({ type: "GET_HEALTH" }));
+    if (!health.ok) {
+      setServerUI("stopped", "Server offline");
+      return false;
+    }
+    const data = health.data;
+    if (data.model_warm) {
+      setServerUI("running", `Connected — ${data.model}`);
       await loadModels();
       return true;
-    } else if (health?.success?.data?.model_loaded) {
+    }
+    if (data.status === "ok" && !data.model_loaded) {
+      setServerUI("running", "Connected — pick a model");
+      await loadModels();
+      return true;
+    }
+    if (data.model_loaded) {
       setServerUI("loading", "Warming up model...");
-      // Poll until warm
       for (let i = 0; i < 30; i++) {
-        await new Promise(r => setTimeout(r, 1000));
-        const h = await msg({ type: "GET_HEALTH" });
-        if (h?.success?.data?.model_warm) {
+        await new Promise((r) => setTimeout(r, 1000));
+        const h = unwrap(await msg({ type: "GET_HEALTH" }));
+        if (h.ok && h.data.model_warm) {
           setServerUI("running", `Connected — ${h.data.model}`);
           await loadModels();
           return true;
@@ -202,197 +243,252 @@ async function checkServer() {
       setServerUI("stopped", "Server failed to warm up");
       return false;
     }
-  } catch (e) {}
+  } catch (e) {
+    showError(`Health check failed: ${e.message}`);
+  }
   setServerUI("stopped", "Server offline");
   return false;
 }
 
 async function handleStart() {
+  hideError();
   setServerUI("loading", "Starting server...");
   try {
-    const resp = await msg({ type: "START_SERVER" });
-    if (resp?.success) {
-      setServerUI("loading", `Loading ${resp.model || "model"}...`);
-      // Server is ready — load models
+    const resp = unwrap(await msg({ type: "START_SERVER" }));
+    if (resp.ok) {
       await loadModels();
-      setServerUI("running", `Connected — ${resp.model || "kokoro"}`);
+      const d = resp.data;
+      setServerUI("running", d.lazy ? "Connected — pick a model" : `Connected — ${d.model || "ready"}`);
     } else {
-      setServerUI("stopped", resp?.error || resp?.message || "Start failed");
+      setServerUI("stopped", resp.error || "Start failed");
+      showError(resp.error || "Start failed", resp.raw);
     }
   } catch (e) {
     setServerUI("stopped", `Error: ${e.message}`);
+    showError(e.message);
   }
 }
 
 async function handleStop() {
   setServerUI("loading", "Stopping...");
   try {
-    const resp = await msg({ type: "STOP_SERVER" });
-    if (resp?.success) {
+    const resp = unwrap(await msg({ type: "STOP_SERVER" }));
+    if (resp.ok) {
       setServerUI("stopped", "Server offline");
-      modelSelect.innerHTML = '<option disabled selected>Start server first</option>';
-      voiceSelect.innerHTML = '<option disabled selected>Select model first</option>';
+      modelSelect.replaceChildren();
+      const opt = document.createElement("option");
+      opt.disabled = true;
+      opt.selected = true;
+      opt.textContent = "Start server first";
+      modelSelect.appendChild(opt);
+      voiceSelect.replaceChildren();
+      const vopt = document.createElement("option");
+      vopt.disabled = true;
+      vopt.selected = true;
+      vopt.textContent = "Select model first";
+      voiceSelect.appendChild(vopt);
     }
-  } catch (e) { setServerUI("stopped", `Error: ${e.message}`); }
+  } catch (e) {
+    setServerUI("stopped", `Error: ${e.message}`);
+  }
 }
 
-// ─── Models / Voices ─────────────────────────────────
+function getPreferredVoice(modelId) {
+  return voicePrefs[modelId] || cachedModels?.data?.models?.find((m) => m.id === modelId)?.default_voice || DEFAULTS.voice;
+}
 
 async function loadModels() {
   try {
-    const resp = await msg({ type: "GET_MODELS" });
-    if (!resp?.success) return;
+    const resp = unwrap(await msg({ type: "GET_MODELS" }));
+    if (!resp.ok) return;
     cachedModels = resp;
     const data = resp.data;
-    const saved = await syncGet(["model"]);
+    const saved = await syncGet(["model", "voicePrefs"]);
+    voicePrefs = saved.voicePrefs || {};
     const preferred = saved.model || DEFAULTS.model;
 
-    modelSelect.innerHTML = "";
-    data.models.forEach(m => {
+    modelSelect.replaceChildren();
+    data.models.forEach((m) => {
       const opt = document.createElement("option");
-      opt.value = m.id; opt.textContent = m.name;
+      opt.value = m.id;
+      opt.textContent = m.name;
       if (m.id === preferred) opt.selected = true;
       modelSelect.appendChild(opt);
     });
 
-    const active = data.models.find(m => m.active) || data.models.find(m => m.id === preferred);
+    let active = data.models.find((m) => m.active) || data.models.find((m) => m.id === preferred);
     if (active) {
       modelSelect.value = active.id;
+      if (!active.loaded && active.id === preferred) {
+        setServerUI("loading", `Loading ${active.name}...`);
+        const loadResult = unwrap(await msg({ type: "LOAD_MODEL", modelId: active.id }));
+        if (!loadResult.ok) throw new Error(loadResult.error || "Model load failed");
+        const refreshed = unwrap(await msg({ type: "GET_MODELS" }));
+        if (refreshed.ok) {
+          cachedModels = refreshed;
+          active = refreshed.data.models.find((m) => m.id === active.id) || active;
+        }
+      }
       await loadVoices(active.id);
       updateModelMeta(active.id);
-      updateLangVisibility(active.id);
+      updateModelSpecificUI(active.id);
     }
     modelSelect.disabled = false;
     voiceSelect.disabled = false;
-  } catch (e) { console.error("[Open TTS] Load models:", e); }
+  } catch (e) {
+    console.error("[Open TTS] Load models:", e);
+  }
 }
 
 async function loadVoices(modelId) {
-  const modelsResp = cachedModels || await msg({ type: "GET_MODELS" });
-  if (!cachedModels) cachedModels = modelsResp;
-  const modelData = modelsResp?.data?.models?.find(m => m.id === modelId);
-  const saved = await syncGet(["voice"]);
-  const prefVoice = saved.voice || DEFAULTS.voice;
+  const modelsResp = cachedModels || unwrap(await msg({ type: "GET_MODELS" }));
+  if (!cachedModels && modelsResp.ok) cachedModels = modelsResp;
+  const modelData = modelsResp?.data?.models?.find((m) => m.id === modelId);
+  const prefVoice = getPreferredVoice(modelId);
 
-  voiceSelect.innerHTML = "";
+  voiceSelect.replaceChildren();
   if (modelData?.voices?.length) {
-    modelData.voices.forEach(v => {
+    modelData.voices.forEach((v) => {
       const opt = document.createElement("option");
-      opt.value = v.id; opt.textContent = v.name;
+      opt.value = v.id;
+      opt.textContent = v.name;
       if (v.id === prefVoice) opt.selected = true;
       voiceSelect.appendChild(opt);
     });
+    if (![...voiceSelect.options].some((o) => o.selected)) {
+      voiceSelect.selectedIndex = 0;
+    }
   } else {
-    voiceSelect.innerHTML = '<option disabled selected>No voices</option>';
+    const opt = document.createElement("option");
+    opt.disabled = true;
+    opt.selected = true;
+    opt.textContent = "No preset voices";
+    voiceSelect.appendChild(opt);
   }
 }
 
 function updateModelMeta(modelId) {
-  const meta = {
-    "kokoro": "Kokoro 82M — Ultra-fast local MLX",
-    "qwen3-tts": "Qwen3-TTS 1.7B — Multilingual",
-    "fish-s2-pro": "Fish Audio S2 Pro — Voice cloning",
-  };
-  modelMeta.textContent = meta[modelId] || "Local model";
+  const m = cachedModels?.data?.models?.find((x) => x.id === modelId);
+  if (!m) {
+    modelMeta.textContent = "Local MLX model";
+    return;
+  }
+  const speedNote = m.supports_native_speed ? "Speed at synthesis" : "Speed via playback";
+  const streamNote = m.supports_streaming ? "Streaming" : "Batch fallback";
+  modelMeta.textContent = `${m.description || m.name} — ${speedNote}, ${streamNote}`;
 }
 
-function updateLangVisibility(modelId) {
-  langSelect.disabled = (modelId === "fish-s2-pro" || modelId === "kokoro");
+function updateModelSpecificUI(modelId) {
+  const m = cachedModels?.data?.models?.find((x) => x.id === modelId);
+  const isFish = modelId === "fish-s2-pro";
+  const isQwen = modelId === "qwen3-tts";
+  fishStyleWrap.hidden = !isFish;
+  instructWrap.hidden = !(isFish || isQwen);
+  langSelect.disabled = isFish || modelId === "kokoro";
   if (langSelect.disabled) langSelect.value = "Auto";
+  voiceSelect.parentElement.hidden = isFish;
 }
 
 async function handleModelChange() {
   const modelId = modelSelect.value;
+  hideError();
   setServerUI("loading", `Switching to ${modelSelect.options[modelSelect.selectedIndex].text}...`);
   try {
-    const resp = await msg({ type: "LOAD_MODEL", modelId });
-    if (resp?.success) {
+    const resp = unwrap(await msg({ type: "LOAD_MODEL", modelId }));
+    if (resp.ok) {
+      await syncSet({ model: modelId });
+      const refreshed = unwrap(await msg({ type: "GET_MODELS" }));
+      if (refreshed.ok) cachedModels = refreshed;
       await loadVoices(modelId);
       updateModelMeta(modelId);
-      updateLangVisibility(modelId);
-      setServerUI("running", "Connected");
-    } else { setServerUI("error", resp?.error || "Switch failed"); }
-  } catch (e) { setServerUI("error", `Error: ${e.message}`); }
-}
-
-// ─── Speak (popup preview) ───────────────────────────
-
-async function stopAllTabs() {
-  try { await msg({ type: "STOP_TTS" }); } catch (e) {}
-  try {
-    const tabs = await chrome.tabs.query({});
-    for (const tab of tabs) {
-      try { await chrome.tabs.sendMessage(tab.id, { type: "STOP_TTS" }); } catch (e) {}
+      updateModelSpecificUI(modelId);
+      setServerUI("running", `Connected — ${modelId}`);
+    } else {
+      setServerUI("stopped", resp.error || "Switch failed");
+      showError(resp.error || "Switch failed");
     }
-  } catch (e) {}
+  } catch (e) {
+    showError(e.message);
+  }
 }
 
 async function handleSpeak() {
-  await stopAllTabs();
-  if (previewAudio) { previewAudio.pause(); previewAudio.src = ""; previewAudio = null; }
+  hideError();
+  if (activeRun?.runId) {
+    pendingHistory = null;
+    await msg({ type: "STOP_TTS", runId: activeRun.runId, clientId }).catch(() => {});
+  }
 
   const text = previewText.value.trim();
   if (!text) return;
 
-  speakBtn.disabled = true;
-  vizText.textContent = "GENERATING";
-  startViz("sim");
-
+  const runId = makeRunId();
+  activeRun = { clientId, runId, source: "popup" };
+  setPlaybackUI("generating", "Generating...");
   const t0 = performance.now();
 
   try {
-    const settings = await syncGet(["voice", "speed", "language", "model"]);
-    const resp = await msg({
-      type: "TTS_REQUEST",
+    const settings = await syncGet(["voice", "speed", "language", "model", "voicePrefs", "instruct", "fishStyle"]);
+    voicePrefs = settings.voicePrefs || {};
+    const modelId = settings.model || modelSelect.value || DEFAULTS.model;
+    const voice = modelId === "fish-s2-pro"
+      ? (settings.fishStyle || fishStyleSelect.value || "whisper")
+      : (voiceSelect.value || voicePrefs[modelId] || DEFAULTS.voice);
+
+    const speakResult = unwrap(await msg({
+      type: "SPEAK",
       text,
-      voice: settings.voice || DEFAULTS.voice,
-      speed: Number(settings.speed) || DEFAULTS.speed,
-      language: settings.language || DEFAULTS.language,
-      model: settings.model || DEFAULTS.model,
-    });
+      settings: {
+        voice,
+        speed: Number(settings.speed) || DEFAULTS.speed,
+        language: settings.language || DEFAULTS.language,
+        model: modelId,
+        instruct: instructField?.value?.trim() || settings.instruct || "",
+      },
+      clientId,
+      runId,
+      source: "popup",
+    }));
+    if (!speakResult.ok) throw new Error(speakResult.error || "Playback failed to start");
 
     latencyEl.textContent = `LAT: ${Math.round(performance.now() - t0)}ms`;
+    genCount++;
+    genCountEl.textContent = `GEN: ${String(genCount).padStart(3, "0")}`;
 
-    if (resp?.success?.audioData) {
-      let playbackRate = 1.0;
-      const modelId = settings.model || DEFAULTS.model;
-      const modelInfo = cachedModels?.data?.models?.find(m => m.id === modelId);
-      if (modelInfo && !modelInfo.supports_native_speed) {
-        playbackRate = Number(settings.speed) || 1.5;
-      }
-
-      previewAudio = new Audio(resp.audioData);
-      previewAudio.playbackRate = playbackRate;
-
-      genCount++;
-      genCountEl.textContent = `GEN: ${String(genCount).padStart(3, "0")}`;
-
-      await addHistory({
-        id: Date.now(), text,
-        voice: settings.voice || DEFAULTS.voice,
-        model: settings.model || DEFAULTS.model,
-        speed: Number(settings.speed) || DEFAULTS.speed,
-        timestamp: Date.now(),
-      });
-
-      previewAudio.onplay = () => { vizText.textContent = "PLAYING"; startViz("audio"); };
-      previewAudio.onended = () => { speakBtn.disabled = false; stopViz(); vizText.textContent = "Ready"; };
-      previewAudio.onerror = () => { speakBtn.disabled = false; stopViz(); vizText.textContent = "Error"; };
-
-      // Set up audio context for visualizer
-      if (!audioCtx) {
-        try { audioCtx = new AudioContext(); } catch (e) {}
-      }
-
-      await previewAudio.play();
-    } else {
-      speakBtn.disabled = false; stopViz(); vizText.textContent = "Failed";
-      statusText.textContent = resp?.error || "TTS failed";
-    }
+    pendingHistory = {
+      runId,
+      id: crypto.randomUUID(),
+      text,
+      voice,
+      model: modelId,
+      speed: Number(settings.speed) || DEFAULTS.speed,
+      timestamp: Date.now(),
+    };
   } catch (e) {
-    speakBtn.disabled = false; stopViz(); vizText.textContent = "Error";
-    statusText.textContent = `Error: ${e.message}`;
+    pendingHistory = null;
+    activeRun = null;
+    setPlaybackUI("idle", "Failed");
+    showError(e.message);
   }
+}
+
+async function handlePauseResume() {
+  if (!activeRun?.runId) return;
+  if (playbackState === "paused") {
+    await msg({ type: "RESUME", clientId, runId: activeRun?.runId });
+    setPlaybackUI("playing", "Reading...");
+  } else if (playbackState === "playing") {
+    await msg({ type: "PAUSE", clientId, runId: activeRun?.runId });
+    setPlaybackUI("paused", "Paused");
+  }
+}
+
+async function handleStopPlayback() {
+  if (!activeRun?.runId) return;
+  pendingHistory = null;
+  await msg({ type: "STOP", clientId, runId: activeRun.runId });
+  activeRun = null;
+  setPlaybackUI("idle", "Ready");
 }
 
 async function handleCopy() {
@@ -400,39 +496,112 @@ async function handleCopy() {
     await navigator.clipboard.writeText(previewText.value);
     copyBtn.classList.add("copied");
     setTimeout(() => copyBtn.classList.remove("copied"), 1200);
-  } catch (e) {}
+  } catch (e) {
+    showError("Clipboard unavailable");
+  }
 }
 
 async function loadSettings() {
-  const data = await syncGet(["model", "voice", "speed", "language", "previewText"]);
+  const data = await syncGet(["model", "voice", "speed", "language", "voicePrefs", "instruct", "fishStyle"]);
+  const local = await localGet(["previewText"]);
+  voicePrefs = data.voicePrefs || {};
   speedSlider.value = Number(data.speed ?? DEFAULTS.speed);
   speedVal.textContent = `${speedSlider.value}x`;
   langSelect.value = data.language || DEFAULTS.language;
-  previewText.value = data.previewText || DEFAULTS.previewText;
+  previewText.value = local.previewText || DEFAULTS.previewText;
+  if (instructField) instructField.value = data.instruct || "";
+  if (fishStyleSelect) fishStyleSelect.value = data.fishStyle || "whisper";
   updateCharCount();
 }
 
 function wireEvents() {
-  speedSlider.addEventListener("input", async () => {
+  speedSlider.addEventListener("input", () => {
     speedVal.textContent = `${speedSlider.value}x`;
-    await syncSet({ speed: Number(speedSlider.value) });
+    debouncedSyncSet("speed", Number(speedSlider.value));
   });
-  voiceSelect.addEventListener("change", () => syncSet({ voice: voiceSelect.value }));
-  langSelect.addEventListener("change", () => syncSet({ language: langSelect.value }));
-  previewText.addEventListener("input", async () => { updateCharCount(); await syncSet({ previewText: previewText.value }); });
+  voiceSelect.addEventListener("change", async () => {
+    const modelId = modelSelect.value;
+    voicePrefs[modelId] = voiceSelect.value;
+    await syncSet({ voicePrefs, voice: voiceSelect.value });
+  });
+  langSelect.addEventListener("change", () => debouncedSyncSet("language", langSelect.value));
+  previewText.addEventListener("input", () => {
+    updateCharCount();
+    debouncedLocalSet("previewText", previewText.value);
+  });
+  if (instructField) {
+    instructField.addEventListener("input", () => debouncedSyncSet("instruct", instructField.value));
+  }
+  if (fishStyleSelect) {
+    fishStyleSelect.addEventListener("change", () => debouncedSyncSet("fishStyle", fishStyleSelect.value));
+  }
   modelSelect.addEventListener("change", handleModelChange);
   speakBtn.addEventListener("click", handleSpeak);
+  pauseBtn.addEventListener("click", handlePauseResume);
+  stopBtnPlayback.addEventListener("click", handleStopPlayback);
   copyBtn.addEventListener("click", handleCopy);
   startBtn.addEventListener("click", handleStart);
   stopBtn.addEventListener("click", handleStop);
-  historyToggle.addEventListener("click", () => historyPanel.classList.toggle("collapsed"));
-  clearHistoryBtn.addEventListener("click", async () => { await localSet({ ttsHistory: [] }); renderHistory([]); });
+  const toggleHistory = () => {
+    const collapsed = historyPanel.classList.toggle("collapsed");
+    historyToggle.setAttribute("aria-expanded", String(!collapsed));
+  };
+  historyToggle.addEventListener("click", toggleHistory);
+  historyToggle.addEventListener("keydown", (event) => {
+    if (event.key === "Enter" || event.key === " ") {
+      event.preventDefault();
+      toggleHistory();
+    }
+  });
+  historyEnabledEl.addEventListener("change", async () => {
+    historyEnabled = historyEnabledEl.checked;
+    await localSet({ historyEnabled });
+  });
+  clearHistoryBtn.addEventListener("click", async () => {
+    await localSet({ ttsHistory: [] });
+    renderHistory([]);
+  });
+  copyDiagnosticsBtn.addEventListener("click", async () => {
+    const diag = errorBanner.dataset.diagnostics || errorText.textContent;
+    try { await navigator.clipboard.writeText(diag); } catch (_) {}
+  });
+
+  chrome.runtime.onMessage.addListener((msg) => {
+    if (!msg._routedByBackground) return;
+    if (msg.clientId && msg.clientId !== clientId) return;
+    if (activeRun?.runId && msg.runId && msg.runId !== activeRun.runId) return;
+    if (msg.type === "TTS_STATUS") {
+      const label = msg.label || "Generating...";
+      const state = label === "Paused" ? "paused" : (/Reading|Playing/.test(label) ? "playing" : "generating");
+      setPlaybackUI(state, label);
+    }
+    if (msg.type === "TTS_PROGRESS") setPlaybackUI("playing", `Playing ${msg.played || 0}/${msg.scheduled || "?"}`);
+    if (msg.type === "TTS_DONE") {
+      const completedHistory = pendingHistory;
+      pendingHistory = null;
+      if (completedHistory?.runId === msg.runId) {
+        const { runId: _runId, ...entry } = completedHistory;
+        addHistory(entry).catch(() => {});
+      }
+      activeRun = null;
+      setPlaybackUI("idle", "Ready");
+    }
+    if (msg.type === "TTS_ERROR") {
+      pendingHistory = null;
+      activeRun = null;
+      showError(msg.message || "Playback error");
+      setPlaybackUI("idle", "Error");
+    }
+  });
 }
 
 async function init() {
+  const manifest = chrome.runtime.getManifest();
+  if (versionEl) versionEl.textContent = `v${manifest.version}`;
   await loadSettings();
-  loadHistory();
+  await loadHistory();
   wireEvents();
+  setPlaybackUI("idle", "Ready");
   await checkServer();
 }
 

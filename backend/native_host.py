@@ -1,15 +1,20 @@
 #!/usr/bin/env python3
 """Native Messaging Host for Open TTS extension."""
 
+from __future__ import annotations
+
 import fcntl
 import json
 import os
 import signal
+import shlex
 import socket
+import struct
 import subprocess
 import sys
-import struct
 import time
+import urllib.error
+import urllib.request
 from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).parent.resolve()
@@ -17,53 +22,67 @@ BACKEND_DIR = SCRIPT_DIR
 SERVER_SCRIPT = BACKEND_DIR / "server.py"
 VENV_PYTHON = BACKEND_DIR / "venv" / "bin" / "python"
 PID_FILE = BACKEND_DIR / ".server.pid"
+LOCK_FILE = BACKEND_DIR / ".open_tts.lock"
+TOKEN_FILE = BACKEND_DIR / ".open_tts_token"
 LOG_FILE = BACKEND_DIR / "server.log"
 DEFAULT_PORT = int(os.getenv("OPEN_TTS_PORT", "8000"))
+MAX_MESSAGE_BYTES = 1_048_576
+ENGINE_ID = "open-tts"
+STARTUP_GRACE_SECONDS = 30
 
-# ---------------------------------------------------------------------------
-# PID file lock — prevents concurrent native host races
-# ---------------------------------------------------------------------------
-_pid_fd = None
+_lock_fd = None
 
-def _acquire_pid_lock():
-    """Open PID_FILE with an exclusive fcntl lock."""
-    global _pid_fd
+
+def _acquire_interprocess_lock() -> bool:
+    global _lock_fd
     try:
-        _pid_fd = open(PID_FILE, "a+")
-        fcntl.flock(_pid_fd.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        _pid_fd.seek(0)
-        _pid_fd.truncate()
+        _lock_fd = open(LOCK_FILE, "a+")
+        fcntl.flock(_lock_fd.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         return True
-    except (OSError, IOError):
+    except OSError:
         return False
 
-def _release_pid_lock():
-    global _pid_fd
-    if _pid_fd:
+
+def _release_interprocess_lock() -> None:
+    global _lock_fd
+    if _lock_fd:
         try:
-            fcntl.flock(_pid_fd.fileno(), fcntl.LOCK_UN)
-            _pid_fd.close()
+            fcntl.flock(_lock_fd.fileno(), fcntl.LOCK_UN)
+            _lock_fd.close()
         except Exception:
             pass
-        _pid_fd = None
+        _lock_fd = None
 
-# ---------------------------------------------------------------------------
-# Native messaging protocol helpers
-# ---------------------------------------------------------------------------
 
 def get_message():
-    """Read a message from stdin (Native Messaging protocol)."""
-    raw_length = sys.stdin.buffer.read(4)
+    raw_length = _read_exact(4, allow_eof=True)
     if not raw_length:
         return None
     message_length = struct.unpack("@I", raw_length)[0]
-    message = sys.stdin.buffer.read(message_length).decode("utf-8")
+    if message_length > MAX_MESSAGE_BYTES:
+        raise ValueError(f"Message exceeds {MAX_MESSAGE_BYTES} bytes")
+    message = _read_exact(message_length).decode("utf-8")
     return json.loads(message)
 
 
+def _read_exact(size: int, *, allow_eof: bool = False) -> bytes:
+    chunks = []
+    remaining = size
+    while remaining:
+        chunk = sys.stdin.buffer.read(remaining)
+        if not chunk:
+            if allow_eof and remaining == size:
+                return b""
+            raise EOFError(f"Native message ended {remaining} bytes early")
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    return b"".join(chunks)
+
+
 def send_message(message):
-    """Send a message to stdout (Native Messaging protocol)."""
     encoded_message = json.dumps(message).encode("utf-8")
+    if len(encoded_message) > MAX_MESSAGE_BYTES:
+        encoded_message = json.dumps({"success": False, "message": "Response too large"}).encode("utf-8")
     encoded_length = struct.pack("@I", len(encoded_message))
     sys.stdout.buffer.write(encoded_length)
     sys.stdout.buffer.write(encoded_message)
@@ -71,319 +90,420 @@ def send_message(message):
 
 
 def send_response(success, message, **extra):
-    """Send a response message."""
-    response = {"success": success, "message": message, **extra}
-    send_message(response)
+    send_message({"success": success, "message": message, **extra})
 
-# ---------------------------------------------------------------------------
-# Port helpers
-# ---------------------------------------------------------------------------
 
-def is_port_in_use(port=DEFAULT_PORT):
-    """Check if a port is actually in use by attempting a TCP connection."""
+def is_port_in_use(port=DEFAULT_PORT) -> bool:
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             s.settimeout(1)
-            result = s.connect_ex(("127.0.0.1", port))
-            return result == 0
-    except (OSError, socket.error):
+            return s.connect_ex(("127.0.0.1", port)) == 0
+    except OSError:
         return False
 
 
 def get_pid_on_port(port=DEFAULT_PORT):
-    """Find the PID of the process listening on the given port (macOS)."""
     try:
         result = subprocess.run(
             ["lsof", "-ti", f":{port}", "-sTCP:LISTEN"],
-            capture_output=True, text=True, timeout=5,
+            capture_output=True,
+            text=True,
+            timeout=5,
         )
-        pids = result.stdout.strip().split("\n")
-        pids = [int(p) for p in pids if p.strip().isdigit()]
+        pids = [int(p) for p in result.stdout.strip().split("\n") if p.strip().isdigit()]
         return pids[0] if pids else None
     except (subprocess.TimeoutExpired, ValueError, FileNotFoundError):
         return None
 
-# ---------------------------------------------------------------------------
-# Server state helpers
-# ---------------------------------------------------------------------------
 
-def is_server_running():
-    """Check if the server is running — checks both PID file AND actual port."""
-    port_active = is_port_in_use()
+def _process_command(pid: int) -> str:
+    try:
+        if sys.platform == "darwin":
+            r = subprocess.run(
+                ["ps", "-p", str(pid), "-o", "command="],
+                capture_output=True,
+                text=True,
+                timeout=3,
+            )
+            return r.stdout.strip()
+        proc = Path(f"/proc/{pid}/cmdline")
+        if proc.exists():
+            return proc.read_text(errors="ignore").replace("\x00", " ")
+    except Exception:
+        pass
+    return ""
 
-    pid = None
-    if PID_FILE.exists():
+
+def _process_cwd(pid: int) -> Path | None:
+    try:
+        if sys.platform == "darwin":
+            result = subprocess.run(
+                ["lsof", "-a", "-p", str(pid), "-d", "cwd", "-Fn"],
+                capture_output=True,
+                text=True,
+                timeout=3,
+            )
+            for line in result.stdout.splitlines():
+                if line.startswith("n/"):
+                    return Path(line[1:]).resolve()
+        proc_cwd = Path(f"/proc/{pid}/cwd")
+        if proc_cwd.exists():
+            return proc_cwd.resolve()
+    except Exception:
+        pass
+    return None
+
+
+def _is_open_tts_process(pid: int) -> bool:
+    cmd = _process_command(pid)
+    if not cmd:
+        return False
+    cwd = _process_cwd(pid)
+    try:
+        parts = shlex.split(cmd)
+    except ValueError:
+        parts = cmd.split()
+    for part in parts:
+        candidate = Path(part)
+        if candidate.name != "server.py":
+            continue
+        if not candidate.is_absolute():
+            if cwd is None:
+                continue
+            candidate = cwd / candidate
         try:
-            pid = int(PID_FILE.read_text().strip())
-            os.kill(pid, 0)
-        except (ValueError, ProcessLookupError, PermissionError):
-            pid = None
-            if PID_FILE.exists():
-                PID_FILE.unlink()
+            if candidate.resolve() == SERVER_SCRIPT:
+                return True
+        except OSError:
+            continue
+    return False
 
-    if port_active:
-        # Port is bound — reconcile PID
-        actual_pid = get_pid_on_port()
-        if actual_pid:
-            if pid and pid != actual_pid:
-                print(f"PID file ({pid}) doesn't match port PID ({actual_pid}), updating", file=sys.stderr)
-            PID_FILE.write_text(str(actual_pid))
-        return True
 
-    # Port not bound, but process exists and is recent (<10s) — might be loading
+def _fetch_health(timeout=2.0):
+    url = f"http://127.0.0.1:{DEFAULT_PORT}/health"
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError):
+        return None
+
+
+def _verify_open_tts_server(pid: int | None = None) -> bool:
+    health = _fetch_health()
+    if not health:
+        return False
+    if health.get("engine") != ENGINE_ID:
+        return False
+    if pid is not None:
+        return _is_open_tts_process(pid)
+    if pid is None:
+        port_pid = get_pid_on_port()
+        if port_pid and _is_open_tts_process(port_pid):
+            return True
+    return False
+
+
+def _read_install_token():
+    try:
+        token = TOKEN_FILE.read_text(encoding="utf-8").strip()
+        return token or None
+    except OSError:
+        return None
+
+
+def _read_pid_file():
+    if not PID_FILE.exists():
+        return None
+    try:
+        return int(PID_FILE.read_text().strip())
+    except ValueError:
+        return None
+
+
+def _write_pid(pid: int) -> None:
+    PID_FILE.write_text(str(pid))
+
+
+def _clear_pid_file() -> None:
+    if PID_FILE.exists():
+        PID_FILE.unlink(missing_ok=True)
+
+
+def is_server_running() -> bool:
+    port_active = is_port_in_use()
+    pid = _read_pid_file()
     if pid is not None:
         try:
-            proc_start = os.stat(f"/proc/{pid}").st_ctime if os.path.exists(f"/proc/{pid}") else 0
-            if not proc_start:
-                # macOS — use ps if available
-                r = subprocess.run(["ps", "-o", "lstart=", "-p", str(pid)],
-                                   capture_output=True, text=True, timeout=2)
-                # Process exists but no port yet — give it 10s grace
-                return True
-        except Exception:
-            pass
+            os.kill(pid, 0)
+        except (ProcessLookupError, PermissionError):
+            pid = None
+            _clear_pid_file()
 
+    if port_active:
+        actual_pid = get_pid_on_port()
+        if actual_pid and _verify_open_tts_server(actual_pid):
+            _write_pid(actual_pid)
+            return True
+        if actual_pid and not _is_open_tts_process(actual_pid):
+            return False
+        return _verify_open_tts_server(actual_pid)
+
+    if pid is not None and _is_open_tts_process(pid):
+        try:
+            age = time.time() - PID_FILE.stat().st_mtime
+        except OSError:
+            age = STARTUP_GRACE_SECONDS + 1
+        return age <= STARTUP_GRACE_SECONDS
     return False
 
 
 def get_server_pid():
-    """Get the server PID if running. Prefer port-based discovery."""
-    pid = get_pid_on_port()
-    if pid:
-        PID_FILE.write_text(str(pid))
+    port_pid = get_pid_on_port()
+    if port_pid and _is_open_tts_process(port_pid) and _verify_open_tts_server(port_pid):
+        _write_pid(port_pid)
+        return port_pid
+    pid = _read_pid_file()
+    if pid and _is_open_tts_process(pid):
         return pid
-
-    if PID_FILE.exists():
-        try:
-            return int(PID_FILE.read_text().strip())
-        except (ValueError, FileNotFoundError):
-            pass
     return None
 
-# ---------------------------------------------------------------------------
-# Process management
-# ---------------------------------------------------------------------------
 
-def kill_stale_server(port=DEFAULT_PORT):
-    """Kill any process occupying the port. Returns (killed, message)."""
+def _kill_process_group(pid: int, sig: int) -> None:
+    try:
+        if sys.platform != "win32":
+            os.killpg(os.getpgid(pid), sig)
+        else:
+            os.kill(pid, sig)
+    except (ProcessLookupError, PermissionError):
+        try:
+            os.kill(pid, sig)
+        except ProcessLookupError:
+            pass
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+        return True
+    except (ProcessLookupError, PermissionError):
+        return False
+
+
+def _wait_for_exit(pid: int, timeout: float) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if not _pid_alive(pid):
+            return True
+        time.sleep(0.1)
+    return not _pid_alive(pid)
+
+
+def kill_owned_server(port=DEFAULT_PORT):
+    """Kill only a verified Open TTS server. Never touch foreign port owners."""
     pid = get_pid_on_port()
     if pid is None:
-        return True, "No stale process found"
+        recorded_pid = _read_pid_file()
+        if recorded_pid and _is_open_tts_process(recorded_pid):
+            _kill_process_group(recorded_pid, signal.SIGTERM)
+            _wait_for_exit(recorded_pid, timeout=5)
+            if _pid_alive(recorded_pid):
+                _kill_process_group(recorded_pid, signal.SIGKILL)
+            _clear_pid_file()
+            return True, f"Stopped non-listening Open TTS process {recorded_pid}"
+        _clear_pid_file()
+        return True, "No Open TTS process found"
+
+    if not _is_open_tts_process(pid):
+        return False, f"Port {port} owned by foreign PID {pid}; refusing to kill"
+
+    if not _verify_open_tts_server(pid):
+        if not _is_open_tts_process(pid):
+            return False, f"PID {pid} is not an Open TTS server"
+        # Process looks like ours but health not ready — still only kill if command matches
+        pass
 
     try:
-        os.kill(pid, signal.SIGTERM)
+        _kill_process_group(pid, signal.SIGTERM)
         for _ in range(20):
             time.sleep(0.25)
             if not is_port_in_use(port):
-                if PID_FILE.exists():
-                    PID_FILE.unlink()
-                return True, f"Killed stale server (PID {pid})"
-
-        # Force kill
-        os.kill(pid, signal.SIGKILL)
+                _clear_pid_file()
+                return True, f"Stopped Open TTS server (PID {pid})"
+        _kill_process_group(pid, signal.SIGKILL)
         time.sleep(0.5)
-        if PID_FILE.exists():
-            PID_FILE.unlink()
-        return True, f"Force-killed stale server (PID {pid})"
+        _clear_pid_file()
+        return True, f"Force-stopped Open TTS server (PID {pid})"
     except ProcessLookupError:
-        if PID_FILE.exists():
-            PID_FILE.unlink()
-        return True, "Stale process already gone"
+        _clear_pid_file()
+        return True, "Server already stopped"
     except PermissionError:
-        return False, f"Permission denied killing PID {pid}"
-    except Exception as e:
-        return False, f"Failed to kill stale server: {e}"
+        return False, f"Permission denied stopping PID {pid}"
+
+
+def _sign_native_dylibs_if_darwin():
+    if sys.platform != "darwin":
+        return
+    script = BACKEND_DIR / "sign_native_dylibs.sh"
+    if not script.is_file():
+        return
+    try:
+        subprocess.run(
+            ["/bin/bash", str(script)],
+            cwd=str(BACKEND_DIR),
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+    except Exception:
+        pass
 
 
 def start_server():
-    """Start the TTS server. Returns (success, message)."""
-    # If already running with port bound, nothing to do
-    if is_port_in_use():
-        pid = get_server_pid()
-        return True, f"Server already running (PID: {pid})"
+    _sign_native_dylibs_if_darwin()
 
-    # Port not in use but PID file exists — clean up dead process
-    if PID_FILE.exists():
+    if is_port_in_use():
+        port_pid = get_pid_on_port()
+        if port_pid and _is_open_tts_process(port_pid):
+            _write_pid(port_pid)
+            if _verify_open_tts_server(port_pid):
+                return True, f"Server already running (PID: {port_pid})", _read_install_token()
+            # Our process owns the port but /health may still be coming up.
+            return True, f"Server starting (PID: {port_pid})", _read_install_token()
+        if port_pid:
+            return False, f"Port {DEFAULT_PORT} in use by non-Open-TTS process (PID: {port_pid})", None
+        return False, f"Port {DEFAULT_PORT} in use but owner could not be identified", None
+
+    pid = _read_pid_file()
+    if pid is not None:
         try:
-            pid = int(PID_FILE.read_text().strip())
-            try:
-                os.kill(pid, signal.SIGKILL)
-            except (ProcessLookupError, PermissionError):
-                pass
-        except ValueError:
+            if _is_open_tts_process(pid):
+                os.kill(pid, 0)
+                if not is_port_in_use():
+                    try:
+                        age = time.time() - PID_FILE.stat().st_mtime
+                    except OSError:
+                        age = STARTUP_GRACE_SECONDS + 1
+                    if age <= STARTUP_GRACE_SECONDS:
+                        return True, f"Server starting (PID: {pid})", _read_install_token()
+                    _kill_process_group(pid, signal.SIGKILL)
+        except ProcessLookupError:
             pass
-        PID_FILE.unlink()
+        _clear_pid_file()
 
-    # Port in use by unknown process — kill it
-    if is_port_in_use():
-        killed, msg = kill_stale_server()
-        if not killed:
-            return False, f"Port {DEFAULT_PORT} in use by unknown process: {msg}"
-        for _ in range(10):
-            time.sleep(0.3)
-            if not is_port_in_use():
-                break
-        else:
-            return False, f"Port {DEFAULT_PORT} still in use after killing stale process"
-
-    # Determine Python executable
     python_exe = str(VENV_PYTHON) if VENV_PYTHON.exists() else sys.executable
+    if not SERVER_SCRIPT.is_file():
+        return False, "server.py not found", None
+    if not VENV_PYTHON.is_file():
+        return False, "venv python missing; run setup.sh", None
 
-    # Start the server as a background process
     try:
-        stdout_fh = open(LOG_FILE, "a")
-        stderr_fh = open(LOG_FILE, "a")
-    except OSError as e:
-        return False, f"Failed to open log file: {e}"
+        log_fh = open(LOG_FILE, "a")
+    except OSError as exc:
+        return False, f"Failed to open log file: {exc}", None
+
+    env = dict(os.environ)
+    env.pop("PYTHONPATH", None)
+    env.setdefault("OPEN_TTS_EAGER_LOAD", "0")
 
     try:
         process = subprocess.Popen(
             [python_exe, str(SERVER_SCRIPT)],
             cwd=str(BACKEND_DIR),
-            stdout=stdout_fh,
-            stderr=stderr_fh,
+            env=env,
+            stdout=log_fh,
+            stderr=log_fh,
             start_new_session=True,
         )
-        stdout_fh.close()
-        stderr_fh.close()
-    except Exception as e:
-        stdout_fh.close()
-        stderr_fh.close()
-        return False, f"Failed to start server: {str(e)}"
+    except Exception as exc:
+        log_fh.close()
+        return False, f"Failed to start server: {exc}", None
+    finally:
+        log_fh.close()
 
-    PID_FILE.write_text(str(process.pid))
-
-    # Wait for port to bind — model warmup now happens in background,
-    # so port binds MUCH faster (typically <2s instead of 10-15s)
+    _write_pid(process.pid)
     start_time = time.time()
-    max_wait = 15  # seconds — reduced from 30 since warmup is async
-
-    while time.time() - start_time < max_wait:
+    while time.time() - start_time < 20:
         time.sleep(0.3)
         try:
             os.kill(process.pid, 0)
         except ProcessLookupError:
-            if PID_FILE.exists():
-                PID_FILE.unlink()
-            return False, "Server failed to start. Check server.log for details."
-
-        if is_port_in_use():
-            return True, f"Server started (PID: {process.pid})"
-
-    # Port not bound yet, but process alive — check again
-    try:
-        os.kill(process.pid, 0)
-        if is_port_in_use():
-            return True, f"Server started (PID: {process.pid})"
-        return True, f"Server starting (PID: {process.pid}, model loading...)"
-    except ProcessLookupError:
-        if PID_FILE.exists():
-            PID_FILE.unlink()
-        return False, "Server failed to start. Check server.log for details."
+            _clear_pid_file()
+            return False, "Server failed to start. Check server.log", None
+        if is_port_in_use() and _verify_open_tts_server(process.pid):
+            return True, f"Server started (PID: {process.pid})", _read_install_token()
+    if is_port_in_use():
+        return True, f"Server starting (PID: {process.pid})", _read_install_token()
+    return True, f"Server process started (PID: {process.pid}); waiting for port", None
 
 
 def stop_server():
-    """Stop the TTS server. Returns (success, message)."""
-    if not is_server_running():
-        if is_port_in_use():
-            killed, msg = kill_stale_server()
-            return killed, msg if not killed else "Server stopped (killed orphan)"
+    if not is_port_in_use() and _read_pid_file() is None:
         return True, "Server is not running"
 
     pid = get_server_pid()
     if pid is None:
-        killed, msg = kill_stale_server()
-        return killed, msg
+        foreign = get_pid_on_port()
+        if foreign:
+            return False, f"Port {DEFAULT_PORT} used by foreign PID {foreign}; not stopping"
+        _clear_pid_file()
+        return True, "Server is not running"
 
-    try:
-        os.kill(pid, signal.SIGTERM)
-
-        for _ in range(20):
-            time.sleep(0.25)
-            try:
-                os.kill(pid, 0)
-            except ProcessLookupError:
-                if PID_FILE.exists():
-                    PID_FILE.unlink()
-                return True, "Server stopped successfully"
-
-            if not is_port_in_use():
-                if PID_FILE.exists():
-                    PID_FILE.unlink()
-                return True, "Server stopped successfully"
-
-        # Force kill
-        try:
-            os.kill(pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-        time.sleep(0.5)
-
-        if PID_FILE.exists():
-            PID_FILE.unlink()
-        return True, "Server stopped (force killed)"
-
-    except ProcessLookupError:
-        if PID_FILE.exists():
-            PID_FILE.unlink()
-        return True, "Server was not running"
-    except PermissionError:
-        return False, "Permission denied. Try stopping manually."
-    except Exception as e:
-        return False, f"Failed to stop server: {str(e)}"
+    return kill_owned_server()[:2]
 
 
 def get_status():
-    """Get the server status."""
-    port_active = is_port_in_use()
     running = is_server_running()
     pid = get_server_pid() if running else None
-
+    port_active = is_port_in_use()
+    health = _fetch_health() if port_active else None
     if running and port_active:
         msg = f"Server running (PID: {pid})"
     elif running:
         msg = f"Server starting (PID: {pid})"
     else:
         msg = "Server not running"
-
     return {
         "running": running,
         "port_active": port_active,
         "pid": pid,
         "message": msg,
+        "install_token": _read_install_token() if running else None,
+        "engine": (health or {}).get("engine"),
     }
 
-# ---------------------------------------------------------------------------
-# Main loop
-# ---------------------------------------------------------------------------
 
 def main():
-    """Main native messaging host loop."""
-    while True:
-        try:
-            message = get_message()
-            if message is None:
-                break
+    if not _acquire_interprocess_lock():
+        send_response(False, "Another native host instance is active")
+        return
 
-            command = message.get("command")
-
-            if command == "start":
-                success, msg = start_server()
-                send_response(success, msg)
-            elif command == "stop":
-                success, msg = stop_server()
-                send_response(success, msg)
-            elif command == "status":
-                status = get_status()
-                send_response(True, status["message"], **status)
-            else:
-                send_response(False, f"Unknown command: {command}")
-
-        except Exception as e:
+    try:
+        while True:
             try:
-                send_response(False, f"Error: {str(e)}")
-            except Exception:
-                break
+                message = get_message()
+                if message is None:
+                    break
+                command = message.get("command")
+                if command == "start":
+                    success, msg, token = start_server()
+                    send_response(success, msg, install_token=token)
+                elif command == "stop":
+                    success, msg = stop_server()
+                    send_response(success, msg)
+                elif command == "status":
+                    status = get_status()
+                    details = {key: value for key, value in status.items() if key != "message"}
+                    send_response(True, status["message"], **details)
+                else:
+                    send_response(False, f"Unknown command: {command}")
+            except Exception as exc:
+                try:
+                    send_response(False, f"Error: {exc}")
+                except Exception:
+                    break
+    finally:
+        _release_interprocess_lock()
 
 
 if __name__ == "__main__":

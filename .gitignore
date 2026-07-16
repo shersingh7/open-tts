@@ -59,3 +59,10 @@ models/
 *.plist
 # Server PID file
 .server.pid
+.open_tts_token
+.open_tts.lock
+
+# Graphify generated cache
+graphify-out/cache/
+dist/
+node_modules/

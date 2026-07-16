@@ -1,8 +1,16 @@
-// Open TTS v3.1 — Background Service Worker
-const SERVER_URL = "http://127.0.0.1:8000";
-const NATIVE_HOST = "com.open_tts.native_host";
+// Open TTS v3.2 — Background Service Worker (routing + lifecycle only)
+importScripts(
+  "shared/constants-umd.js",
+  "shared/protocol-umd.js",
+  "shared/storage-umd.js",
+);
 
-// ─── Offscreen lifecycle ─────────────────────────────
+const { SERVER_URL, NATIVE_HOST } = OpenTTSConstants;
+const { unwrap, ok, fail, playbackContext, parseApiErrorBody } = OpenTTSProtocol;
+const { getAuthHeaders, storeInstallToken } = OpenTTSStorage;
+
+let activeSession = null;
+
 async function ensureOffscreen() {
   const exists = await chrome.offscreen.hasDocument?.().catch(() => null);
   if (exists) return true;
@@ -10,7 +18,7 @@ async function ensureOffscreen() {
     await chrome.offscreen.createDocument({
       url: chrome.runtime.getURL("offscreen.html"),
       reasons: ["AUDIO_PLAYBACK"],
-      justification: "Local TTS audio playback",
+      justification: "Local TTS audio playback and synthesis",
     });
     return true;
   } catch (e) {
@@ -22,226 +30,273 @@ async function ensureOffscreen() {
 
 async function sendToOffscreen(payload) {
   if (!await ensureOffscreen()) throw new Error("Offscreen unavailable");
-  return chrome.runtime.sendMessage(payload);
-}
-
-// ─── Native messaging ─────────────────────────────────
-function nativeMsg(command) {
   return new Promise((resolve, reject) => {
-    const timeout = setTimeout(() => reject(new Error("Native host timeout")), 30000);
-    chrome.runtime.sendNativeMessage(NATIVE_HOST, { command }, (resp) => {
-      clearTimeout(timeout);
-      if (chrome.runtime.lastError) { reject(new Error(chrome.runtime.lastError.message)); return; }
+    chrome.runtime.sendMessage({ ...payload, _fromBackground: true }, (resp) => {
+      if (chrome.runtime.lastError) {
+        reject(new Error(chrome.runtime.lastError.message));
+        return;
+      }
       resolve(resp);
     });
   });
 }
 
-// ─── Server health ────────────────────────────────────
+function nativeMsg(command) {
+  return new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => reject(new Error("Native host timeout")), 30000);
+    chrome.runtime.sendNativeMessage(NATIVE_HOST, { command }, (resp) => {
+      clearTimeout(timeout);
+      if (chrome.runtime.lastError) {
+        reject(new Error(chrome.runtime.lastError.message));
+        return;
+      }
+      resolve(resp);
+    });
+  });
+}
 
 async function fetchHealth(timeoutMs = 3000) {
   try {
-    const r = await fetch(`${SERVER_URL}/health`, { signal: AbortSignal.timeout(timeoutMs) });
+    const headers = await getAuthHeaders();
+    delete headers["Content-Type"];
+    const r = await fetch(`${SERVER_URL}/health`, {
+      headers,
+      signal: AbortSignal.timeout(timeoutMs),
+    });
     if (!r.ok) return null;
-    return await r.json();
-  } catch { return null; }
+    const data = await r.json();
+    if (!headers["X-Open-TTS-Token"]) {
+      try {
+        const status = await nativeMsg("status");
+        if (status?.install_token) await storeInstallToken(status.install_token);
+      } catch (_) {
+        // Health remains useful when the host is not installed; authenticated
+        // API calls will return a clear error rather than leaking the token.
+      }
+    }
+    return data;
+  } catch {
+    return null;
+  }
 }
 
-async function isServerAlive() {
-  const h = await fetchHealth();
-  return h && h.model_loaded;
+async function apiFetch(path, options = {}) {
+  const execute = async () => {
+    const headers = await getAuthHeaders();
+    return fetch(`${SERVER_URL}${path}`, {
+      ...options,
+      headers: { ...headers, ...(options.headers || {}) },
+      signal: options.signal || AbortSignal.timeout(options.timeout || 30000),
+    });
+  };
+  let r = await execute();
+  if (r.status === 401) {
+    try {
+      const status = await nativeMsg("status");
+      if (status?.install_token) {
+        await storeInstallToken(status.install_token);
+        r = await execute();
+      }
+    } catch (_) {}
+  }
+  if (!r.ok) {
+    const err = await r.json().catch(() => ({}));
+    const { message, code } = parseApiErrorBody(err, r.status);
+    throw Object.assign(new Error(message), { code, status: r.status });
+  }
+  return r;
 }
 
-// ─── Message handler ─────────────────────────────────
+async function ensureBackendAvailable() {
+  const existing = await fetchHealth(2000);
+  if (existing?.status === "ok") return existing;
+
+  const started = await nativeMsg("start");
+  if (started?.install_token) await storeInstallToken(started.install_token);
+  if (started?.success === false) throw new Error(started.message || "Open TTS server failed to start");
+
+  for (let i = 0; i < 60; i++) {
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    const health = await fetchHealth(2000);
+    if (health?.status === "ok") return health;
+  }
+  throw new Error("Open TTS server did not become ready");
+}
+
+function notifyClient(session, payload) {
+  const routed = { ...payload, _routedByBackground: true };
+  if (!session?.sourceTabId || session.source === "popup") {
+    chrome.runtime.sendMessage(routed).catch(() => {});
+    return;
+  }
+  chrome.tabs.sendMessage(session.sourceTabId, routed, { frameId: session.sourceFrameId || 0 }).catch(() => {});
+}
+
+function ownsActiveSession(req) {
+  if (!activeSession || !req.runId) return false;
+  if (req.runId !== activeSession.runId) return false;
+  return !req.clientId || req.clientId === activeSession.clientId;
+}
+
 chrome.runtime.onMessage.addListener((req, sender, sendResponse) => {
+  if (req._fromOffscreen) {
+    if (["TTS_STATUS", "TTS_ERROR", "TTS_DONE", "TTS_PROGRESS"].includes(req.type)) {
+      if (OpenTTSProtocol.isStaleEvent(activeSession, req)) {
+        sendResponse({ ignored: true });
+        return true;
+      }
+      notifyClient(activeSession || req, req);
+      if (req.type === "TTS_DONE" || req.type === "TTS_ERROR") activeSession = null;
+      sendResponse({ success: true });
+      return true;
+    }
+    return false;
+  }
   if (req._fromBackground) return false;
   const type = req.type;
 
-  if (["SPEAK", "STOP", "PAUSE", "RESUME"].includes(type)) {
-    sendToOffscreen({ ...req, _fromBackground: true })
-      .then(r => sendResponse(r || { started: true }))
-      .catch(e => sendResponse({ error: e.message }));
+  if (type === "SPEAK") {
+    const ctx = playbackContext(sender, req);
+    const previous = activeSession;
+    activeSession = { ...ctx, state: "speaking" };
+    Promise.resolve()
+      .then(async () => {
+        if (previous?.runId && previous.runId !== ctx.runId) {
+          await sendToOffscreen({ type: "STOP", ...previous }).catch(() => {});
+          notifyClient(previous, { type: "TTS_DONE", ...previous });
+        }
+      })
+      .then(() => ensureBackendAvailable())
+      .then(async () => {
+        const headers = await getAuthHeaders();
+        const settings = {
+          ...(req.settings || {}),
+          authToken: headers["X-Open-TTS-Token"] || "",
+        };
+        return sendToOffscreen({ type: "SPEAK", text: req.text, settings, ...ctx });
+      })
+      .then((r) => sendResponse(r || { success: true, started: true }))
+      .catch((e) => {
+        if (activeSession?.runId === ctx.runId) activeSession = null;
+        sendResponse(fail(e.message, e.code));
+      });
+    return true;
+  }
+
+  if (["STOP", "PAUSE", "RESUME"].includes(type)) {
+    if (!ownsActiveSession(req)) {
+      sendResponse(fail("Playback control does not own the active run", "stale_run"));
+      return true;
+    }
+    sendToOffscreen({ type, ...activeSession, _fromBackground: true })
+      .then((r) => sendResponse(r || { success: true }))
+      .catch((e) => sendResponse(fail(e.message)));
     return true;
   }
 
   if (type === "STOP_TTS") {
-    sendToOffscreen({ type: "STOP", _fromBackground: true }).catch(() => {});
-    chrome.tabs.query({}).then(tabs => tabs.forEach(t => chrome.tabs.sendMessage(t.id, { type: "STOP_TTS" }).catch(() => {}))).catch(() => {});
-    sendResponse({ stopped: true });
+    if (ownsActiveSession(req)) {
+      sendToOffscreen({ type: "STOP", ...activeSession, _fromBackground: true }).catch(() => {});
+    }
+    sendResponse({ success: true, stopped: true });
     return true;
   }
 
   if (type === "ENSURE_OFFSCREEN") {
-    ensureOffscreen().then(ok => sendResponse({ success: ok })).catch(() => sendResponse({ success: false }));
+    ensureOffscreen().then((v) => sendResponse(ok({ ready: v }))).catch(() => sendResponse(fail("Offscreen failed")));
     return true;
   }
 
-  if (type === "TTS_REQUEST") { handleTTS(req, sendResponse); return true; }
-  if (type === "GET_HEALTH") { handleHealth(sendResponse); return true; }
-  if (type === "GET_MODELS") { handleModels(sendResponse); return true; }
-  if (type === "LOAD_MODEL") { handleLoadModel(req, sendResponse); return true; }
-  if (type === "GET_VOICES") { handleVoices(sendResponse); return true; }
-  if (type === "ENSURE_SERVER") { ensureServer().then(ok => sendResponse({ success: ok })).catch(() => sendResponse({ success: false })); return true; }
-  if (type === "START_SERVER") { handleStart(sendResponse); return true; }
-  if (type === "STOP_SERVER") { handleStop(sendResponse); return true; }
+  if (type === "GET_HEALTH") {
+    fetchHealth(5000).then((data) => {
+      if (data) sendResponse(ok(data));
+      else sendResponse(fail("Server not reachable"));
+    });
+    return true;
+  }
+
+  if (type === "GET_MODELS") {
+    apiFetch("/v1/models").then((r) => r.json()).then((data) => sendResponse(ok(data)))
+      .catch((e) => sendResponse(fail(e.message, e.code)));
+    return true;
+  }
+
+  if (type === "LOAD_MODEL") {
+    apiFetch(`/v1/load-model?model_id=${encodeURIComponent(req.modelId || "kokoro")}`, { method: "POST" })
+      .then((r) => r.json()).then((data) => sendResponse(ok(data)))
+      .catch((e) => sendResponse(fail(e.message, e.code)));
+    return true;
+  }
+
+  if (type === "GET_VOICES") {
+    apiFetch("/v1/voices").then((r) => r.json()).then((data) => sendResponse(ok(data)))
+      .catch((e) => sendResponse(fail(e.message, e.code)));
+    return true;
+  }
+
+  if (type === "START_SERVER") {
+    (async () => {
+      try {
+        const existing = await fetchHealth(2000);
+        if (existing?.model_warm || existing?.status === "ok") {
+          sendResponse(ok({ message: "Already running", model: existing.model, voices: existing.voices, lazy: !existing.model_loaded }));
+          return;
+        }
+        const resp = await nativeMsg("start");
+        if (resp?.install_token) await storeInstallToken(resp.install_token);
+        if (resp?.success === false) {
+          sendResponse(fail(resp.message || "Start failed"));
+          return;
+        }
+        for (let i = 0; i < 60; i++) {
+          await new Promise((r) => setTimeout(r, 1000));
+          const h = await fetchHealth(3000);
+          if (!h) continue;
+          if (h.model_warm) {
+            sendResponse(ok({ message: `Server ready — ${h.model}`, model: h.model, voices: h.voices }));
+            return;
+          }
+          if (h.status === "ok" && !h.model_loaded) {
+            sendResponse(ok({ message: "Server ready", model: null, voices: [], lazy: true }));
+            return;
+          }
+          if (h.model_loaded && i > 30) {
+            sendResponse(ok({ message: `Server ready (warming) — ${h.model}`, model: h.model, voices: h.voices }));
+            return;
+          }
+        }
+        sendResponse(fail("Server started but model didn't warm up in 60s"));
+      } catch (e) {
+        sendResponse(fail(e.message));
+      }
+    })();
+    return true;
+  }
+
+  if (type === "STOP_SERVER") {
+    nativeMsg("stop").then((resp) => sendResponse(ok({ message: resp?.message })))
+      .catch((e) => sendResponse(fail(e.message)));
+    return true;
+  }
+
+  if (type === "ENSURE_SERVER") {
+    (async () => {
+      const h = await fetchHealth(2000);
+      if (h?.model_warm || h?.status === "ok") {
+        sendResponse(ok({ ready: true }));
+        return;
+      }
+      try {
+        const resp = await nativeMsg("start");
+        if (resp?.install_token) await storeInstallToken(resp.install_token);
+        sendResponse(ok({ ready: resp?.success !== false }));
+      } catch (e) {
+        sendResponse(fail(e.message));
+      }
+    })();
+    return true;
+  }
+
+  sendResponse(fail(`Unknown message type: ${type}`));
+  return true;
 });
-
-// ─── Handlers ─────────────────────────────────────────
-
-async function handleHealth(sendResponse) {
-  const data = await fetchHealth(5000);
-  if (data) sendResponse({ success: true, data });
-  else sendResponse({ success: false, error: "Server not reachable" });
-}
-
-async function handleModels(sendResponse) {
-  try {
-    const r = await fetch(`${SERVER_URL}/v1/models`, { signal: AbortSignal.timeout(10000) });
-    const data = await r.json();
-    sendResponse({ success: true, data });
-  } catch (e) { sendResponse({ success: false, error: e.message }); }
-}
-
-async function handleLoadModel(req, sendResponse) {
-  try {
-    const r = await fetch(`${SERVER_URL}/v1/load-model?model_id=${encodeURIComponent(req.modelId || "kokoro")}`, { method: "POST", signal: AbortSignal.timeout(30000) });
-    const data = await r.json();
-    sendResponse({ success: true, data });
-  } catch (e) { sendResponse({ success: false, error: e.message }); }
-}
-
-async function handleVoices(sendResponse) {
-  try {
-    const r = await fetch(`${SERVER_URL}/v1/voices`, { signal: AbortSignal.timeout(5000) });
-    const data = await r.json();
-    sendResponse({ success: true, data });
-  } catch (e) { sendResponse({ success: false, error: e.message }); }
-}
-
-async function handleStart(sendResponse) {
-  try {
-    // First check if server is already running
-    const existing = await fetchHealth(2000);
-    if (existing?.model_loaded) {
-      sendResponse({ success: true, message: "Already running", alreadyRunning: true });
-      return;
-    }
-
-    // Try native messaging to start the server
-    let resp;
-    try {
-      resp = await nativeMsg("start");
-    } catch (e) {
-      sendResponse({ success: false, error: `Cannot start server: ${e.message}. Make sure the native host is installed.` });
-      return;
-    }
-
-    if (resp?.success === false) {
-      sendResponse({ success: false, message: resp?.message || "Start failed" });
-      return;
-    }
-
-    // Now poll for server to be fully ready (model_warm, not just model_loaded)
-    for (let i = 0; i < 60; i++) {
-      await new Promise(r => setTimeout(r, 1000));
-      const h = await fetchHealth(3000);
-      if (h?.model_warm) {
-        sendResponse({ success: true, message: `Server ready — ${h.model}`, model: h.model, voices: h.voices });
-        return;
-      }
-      if (h?.model_loaded && i > 30) {
-        // Model loaded but not warm after 30s — probably stuck
-        sendResponse({ success: true, message: `Server ready (warming) — ${h.model}`, model: h.model, voices: h.voices });
-        return;
-      }
-    }
-    sendResponse({ success: false, error: "Server started but model didn't warm up in 60s" });
-  } catch (e) {
-    sendResponse({ success: false, error: e.message });
-  }
-}
-
-async function handleStop(sendResponse) {
-  try {
-    const resp = await nativeMsg("stop");
-    sendResponse({ success: resp?.success ?? true, message: resp?.message });
-  } catch (e) { sendResponse({ success: false, error: e.message }); }
-}
-
-async function ensureServer() {
-  // Check if already running and warm
-  const h = await fetchHealth(3000);
-  if (h?.model_warm) return true;
-
-  // Try native messaging
-  try {
-    const resp = await nativeMsg("start");
-    if (resp?.success === false) return false;
-  } catch (e) { return false; }
-
-  // Poll for warm
-  for (let i = 0; i < 60; i++) {
-    await new Promise(r => setTimeout(r, 1000));
-    const h = await fetchHealth(2000);
-    if (h?.model_warm) return true;
-    if (h?.model_loaded && i > 30) return true; // accept loaded after 30s
-  }
-  return false;
-}
-
-async function handleTTS(req, sendResponse) {
-  try {
-    // Quick health check — wait for warm
-    const h = await fetchHealth(3000);
-    if (!h?.model_warm) {
-      // Try to start server
-      try { await nativeMsg("start"); } catch (e) { sendResponse({ success: false, error: "Server not running" }); return; }
-      // Wait for warm
-      for (let i = 0; i < 45; i++) {
-        await new Promise(r => setTimeout(r, 1000));
-        const h2 = await fetchHealth(2000);
-        if (h2?.model_warm) break;
-        if (i === 44) { sendResponse({ success: false, error: "Server not ready" }); return; }
-      }
-    }
-
-    const body = {
-      text: req.text, voice: req.voice, speed: req.speed,
-      language: req.language || "Auto", format: "wav",
-    };
-    if (req.model) body.model = req.model;
-
-    const r = await fetch(`${SERVER_URL}/v1/synthesize`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-      signal: AbortSignal.timeout(300000),
-    });
-    if (!r.ok) {
-      const err = await r.json().catch(() => ({}));
-      throw new Error(err?.detail || `Server error ${r.status}`);
-    }
-    const buf = await r.arrayBuffer();
-    const ct = r.headers.get("content-type") || "audio/wav";
-    const applyPlaybackRate = r.headers.get("X-TTS-Apply-Playback-Rate") === "true";
-    const playbackRate = parseFloat(r.headers.get("X-TTS-Playback-Rate") || "1.0");
-
-    const b64 = arrayBufferToBase64(buf);
-    sendResponse({
-      success: true,
-      audioData: `data:${ct};base64,${b64}`,
-      applyPlaybackRate,
-      playbackRate,
-    });
-  } catch (e) {
-    sendResponse({ success: false, error: e.message });
-  }
-}
-
-function arrayBufferToBase64(buf) {
-  const bytes = new Uint8Array(buf);
-  let bin = "";
-  for (let i = 0; i < bytes.length; i += 32768)
-    bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 32768));
-  return btoa(bin);
-}
