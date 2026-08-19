@@ -4,7 +4,30 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional, Tuple
 
+from .config import STREAMING_INTERVAL
 from .registry import FISH_VOICE_TAGS, MODEL_REGISTRY, normalize_lang
+
+
+def resolve_voice(model_id: str, voice: str, supported: List[str]) -> str:
+    """Pick a voice the model can actually speak.
+
+    The extension used to send the last global ``voice`` (often Kokoro's
+    af_bella) after switching to Qwen, which made generate fail and the
+    Speak button flash red with no audio.
+    """
+    if not supported:
+        return (voice or "").strip()
+    try:
+        return normalize_voice(voice, supported)
+    except Exception:
+        pass
+    default = MODEL_REGISTRY.get(model_id, {}).get("default_voice")
+    if default:
+        try:
+            return normalize_voice(default, supported)
+        except Exception:
+            pass
+    return supported[0]
 
 
 def normalize_voice(voice: str, supported: List[str]) -> str:
@@ -44,7 +67,7 @@ def build_gen_kwargs(
     language: str = "Auto",
     instruct: Optional[str] = None,
     stream: bool = False,
-    streaming_interval: float = 1.0,
+    streaming_interval: Optional[float] = None,
 ) -> Tuple[dict, str]:
     reg = MODEL_REGISTRY.get(model_id, {})
     kwargs: Dict[str, Any] = dict(text=text, verbose=False, max_tokens=4096)
@@ -55,7 +78,7 @@ def build_gen_kwargs(
         kwargs["speed"] = 1.0
 
     if reg.get("has_preset_voices"):
-        speaker = normalize_voice(voice, voices) if voices else voice
+        speaker = resolve_voice(model_id, voice, voices) if voices else voice
         kwargs["voice"] = speaker
         if reg.get("supports_lang_code"):
             kwargs["lang_code"] = normalize_lang(language)
@@ -69,7 +92,9 @@ def build_gen_kwargs(
 
     if stream and reg.get("supports_streaming", True):
         kwargs["stream"] = True
-        kwargs["streaming_interval"] = streaming_interval
+        kwargs["streaming_interval"] = (
+            STREAMING_INTERVAL if streaming_interval is None else float(streaming_interval)
+        )
 
     return kwargs, kwargs.get("lang_code", "auto")
 
@@ -112,6 +137,34 @@ def split_kokoro_chunks(text: str, max_chars: int = 400) -> List[str]:
             break
         # Pure-whitespace slices are skipped; they carry no phonemes.
     return parts
+
+
+def split_stream_text(text: str, first_max: int = 400, rest_max: int = 2000) -> List[str]:
+    """Split so the first generate() is small enough for early first audio.
+
+    Slices are exact substrings of the original input. A short first slice
+    keeps time-to-first-audio off an 8k-char generate() when the model
+    yields only once per call.
+    """
+    if not text:
+        return []
+    if len(text) <= first_max:
+        return [text]
+
+    head = split_kokoro_chunks(text, max_chars=first_max)
+    if not head:
+        return [text]
+    first = head[0]
+    if text.startswith(first):
+        remainder = text[len(first):]
+    else:
+        idx = text.find(first)
+        remainder = text[idx + len(first):] if idx >= 0 else ""
+    if not remainder:
+        return [first]
+    if len(remainder) <= rest_max:
+        return [first, remainder]
+    return [first, *split_kokoro_chunks(remainder, max_chars=rest_max)]
 
 
 def model_capabilities(model_id: str, voices: Optional[List[str]] = None) -> dict:

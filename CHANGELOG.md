@@ -1,5 +1,23 @@
 # Changelog
 
+## 3.3.0 — 2026-08-18
+
+### Added
+- Incremental streaming on `/v1/synthesize` (`stream: true`) and smaller first-slice generation
+- Pitch-preserving time-stretch for Qwen/Fish speed (no more cartoonish 1.5x/2x)
+- Per-model voice resolution so a leftover Kokoro voice cannot break Qwen
+
+### Fixed
+- First playable frame is emitted before the rest of the utterance finishes
+- Stream no longer waits 60s after the last frame before sending `done`
+- Offscreen Speak race (`Receiving end does not exist`) retried
+- Model switch aborted after 30s; load now waits up to 5 minutes
+- Short mid-stream grains no longer play at 1x when speed is 2x
+- Speak widget no longer shows chunk counters (`10/15`)
+
+### Changed
+- Version source of truth: 3.3.0 across manifest, server, UI
+
 ## 3.2.0 — 2026-07-14
 
 ### Added

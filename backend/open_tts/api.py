@@ -187,67 +187,7 @@ def register_routes(app: FastAPI) -> None:
         _health_cache["data"] = None
         return {"success": True, **result}
 
-    @app.post("/v1/synthesize")
-    async def synthesize(request: SynthesizeRequest):
-        t0 = time.perf_counter()
-        text = validate_text(request.text)
-        model_id = request.model or coordinator.model_id or DEFAULT_MODEL
-        if model_id not in MODEL_REGISTRY:
-            raise http_exception(404, ErrorCode.MODEL_NOT_FOUND, f"Unknown model: {model_id}")
-        fmt = parse_audio_format(request.format)
-
-        audio_bytes, mime, meta = await asyncio.to_thread(
-            coordinator.generate_full,
-            model_id,
-            text,
-            request.voice,
-            request.speed,
-            language=request.language,
-            instruct=request.instruct,
-            fmt=fmt,
-        )
-        gen_time = time.perf_counter() - t0
-        reg = MODEL_REGISTRY[model_id]
-        headers = {
-            "X-TTS-Model": model_id,
-            "X-TTS-Voice": request.voice,
-            "X-TTS-RTF": f"{meta.get('rtf', 0):.3f}",
-            "X-TTS-Gen-Time": f"{gen_time:.3f}",
-            "X-TTS-Speed": f"{request.speed}",
-            "X-TTS-Apply-Playback-Rate": "false" if reg.get("supports_native_speed") else "true",
-            "X-TTS-Playback-Rate": f"{request.speed}",
-        }
-        return Response(content=audio_bytes, media_type=mime, headers=headers)
-
-    @app.post("/v1/synthesize-batch")
-    async def synthesize_batch(request: BatchRequest):
-        t0 = time.perf_counter()
-        texts = validate_batch(request.texts)
-        model_id = request.model or coordinator.model_id or DEFAULT_MODEL
-        fmt = parse_audio_format(request.format)
-        results = await asyncio.to_thread(
-            coordinator.generate_batch,
-            model_id,
-            texts,
-            request.voice,
-            request.speed,
-            language=request.language,
-            instruct=request.instruct,
-            fmt=fmt,
-        )
-        return {
-            "results": results,
-            "model": model_id,
-            "total_time": round(time.perf_counter() - t0, 3),
-            "error_count": sum(1 for r in results if "error" in r),
-        }
-
-    @app.post("/v1/synthesize-stream-batch")
-    async def synthesize_stream_batch(request: StreamBatchRequest, req: Request):
-        texts = validate_batch(request.texts)
-        model_id = request.model or coordinator.model_id or DEFAULT_MODEL
-        if model_id not in MODEL_REGISTRY:
-            raise http_exception(404, ErrorCode.MODEL_NOT_FOUND, f"Unknown model: {model_id}")
+    def _framed_stream(req: Request, model_id: str, texts: List[str], request, extra_headers: dict):
         disconnected = False
 
         async def _response() -> AsyncGenerator[bytes, None]:
@@ -280,6 +220,7 @@ def register_routes(app: FastAPI) -> None:
                 except Exception as exc:
                     _offer(("error", exc))
                 finally:
+                    _offer(None)
                     done.set()
 
             threading.Thread(target=_worker, daemon=True).start()
@@ -331,13 +272,94 @@ def register_routes(app: FastAPI) -> None:
             media_type="application/octet-stream",
             headers={
                 "X-TTS-Model": model_id,
-                "X-TTS-Stream-Batch": "true",
                 "Cache-Control": "no-cache",
+                **extra_headers,
             },
         )
 
+    @app.post("/v1/synthesize")
+    async def synthesize(request: SynthesizeRequest, req: Request):
+        t0 = time.perf_counter()
+        text = validate_text(request.text)
+        model_id = request.model or coordinator.model_id or DEFAULT_MODEL
+        if model_id not in MODEL_REGISTRY:
+            raise http_exception(404, ErrorCode.MODEL_NOT_FOUND, f"Unknown model: {model_id}")
+        fmt = parse_audio_format(request.format)
+
+        if request.stream:
+            return _framed_stream(
+                req,
+                model_id,
+                [text],
+                request,
+                {
+                    "X-TTS-Voice": request.voice,
+                    "X-TTS-Stream": "true",
+                    "X-TTS-Speed": f"{request.speed}",
+                },
+            )
+
+        audio_bytes, mime, meta = await asyncio.to_thread(
+            coordinator.generate_full,
+            model_id,
+            text,
+            request.voice,
+            request.speed,
+            language=request.language,
+            instruct=request.instruct,
+            fmt=fmt,
+        )
+        gen_time = time.perf_counter() - t0
+        headers = {
+            "X-TTS-Model": model_id,
+            "X-TTS-Voice": request.voice,
+            "X-TTS-RTF": f"{meta.get('rtf', 0):.3f}",
+            "X-TTS-Gen-Time": f"{gen_time:.3f}",
+            "X-TTS-Speed": f"{request.speed}",
+            "X-TTS-Apply-Playback-Rate": "false",
+            "X-TTS-Playback-Rate": "1.0",
+        }
+        return Response(content=audio_bytes, media_type=mime, headers=headers)
+
+    @app.post("/v1/synthesize-batch")
+    async def synthesize_batch(request: BatchRequest):
+        t0 = time.perf_counter()
+        texts = validate_batch(request.texts)
+        model_id = request.model or coordinator.model_id or DEFAULT_MODEL
+        fmt = parse_audio_format(request.format)
+        results = await asyncio.to_thread(
+            coordinator.generate_batch,
+            model_id,
+            texts,
+            request.voice,
+            request.speed,
+            language=request.language,
+            instruct=request.instruct,
+            fmt=fmt,
+        )
+        return {
+            "results": results,
+            "model": model_id,
+            "total_time": round(time.perf_counter() - t0, 3),
+            "error_count": sum(1 for r in results if "error" in r),
+        }
+
+    @app.post("/v1/synthesize-stream-batch")
+    async def synthesize_stream_batch(request: StreamBatchRequest, req: Request):
+        texts = validate_batch(request.texts)
+        model_id = request.model or coordinator.model_id or DEFAULT_MODEL
+        if model_id not in MODEL_REGISTRY:
+            raise http_exception(404, ErrorCode.MODEL_NOT_FOUND, f"Unknown model: {model_id}")
+        return _framed_stream(
+            req,
+            model_id,
+            texts,
+            request,
+            {"X-TTS-Stream-Batch": "true"},
+        )
+
     @app.post("/v1/audio/speech")
-    async def openai_speech(request: SpeechRequest):
+    async def openai_speech(request: SpeechRequest, req: Request):
         fmt = parse_audio_format(request.response_format)
         synth = SynthesizeRequest(
             text=request.input,
@@ -348,8 +370,8 @@ def register_routes(app: FastAPI) -> None:
             model=request.model if request.model != "tts-1" else None,
             format=fmt.value,
         )
-        return await synthesize(synth)
+        return await synthesize(synth, req)
 
     @app.post("/v1/speech")
-    async def openai_speech_alt(request: SpeechRequest):
-        return await openai_speech(request)
+    async def openai_speech_alt(request: SpeechRequest, req: Request):
+        return await openai_speech(request, req)

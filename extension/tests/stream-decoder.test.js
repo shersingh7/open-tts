@@ -62,4 +62,30 @@ describe("stream frame decoder", () => {
     new DataView(bytes.buffer).setUint32(0, MAX_HEADER_BYTES + 1, true);
     expect(() => decoder.push(bytes)).toThrow(/header is too large/i);
   });
+
+  it("decodes a first audio frame then later frames and done in order", () => {
+    const { FrameDecoder } = decoderApi();
+    const decoder = new FrameDecoder();
+    const first = frame({ index: 0, sample_rate: 24000, final: false }, new Uint8Array([82, 73, 70, 70, 1, 2]));
+    const later = frame({ index: 0, sample_rate: 24000, final: false }, new Uint8Array([82, 73, 70, 70, 3, 4]));
+    const fin = frame({ index: 0, final: true });
+    const done = frame({ done: true });
+    const combined = new Uint8Array(first.length + later.length + fin.length + done.length);
+    let offset = 0;
+    for (const part of [first, later, fin, done]) {
+      combined.set(part, offset);
+      offset += part.length;
+    }
+    const out = decoder.push(combined);
+    decoder.finish();
+    expect(out.map((item) => item.header)).toEqual([
+      { index: 0, sample_rate: 24000, final: false },
+      { index: 0, sample_rate: 24000, final: false },
+      { index: 0, final: true },
+      { done: true },
+    ]);
+    expect([...out[0].audio]).toEqual([82, 73, 70, 70, 1, 2]);
+    expect([...out[1].audio]).toEqual([82, 73, 70, 70, 3, 4]);
+    expect(out[2].audio.length).toBe(0);
+  });
 });

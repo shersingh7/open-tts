@@ -13,9 +13,18 @@ from typing import Any, Callable, Dict, Generator, List, Optional, Tuple
 import numpy as np
 from fastapi import HTTPException
 
-from .adapters import build_gen_kwargs, get_model_voices, split_kokoro_chunks
-from .audio import encode_audio, encode_wav, to_f32
-from .config import BACKEND_DIR, DEFAULT_MODEL, GEN_TIMEOUT, WARMUP_TEXT, AudioFormat
+from .adapters import build_gen_kwargs, get_model_voices, split_kokoro_chunks, split_stream_text
+from .audio import encode_audio, encode_wav, time_stretch, to_f32
+from .config import (
+    BACKEND_DIR,
+    DEFAULT_MODEL,
+    GEN_TIMEOUT,
+    STREAM_FIRST_CHUNK_CHARS,
+    STREAM_REST_CHUNK_CHARS,
+    STREAMING_INTERVAL,
+    WARMUP_TEXT,
+    AudioFormat,
+)
 from .errors import ErrorCode, http_exception
 from .protocol import pack_frame
 from .registry import MODEL_REGISTRY
@@ -199,48 +208,80 @@ class ModelCoordinator:
 
     # ── Generation ───────────────────────────────────────────────────
 
-    def _generate_parts(self, model, gen_kwargs: dict, model_id: str) -> Tuple[np.ndarray, int, float]:
-        deadline = time.perf_counter() + GEN_TIMEOUT
-        parts: List[np.ndarray] = []
-        sr: Optional[int] = None
-        rtf = 0.0
+    def _iter_audio_results(
+        self,
+        model,
+        gen_kwargs: dict,
+        model_id: str,
+        *,
+        cancel_check: Optional[Callable[[], bool]] = None,
+        deadline: Optional[float] = None,
+    ) -> Generator[Tuple[np.ndarray, int, float], None, None]:
+        """Yield each generate() part as soon as it exists. Do not concatenate."""
+        stop_at = deadline if deadline is not None else time.perf_counter() + GEN_TIMEOUT
 
-        def _consume(kwargs: dict) -> None:
-            nonlocal sr, rtf
+        def _consume(kwargs: dict) -> Generator[Tuple[np.ndarray, int, float], None, None]:
             for result in model.generate(**kwargs):
-                if self._cancel.is_set():
+                if self._cancel.is_set() or (cancel_check and cancel_check()):
                     raise http_exception(499, ErrorCode.STREAM_CANCELLED, "Generation cancelled")
-                if time.perf_counter() > deadline:
+                if time.perf_counter() > stop_at:
                     raise http_exception(504, ErrorCode.GENERATION_TIMEOUT, f"Exceeded {GEN_TIMEOUT}s")
-                if sr is None:
-                    sr = result.sample_rate
-                    rtf = getattr(result, "real_time_factor", 0.0)
-                parts.append(to_f32(result.audio))
+                audio = to_f32(result.audio)
+                if audio.size == 0:
+                    continue
+                yield (
+                    audio,
+                    int(result.sample_rate),
+                    float(getattr(result, "real_time_factor", 0.0) or 0.0),
+                )
 
         try:
-            _consume(gen_kwargs)
+            yield from _consume(gen_kwargs)
         except HTTPException:
             raise
         except Exception as exc:
             if model_id == "kokoro" and "broadcast_shapes" in str(exc):
                 chunks = split_kokoro_chunks(gen_kwargs.get("text", ""))
                 if len(chunks) > 1:
-                    parts = []
-                    sr = None
                     for chunk in chunks:
-                        chunk_kwargs = {**gen_kwargs, "text": chunk}
-                        _consume(chunk_kwargs)
+                        yield from _consume({**gen_kwargs, "text": chunk})
                 else:
                     raise http_exception(500, ErrorCode.GENERATION_FAILED, str(exc))
             else:
                 raise http_exception(500, ErrorCode.GENERATION_FAILED, str(exc))
 
+    def _generate_parts(self, model, gen_kwargs: dict, model_id: str) -> Tuple[np.ndarray, int, float]:
+        parts: List[np.ndarray] = []
+        sr: Optional[int] = None
+        rtf = 0.0
+        for audio, part_sr, part_rtf in self._iter_audio_results(model, gen_kwargs, model_id):
+            if sr is None:
+                sr = part_sr
+                rtf = part_rtf
+            parts.append(audio)
+
         if not parts:
             raise http_exception(500, ErrorCode.GENERATION_FAILED, "No audio generated")
 
         audio = np.concatenate(parts) if len(parts) > 1 else parts[0]
-        del parts
         return audio, sr or 24000, rtf
+
+    def _apply_requested_speed(self, audio: np.ndarray, speed: float, sample_rate: int, *, native: bool) -> np.ndarray:
+        if native or audio.size == 0 or abs(float(speed) - 1.0) < 1e-3:
+            return audio
+        return time_stretch(audio, speed, sample_rate)
+
+    def _pack_audio_frame(self, idx: int, audio: np.ndarray, sr: int, speed: float, **extra) -> bytes:
+        wav = encode_wav(audio, sr)
+        return pack_frame({
+            "index": idx,
+            "sample_rate": sr,
+            "speed": speed,
+            "apply_playback_rate": False,
+            "playback_rate": 1.0,
+            "final": False,
+            **extra,
+        }, wav)
 
     def generate_full(
         self,
@@ -253,7 +294,7 @@ class ModelCoordinator:
         instruct: Optional[str] = None,
         fmt: AudioFormat = AudioFormat.WAV,
     ) -> Tuple[bytes, str, dict]:
-        acquired = self._operation_lock.acquire(timeout=30)
+        acquired = self._operation_lock.acquire(timeout=self._operation_lock_timeout)
         if not acquired:
             raise http_exception(503, ErrorCode.GPU_BUSY, "GPU busy")
 
@@ -269,6 +310,10 @@ class ModelCoordinator:
                 language=language, instruct=instruct,
             )
             audio, sr, rtf = self._generate_parts(self.model, gen_kwargs, model_id)
+            audio = self._apply_requested_speed(
+                audio, speed, sr,
+                native=MODEL_REGISTRY.get(model_id, {}).get("supports_native_speed", False),
+            )
             audio_bytes, mime = encode_audio(audio, sr, fmt)
             self.state = ModelState.READY
             meta = {"sample_rate": sr, "rtf": rtf, "model_id": model_id}
@@ -311,13 +356,16 @@ class ModelCoordinator:
                         language=language, instruct=instruct,
                     )
                     audio, sr, rtf = self._generate_parts(self.model, gen_kwargs, model_id)
+                    audio = self._apply_requested_speed(
+                        audio, speed, sr,
+                        native=MODEL_REGISTRY.get(model_id, {}).get("supports_native_speed", False),
+                    )
                     audio_bytes, _ = encode_audio(audio, sr, fmt)
                     results.append({
                         "index": idx,
                         "audio_base64": base64.b64encode(audio_bytes).decode(),
                         "rtf": rtf,
                     })
-                    gc.collect()
                 except HTTPException as exc:
                     detail = exc.detail if isinstance(exc.detail, dict) else {"message": str(exc.detail)}
                     results.append({"index": idx, "error": detail.get("message", str(exc.detail)), "code": detail.get("code")})
@@ -376,51 +424,69 @@ class ModelCoordinator:
                     yield pack_frame({"index": idx, "error": "cancelled", "code": ErrorCode.STREAM_CANCELLED.value})
                     return
 
-                gen_kwargs, _ = build_gen_kwargs(
-                    model_id, text, voice, speed, self.voices(model_id),
-                    language=language, instruct=instruct,
-                    stream=supports_stream,
-                )
-                if not supports_native:
-                    gen_kwargs["speed"] = 1.0
-
                 deadline = time.perf_counter() + GEN_TIMEOUT
+                slices = (
+                    split_stream_text(text, STREAM_FIRST_CHUNK_CHARS, STREAM_REST_CHUNK_CHARS)
+                    if supports_stream
+                    else [text]
+                )
 
                 try:
                     if supports_stream:
-                        for result in self.model.generate(**gen_kwargs):
-                            if cancel_check and cancel_check():
-                                self._cancel.set()
-                                return
-                            if time.perf_counter() > deadline:
-                                raise TimeoutError(f"Chunk {idx} exceeded {GEN_TIMEOUT}s")
-                            audio = to_f32(result.audio)
-                            wav = encode_wav(audio, result.sample_rate)
-                            hdr = {
-                                "index": idx,
-                                "sample_rate": result.sample_rate,
-                                "speed": speed,
-                                "apply_playback_rate": not supports_native,
-                                "playback_rate": speed,
-                                "final": False,
-                            }
-                            yield pack_frame(hdr, wav)
+                        for slice_text in slices:
+                            gen_kwargs, _ = build_gen_kwargs(
+                                model_id, slice_text, voice, speed, self.voices(model_id),
+                                language=language, instruct=instruct,
+                                stream=True,
+                                streaming_interval=STREAMING_INTERVAL,
+                            )
+                            if not supports_native:
+                                gen_kwargs["speed"] = 1.0
+                            pending: List[np.ndarray] = []
+                            pending_sr = 24000
+                            min_samples = 0
+                            for audio, sr, _rtf in self._iter_audio_results(
+                                self.model,
+                                gen_kwargs,
+                                model_id,
+                                cancel_check=cancel_check,
+                                deadline=deadline,
+                            ):
+                                pending.append(audio)
+                                pending_sr = sr
+                                if min_samples == 0:
+                                    min_samples = max(int(sr * 0.05), 64)
+                                if sum(part.size for part in pending) < min_samples:
+                                    continue
+                                merged = np.concatenate(pending) if len(pending) > 1 else pending[0]
+                                pending = []
+                                yield self._pack_audio_frame(
+                                    idx,
+                                    self._apply_requested_speed(merged, speed, pending_sr, native=supports_native),
+                                    pending_sr,
+                                    speed,
+                                )
+                            if pending:
+                                merged = np.concatenate(pending) if len(pending) > 1 else pending[0]
+                                yield self._pack_audio_frame(
+                                    idx,
+                                    self._apply_requested_speed(merged, speed, pending_sr, native=supports_native),
+                                    pending_sr,
+                                    speed,
+                                )
                     else:
-                        audio, sr, _ = self._generate_parts(self.model, {k: v for k, v in gen_kwargs.items() if k not in ("stream", "streaming_interval")}, model_id)
-                        wav = encode_wav(audio, sr)
-                        hdr = {
-                            "index": idx,
-                            "sample_rate": sr,
-                            "speed": speed,
-                            "apply_playback_rate": not supports_native,
-                            "playback_rate": speed,
-                            "final": False,
-                            "fallback": "non-streaming",
-                        }
-                        yield pack_frame(hdr, wav)
+                        gen_kwargs, _ = build_gen_kwargs(
+                            model_id, text, voice, speed, self.voices(model_id),
+                            language=language, instruct=instruct,
+                            stream=False,
+                        )
+                        if not supports_native:
+                            gen_kwargs["speed"] = 1.0
+                        audio, sr, _ = self._generate_parts(self.model, gen_kwargs, model_id)
+                        audio = self._apply_requested_speed(audio, speed, sr, native=supports_native)
+                        yield self._pack_audio_frame(idx, audio, sr, speed, fallback="non-streaming")
 
                     yield pack_frame({"index": idx, "final": True})
-                    gc.collect()
                 except HTTPException as exc:
                     detail = exc.detail if isinstance(exc.detail, dict) else {"message": str(exc.detail)}
                     yield pack_frame({

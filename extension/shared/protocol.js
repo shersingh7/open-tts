@@ -77,3 +77,37 @@ export function isStaleEvent(session, msg) {
   if (!session || !msg?.runId) return false;
   return msg.runId !== session.runId;
 }
+
+export function describeFetchError(err) {
+  const name = err && err.name;
+  const message = String(err && err.message ? err.message : err || "");
+  if (
+    name === "TimeoutError"
+    || name === "AbortError"
+    || /timed? ?out|signal timed out|signal is aborted|operation was aborted|The user aborted/i.test(message)
+  ) {
+    return "Request timed out";
+  }
+  return message || "Request failed";
+}
+
+export function isTransientDeliveryError(err) {
+  const message = String(err && err.message ? err.message : err || "");
+  return /Receiving end does not exist|message port closed|Could not establish connection/i.test(message);
+}
+
+export async function sendWithRetry(sendOnce, options = {}) {
+  const delays = options.delays || [0, 50, 100, 200, 400];
+  const retryIf = options.retryIf || isTransientDeliveryError;
+  let lastErr;
+  for (let i = 0; i < delays.length; i++) {
+    if (delays[i]) await new Promise((resolve) => setTimeout(resolve, delays[i]));
+    try {
+      return await sendOnce();
+    } catch (err) {
+      lastErr = err;
+      if (!retryIf(err)) throw err;
+    }
+  }
+  throw lastErr;
+}

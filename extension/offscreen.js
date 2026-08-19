@@ -1,6 +1,6 @@
-// Open TTS v3.2 — Offscreen synthesis + playback pipeline
+// Open TTS v3.3 — Offscreen synthesis + playback pipeline
 
-const { SERVER_URL, CHUNK_TARGET } = OpenTTSConstants;
+const { SERVER_URL, CHUNK_TARGET, FIRST_CHUNK_TARGET } = OpenTTSConstants;
 const { isStaleEvent, parseApiErrorBody } = OpenTTSProtocol;
 
 const MAX_TIMEOUT = 600000;
@@ -60,45 +60,8 @@ function emit(type, extra = {}) {
   }).catch(() => {});
 }
 
-function norm(t) {
-  return (t || "").replace(/[\u200B-\u200D\uFEFF]/g, "").replace(/\s+/g, " ").trim();
-}
-
-function splitText(text, max = CHUNK_TARGET) {
-  const clean = norm(text);
-  if (!clean) return [];
-  if (clean.length <= max) return [clean];
-  const out = [];
-  const flush = (c) => { if (c.trim()) out.push(c.trim()); };
-  for (const para of clean.split(/\n\n+/)) {
-    if (!para.trim()) continue;
-    if (para.length > max) {
-      for (const sent of para.split(/(?<=[.!?])\s+/)) {
-        if (!sent) continue;
-        if (sent.length > max) {
-          let buf = "";
-          for (const w of sent.split(" ")) {
-            if (!w) continue;
-            const next = buf ? `${buf} ${w}` : w;
-            if (next.length > max && buf) { flush(buf); buf = w; }
-            else buf = next;
-          }
-          if (buf) flush(buf);
-        } else {
-          const last = out[out.length - 1];
-          const cand = last ? `${last} ${sent}` : sent;
-          if (cand.length <= max) out[out.length - 1] = cand;
-          else out.push(sent);
-        }
-      }
-    } else {
-      const last = out[out.length - 1];
-      const cand = last ? `${last}\n\n${para}` : para;
-      if (cand.length <= max) out[out.length - 1] = cand;
-      else out.push(para);
-    }
-  }
-  return out;
+function splitText(text, max = CHUNK_TARGET, firstMax = FIRST_CHUNK_TARGET || 400) {
+  return OpenTTSPlayback.splitText(text, max, firstMax);
 }
 
 async function ensureServer() {
@@ -203,35 +166,33 @@ async function scheduleBuffer(buf, playbackRate = 1.0) {
 }
 
 async function doSpeak(text, settings) {
-  emit("TTS_STATUS", { label: "Preparing..." });
+  emit("TTS_STATUS", { label: OpenTTSPlayback.speakStatus("prepare") });
   const chunks = splitText(text, CHUNK_TARGET);
   if (!chunks.length) throw new Error("Nothing to read");
   if (!await ensureServer()) throw new Error("Server not running");
 
-  emit("TTS_STATUS", { label: `Generating ${chunks.length} chunk(s)...` });
-  let decoded = 0;
-  let started = false;
+  emit("TTS_STATUS", { label: OpenTTSPlayback.speakStatus("generate") });
+  const result = await OpenTTSPlayback.consumePlaybackStream(
+    streamBatch(chunks, settings, abortCtl?.signal),
+    {
+      schedule: async (frame) => {
+        const audioBuf = await decodeWav(frame.audio);
+        const rate = frame.applyPlaybackRate ? (frame.playbackRate || 1.0) : 1.0;
+        await scheduleBuffer(audioBuf, rate);
+      },
+      onStatus: () => {
+        emit("TTS_STATUS", { label: OpenTTSPlayback.speakStatus("read") });
+      },
+    },
+  );
 
-  for await (const frame of streamBatch(chunks, settings, abortCtl?.signal)) {
-    if (frame.error) throw Object.assign(new Error(frame.error), { code: frame.code });
-    if (!frame.audio) continue;
-    const audioBuf = await decodeWav(frame.audio);
-    decoded++;
-    if (!started) {
-      started = true;
-      emit("TTS_STATUS", { label: chunks.length > 1 ? `Reading 1/${chunks.length}...` : "Reading..." });
-    }
-    const rate = frame.applyPlaybackRate ? (frame.playbackRate || 1.0) : 1.0;
-    await scheduleBuffer(audioBuf, rate);
-  }
-
-  if (!decoded) throw new Error("No playable audio generated");
+  if (!result.decoded) throw new Error("No playable audio generated");
   generationComplete = true;
   maybeFinish(session?.runId);
 }
 
 async function doSpeakFallback(text, settings) {
-  emit("TTS_STATUS", { label: "Retrying without stream..." });
+  emit("TTS_STATUS", { label: OpenTTSPlayback.speakStatus("retry") });
   const chunks = splitText(text, CHUNK_TARGET);
   if (!chunks.length) throw new Error("Nothing to read");
   if (!await ensureServer()) throw new Error("Server not running");
@@ -263,10 +224,8 @@ async function doSpeakFallback(text, settings) {
   const results = batch.results || [];
   if (!results.length) throw new Error("No audio returned");
 
-  const modelId = settings.model || "kokoro";
-  const modelInfo = await getModelInfo(modelId);
-  const applyRate = modelInfo && !modelInfo.supports_native_speed;
-  const rate = applyRate ? (Number(settings.speed) || 1.5) : 1.0;
+  // Speed is applied server-side (native or time-stretch). Do not also
+  // change playbackRate here — that raises pitch and makes Qwen cartoonish.
 
   let started = false;
   for (let i = 0; i < results.length; i++) {
@@ -277,30 +236,14 @@ async function doSpeakFallback(text, settings) {
     if (decoded) {
       if (!started) {
         started = true;
-        emit("TTS_STATUS", { label: results.length > 1 ? `Reading 1/${results.length}...` : "Reading..." });
+        emit("TTS_STATUS", { label: OpenTTSPlayback.speakStatus("read") });
       }
-      await scheduleBuffer(decoded, rate);
+      await scheduleBuffer(decoded, 1.0);
     }
   }
   if (!started) throw new Error("No playable audio");
   generationComplete = true;
   maybeFinish(session?.runId);
-}
-
-async function getModelInfo(modelId) {
-  try {
-    const headers = await getAuthHeaders();
-    delete headers["Content-Type"];
-    const r = await fetch(`${SERVER_URL}/v1/models`, {
-      headers,
-      signal: AbortSignal.timeout(5000),
-    });
-    if (!r.ok) return null;
-    const d = await r.json();
-    return d.models?.find((m) => m.id === modelId);
-  } catch {
-    return null;
-  }
 }
 
 async function decodeChunk(b64) {

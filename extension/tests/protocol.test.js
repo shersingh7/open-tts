@@ -86,4 +86,44 @@ describe("API error envelope parsing", () => {
     const r = protocol.parseApiErrorBody(null, 500);
     expect(r.message).toBe("Server error 500");
   });
+
+  it("maps abort/timeout signal errors to a readable timeout", () => {
+    expect(protocol.describeFetchError({ name: "AbortError", message: "signal is aborted without reason" })).toBe("Request timed out");
+    expect(protocol.describeFetchError({ name: "TimeoutError", message: "signal timed out" })).toBe("Request timed out");
+    expect(protocol.describeFetchError({ name: "TypeError", message: "Failed to fetch" })).toBe("Failed to fetch");
+  });
+});
+
+describe("offscreen delivery retry", () => {
+  let protocol;
+  beforeAll(() => {
+    const g = {};
+    new Function("globalThis", readFileSync(join(sharedDir, "protocol-umd.js"), "utf8"))(g);
+    protocol = g.OpenTTSProtocol;
+  });
+
+  it("retries receiving-end-does-not-exist then succeeds", async () => {
+    let calls = 0;
+    const result = await protocol.sendWithRetry(
+      async () => {
+        calls += 1;
+        if (calls < 3) throw new Error("Could not establish connection. Receiving end does not exist.");
+        return { success: true, started: true };
+      },
+      { delays: [0, 0, 0, 0] },
+    );
+    expect(calls).toBe(3);
+    expect(result.started).toBe(true);
+  });
+
+  it("does not retry a non-delivery error", async () => {
+    let calls = 0;
+    await expect(
+      protocol.sendWithRetry(async () => {
+        calls += 1;
+        throw new Error("Offscreen unavailable");
+      }, { delays: [0, 0, 0] }),
+    ).rejects.toThrow(/Offscreen unavailable/);
+    expect(calls).toBe(1);
+  });
 });

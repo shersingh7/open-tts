@@ -1,4 +1,4 @@
-// Open TTS v3.2 — Content Script
+// Open TTS v3.3 — Content Script
 
 let widget = null;
 let clientId = `c_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
@@ -157,9 +157,8 @@ async function onClick(e) {
     const settings = await new Promise((resolve) => {
       chrome.storage.sync.get(["voice", "speed", "language", "model", "voicePrefs", "instruct", "fishStyle"], (data) => {
         const model = data.model || "kokoro";
-        const voicePrefs = data.voicePrefs || {};
         resolve({
-          voice: model === "fish-s2-pro" ? (data.fishStyle || "whisper") : (voicePrefs[model] || data.voice || "af_bella"),
+          voice: OpenTTSConstants.resolveVoice(model, data),
           speed: Number(data.speed) || 1.5,
           language: data.language || "Auto",
           model,
@@ -212,7 +211,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     return true;
   }
   if (msg.type === "TTS_PROGRESS") {
-    setBusy(true, `Playing ${msg.played || 0}/${msg.scheduled || "?"}`);
+    setBusy(true, "Reading...");
     sendResponse({ ok: true });
     return true;
   }

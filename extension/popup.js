@@ -1,4 +1,4 @@
-/* Open TTS v3.2 — Popup */
+/* Open TTS v3.3 — Popup */
 
 const $ = (id) => document.getElementById(id);
 const modelSelect = $("model");
@@ -294,7 +294,7 @@ async function handleStop() {
 }
 
 function getPreferredVoice(modelId) {
-  return voicePrefs[modelId] || cachedModels?.data?.models?.find((m) => m.id === modelId)?.default_voice || DEFAULTS.voice;
+  return OpenTTSConstants.resolveVoice(modelId, { voicePrefs });
 }
 
 async function loadModels() {
@@ -373,7 +373,7 @@ function updateModelMeta(modelId) {
     modelMeta.textContent = "Local MLX model";
     return;
   }
-  const speedNote = m.supports_native_speed ? "Speed at synthesis" : "Speed via playback";
+  const speedNote = m.supports_native_speed ? "Speed at synthesis" : "Speed via time-stretch";
   const streamNote = m.supports_streaming ? "Streaming" : "Batch fallback";
   modelMeta.textContent = `${m.description || m.name} — ${speedNote}, ${streamNote}`;
 }
@@ -396,18 +396,23 @@ async function handleModelChange() {
   try {
     const resp = unwrap(await msg({ type: "LOAD_MODEL", modelId }));
     if (resp.ok) {
-      await syncSet({ model: modelId });
       const refreshed = unwrap(await msg({ type: "GET_MODELS" }));
       if (refreshed.ok) cachedModels = refreshed;
       await loadVoices(modelId);
+      const selectedVoice = voiceSelect.value;
+      if (selectedVoice && !voiceSelect.options[voiceSelect.selectedIndex]?.disabled) {
+        voicePrefs[modelId] = selectedVoice;
+      }
+      await syncSet({ model: modelId, voicePrefs, voice: voicePrefs[modelId] || selectedVoice });
       updateModelMeta(modelId);
       updateModelSpecificUI(modelId);
       setServerUI("running", `Connected — ${modelId}`);
     } else {
-      setServerUI("stopped", resp.error || "Switch failed");
-      showError(resp.error || "Switch failed");
+      setServerUI("running", "Connected");
+      showError(resp.error || "Couldn't switch models");
     }
   } catch (e) {
+    setServerUI("running", "Connected");
     showError(e.message);
   }
 }
@@ -431,9 +436,11 @@ async function handleSpeak() {
     const settings = await syncGet(["voice", "speed", "language", "model", "voicePrefs", "instruct", "fishStyle"]);
     voicePrefs = settings.voicePrefs || {};
     const modelId = settings.model || modelSelect.value || DEFAULTS.model;
-    const voice = modelId === "fish-s2-pro"
-      ? (settings.fishStyle || fishStyleSelect.value || "whisper")
-      : (voiceSelect.value || voicePrefs[modelId] || DEFAULTS.voice);
+    const voice = OpenTTSConstants.resolveVoice(modelId, {
+      voicePrefs,
+      voice: voiceSelect.value || settings.voice,
+      fishStyle: settings.fishStyle || fishStyleSelect.value,
+    });
 
     const speakResult = unwrap(await msg({
       type: "SPEAK",
@@ -575,7 +582,7 @@ function wireEvents() {
       const state = label === "Paused" ? "paused" : (/Reading|Playing/.test(label) ? "playing" : "generating");
       setPlaybackUI(state, label);
     }
-    if (msg.type === "TTS_PROGRESS") setPlaybackUI("playing", `Playing ${msg.played || 0}/${msg.scheduled || "?"}`);
+    if (msg.type === "TTS_PROGRESS") setPlaybackUI("playing", "Reading...");
     if (msg.type === "TTS_DONE") {
       const completedHistory = pendingHistory;
       pendingHistory = null;

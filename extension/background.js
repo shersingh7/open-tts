@@ -1,12 +1,12 @@
-// Open TTS v3.2 — Background Service Worker (routing + lifecycle only)
+// Open TTS v3.3 — Background Service Worker (routing + lifecycle only)
 importScripts(
   "shared/constants-umd.js",
   "shared/protocol-umd.js",
   "shared/storage-umd.js",
 );
 
-const { SERVER_URL, NATIVE_HOST } = OpenTTSConstants;
-const { unwrap, ok, fail, playbackContext, parseApiErrorBody } = OpenTTSProtocol;
+const { SERVER_URL, NATIVE_HOST, LOAD_MODEL_TIMEOUT_MS } = OpenTTSConstants;
+const { unwrap, ok, fail, playbackContext, parseApiErrorBody, sendWithRetry, describeFetchError } = OpenTTSProtocol;
 const { getAuthHeaders, storeInstallToken } = OpenTTSStorage;
 
 let activeSession = null;
@@ -30,7 +30,7 @@ async function ensureOffscreen() {
 
 async function sendToOffscreen(payload) {
   if (!await ensureOffscreen()) throw new Error("Offscreen unavailable");
-  return new Promise((resolve, reject) => {
+  return sendWithRetry(() => new Promise((resolve, reject) => {
     chrome.runtime.sendMessage({ ...payload, _fromBackground: true }, (resp) => {
       if (chrome.runtime.lastError) {
         reject(new Error(chrome.runtime.lastError.message));
@@ -38,7 +38,7 @@ async function sendToOffscreen(payload) {
       }
       resolve(resp);
     });
-  });
+  }));
 }
 
 function nativeMsg(command) {
@@ -89,7 +89,12 @@ async function apiFetch(path, options = {}) {
       signal: options.signal || AbortSignal.timeout(options.timeout || 30000),
     });
   };
-  let r = await execute();
+  let r;
+  try {
+    r = await execute();
+  } catch (err) {
+    throw Object.assign(new Error(describeFetchError(err)), { cause: err });
+  }
   if (r.status === 401) {
     try {
       const status = await nativeMsg("status");
@@ -222,9 +227,19 @@ chrome.runtime.onMessage.addListener((req, sender, sendResponse) => {
   }
 
   if (type === "LOAD_MODEL") {
-    apiFetch(`/v1/load-model?model_id=${encodeURIComponent(req.modelId || "kokoro")}`, { method: "POST" })
+    apiFetch(`/v1/load-model?model_id=${encodeURIComponent(req.modelId || "kokoro")}`, {
+      method: "POST",
+      timeout: LOAD_MODEL_TIMEOUT_MS || 300000,
+    })
       .then((r) => r.json()).then((data) => sendResponse(ok(data)))
-      .catch((e) => sendResponse(fail(e.message, e.code)));
+      .catch((e) => {
+        const message = describeFetchError(e);
+        if (message === "Request timed out") {
+          sendResponse(fail("Model load timed out. Larger models can take a few minutes — try again.", "timeout"));
+          return;
+        }
+        sendResponse(fail(message, e.code));
+      });
     return true;
   }
 
