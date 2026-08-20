@@ -32,6 +32,7 @@ class FakeModel:
         self.stream_supported = model_id != "fish-s2-pro"
         self.stream_parts = 3
         self.part_lengths = None
+        self.part_signals = None
         self.part_delay = 0.0
         self.part_gate: threading.Event | None = None
         self.hold_generate: threading.Event | None = None
@@ -68,11 +69,14 @@ class FakeModel:
                     self.part_gate.wait(timeout=15)
                 if self.part_delay:
                     time.sleep(self.part_delay)
-            n_samp = 2400
-            if self.part_lengths:
-                n_samp = int(self.part_lengths[min(i, len(self.part_lengths) - 1)])
-            audio = np.zeros(max(n_samp, 1), dtype=np.float32)
-            audio[0] = float(i + 1)
+            if self.part_signals is not None:
+                audio = np.asarray(self.part_signals[min(i, len(self.part_signals) - 1)], dtype=np.float32)
+            else:
+                n_samp = 2400
+                if self.part_lengths:
+                    n_samp = int(self.part_lengths[min(i, len(self.part_lengths) - 1)])
+                audio = np.zeros(max(n_samp, 1), dtype=np.float32)
+                audio[0] = float(i + 1)
             self.parts_yielded += 1
             yield FakeResult(audio=audio, is_final_chunk=(i == n - 1))
 

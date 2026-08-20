@@ -3,6 +3,7 @@ from __future__ import annotations
 import threading
 import time
 
+import numpy as np
 import pytest
 from fastapi import HTTPException
 
@@ -136,15 +137,14 @@ def test_batch_restores_ready_after_generation(fake_loader):
 
 
 def test_stream_batch_emits_first_frame_before_later_parts(fake_loader):
-    """Drive the shipped coordinator: first audio frame arrives before part 2 is yielded."""
+    """First playable frame is emitted before the remaining grains finish."""
     from open_tts.protocol import unpack_frames
 
     coord = ModelCoordinator()
     coord.load("kokoro")
     model = fake_loader["kokoro"]
-    gate = threading.Event()
-    model.part_gate = gate
-    model.stream_parts = 3
+    model.stream_parts = 20
+    model.part_lengths = [2400] * 20
 
     first_audio = None
     later_at_first = None
@@ -155,14 +155,13 @@ def test_stream_batch_emits_first_frame_before_later_parts(fake_loader):
             if audio and first_audio is None:
                 first_audio = audio
                 later_at_first = model.parts_yielded
-                gate.set()
             if header.get("final"):
                 seen_final = True
 
     assert first_audio, "expected an audio-bearing frame"
     assert first_audio[:4] == b"RIFF"
-    assert later_at_first == 1, f"later parts already produced at first frame: {later_at_first}"
-    assert model.parts_yielded == 3
+    assert later_at_first < 20, f"first frame waited for all grains: {later_at_first}"
+    assert model.parts_yielded == 20
     assert seen_final
 
 
@@ -215,6 +214,103 @@ def test_qwen_stream_does_not_ask_client_to_shift_pitch(fake_loader):
     assert audio_headers
     assert all(h.get("apply_playback_rate") is False for h in audio_headers)
     assert all(float(h.get("playback_rate") or 1.0) == 1.0 for h in audio_headers)
+
+
+def _stream_pcm_parts(coord, model_id, text, voice, speed):
+    import io
+
+    import soundfile as sf
+
+    from open_tts.protocol import unpack_frames
+
+    pcm = []
+    sample_rate = None
+    for raw in coord.stream_batch_frames(model_id, [text], voice, speed):
+        frames, _ = unpack_frames(raw)
+        for header, audio in frames:
+            if not audio:
+                continue
+            data, sr = sf.read(io.BytesIO(audio))
+            sample_rate = sr
+            pcm.append(np.asarray(data, dtype=np.float32).reshape(-1))
+    joined = np.concatenate(pcm) if pcm else np.zeros(0, dtype=np.float32)
+    return joined, pcm, sample_rate
+
+
+def _stream_pcm(coord, model_id, text, voice, speed):
+    joined, _parts, sr = _stream_pcm_parts(coord, model_id, text, voice, speed)
+    return joined, sr
+
+
+def test_stream_short_grains_do_not_cut_off_at_joins(fake_loader):
+    coord = ModelCoordinator()
+    coord.load("qwen3-tts")
+    model = fake_loader["qwen3-tts"]
+    n_grains = 48
+    grain = np.full(800, 0.45, dtype=np.float32)
+    model.stream_parts = n_grains
+    model.part_signals = [grain.copy() for _ in range(n_grains)]
+    joined, parts, _ = _stream_pcm_parts(coord, "qwen3-tts", "Word word word word.", "ryan", 2.0)
+    assert joined.size > 0
+    interior = joined[400 : max(401, joined.size - 400)]
+    zeros = np.abs(interior) < 0.05
+    longest = 0
+    run = 0
+    for z in zeros:
+        if z:
+            run += 1
+            longest = max(longest, run)
+        else:
+            run = 0
+    assert longest < 80, f"join hole of {longest} near-silent samples"
+    if len(parts) > 1:
+        jumps = []
+        pos = 0
+        for part in parts[:-1]:
+            pos += part.size
+            if 0 < pos < joined.size:
+                jumps.append(abs(float(joined[pos]) - float(joined[pos - 1])))
+        assert jumps
+        assert max(jumps) < 0.15, f"join click {max(jumps):.3f}"
+
+
+def test_stream_emits_held_tail_when_last_grain_shorter_than_xfade(fake_loader):
+    from open_tts.config import STREAM_PHRASE_SECONDS, STREAM_XFADE_SECONDS
+
+    coord = ModelCoordinator()
+    coord.load("kokoro")
+    model = fake_loader["kokoro"]
+    sr = 24000
+    phrase = max(int(sr * STREAM_PHRASE_SECONDS), 64)
+    short = max(8, int(sr * STREAM_XFADE_SECONDS) // 4)
+    assert short < int(sr * STREAM_XFADE_SECONDS)
+    model.stream_parts = 2
+    model.part_signals = [
+        np.linspace(0.1, 0.9, phrase, dtype=np.float32),
+        np.linspace(0.2, 0.35, short, dtype=np.float32),
+    ]
+    joined, _ = _stream_pcm(coord, "kokoro", "Tail must not vanish.", "af_bella", 1.0)
+    overlap = short
+    expected = phrase + short - overlap
+    assert joined.size > 0
+    assert abs(joined.size - expected) <= 8, f"got {joined.size} expected ~{expected} (discarded tail)"
+    assert float(np.max(np.abs(np.diff(joined)))) < 0.15
+
+
+def test_stream_duration_scales_with_speed(fake_loader):
+    coord = ModelCoordinator()
+    coord.load("qwen3-tts")
+    model = fake_loader["qwen3-tts"]
+    n_grains = 12
+    grain = np.full(800, 0.3, dtype=np.float32)
+    model.stream_parts = n_grains
+    model.part_signals = [grain.copy() for _ in range(n_grains)]
+    slow, _ = _stream_pcm(coord, "qwen3-tts", "Scale this utterance.", "ryan", 1.0)
+    model.parts_yielded = 0
+    model.part_signals = [grain.copy() for _ in range(n_grains)]
+    fast, _ = _stream_pcm(coord, "qwen3-tts", "Scale this utterance.", "ryan", 2.0)
+    assert slow.size > 0 and fast.size > 0
+    assert fast.size < slow.size * 0.7
 
 
 def test_qwen_stream_speeds_up_short_middle_grains(fake_loader):

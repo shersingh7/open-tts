@@ -70,6 +70,52 @@ describe("playback consume loop", () => {
   });
 });
 
+describe("offscreen uses the abutting clock", () => {
+  it("schedules through createPlaybackClock rather than re-applying lead", () => {
+    const src = readFileSync(join(root, "..", "offscreen.js"), "utf8");
+    expect(src).toMatch(/createPlaybackClock/);
+    expect(src).toMatch(/playClock\.schedule\(/);
+    expect(src).not.toMatch(/Math\.max\(nextStartTime,\s*ctx\.currentTime\s*\+\s*AUDIO_LEAD\)/);
+  });
+});
+
+describe("playback gate", () => {
+  it("does not resume a suspended context while paused", () => {
+    const { createPlaybackGate } = playbackApi();
+    const gate = createPlaybackGate();
+    expect(gate.shouldResumeContext("suspended")).toBe(true);
+    gate.pause();
+    expect(gate.isPaused()).toBe(true);
+    expect(gate.shouldResumeContext("suspended")).toBe(false);
+    expect(gate.canStart("suspended")).toBe(true);
+    gate.resume();
+    expect(gate.shouldResumeContext("suspended")).toBe(true);
+  });
+});
+
+describe("offscreen honors the pause gate", () => {
+  it("will not auto-resume AudioContext on the next scheduled buffer", () => {
+    const src = readFileSync(join(root, "..", "offscreen.js"), "utf8");
+    expect(src).toMatch(/createPlaybackGate/);
+    expect(src).toMatch(/playGate\.shouldResumeContext/);
+    expect(src).not.toMatch(/if \(ctx\.state === "suspended"\) await ctx\.resume\(\);/);
+  });
+});
+
+describe("playback clock", () => {
+  it("applies lead only before the first buffer; later buffers abut", () => {
+    const { createPlaybackClock } = playbackApi();
+    const clock = createPlaybackClock(0.05);
+    const first = clock.schedule(0.4, 1.0);
+    const second = clock.schedule(0.3, 9.0);
+    const third = clock.schedule(0.2, 99.0);
+    expect(first).toBeCloseTo(1.05, 5);
+    expect(second).toBeCloseTo(first + 0.4, 5);
+    expect(third).toBeCloseTo(second + 0.3, 5);
+    expect(second).toBeLessThan(9.0);
+  });
+});
+
 describe("speak status labels", () => {
   it("never shows chunk counters", () => {
     const { speakStatus } = playbackApi();

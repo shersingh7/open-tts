@@ -1,7 +1,7 @@
 export const SERVER_URL = "http://127.0.0.1:8000";
 export const NATIVE_HOST = "com.open_tts.native_host";
-export const CHUNK_TARGET = 2000;
-export const FIRST_CHUNK_TARGET = 400;
+export const CHUNK_TARGET = 4000;
+export const FIRST_CHUNK_TARGET = 4000;
 export const MAX_HISTORY = 20;
 export const MAX_CHARS = 200000;
 export const LOAD_MODEL_TIMEOUT_MS = 300000;

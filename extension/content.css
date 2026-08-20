@@ -15,10 +15,10 @@
   gap: 8px;
   padding: 6px 14px 6px 8px;
   border-radius: 12px;
-  background: #1a1a22;
-  border: 1px solid #33333f;
-  box-shadow: 0 4px 20px rgba(0, 0, 0, 0.4), 0 0 0 1px rgba(108, 92, 231, 0.08);
-  color: #e4e4ec;
+  background: #121410;
+  border: 1px solid #2a2c26;
+  box-shadow: 0 4px 20px rgba(0, 0, 0, 0.4), 0 0 0 1px rgba(255, 92, 20, 0.12);
+  color: #e8e2d4;
   font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Inter", sans-serif;
   font-size: 13px;
   font-weight: 600;
@@ -36,7 +36,7 @@
 
 #open-tts-button {
   border: none;
-  background: rgba(108, 92, 231, 0.12);
+  background: rgba(255, 92, 20, 0.14);
   width: 40px;
   height: 40px;
   min-width: 40px;
@@ -50,14 +50,14 @@
 }
 
 #open-tts-button:hover {
-  background: rgba(108, 92, 231, 0.25);
-  box-shadow: 0 0 12px rgba(108, 92, 231, 0.25);
+  background: rgba(255, 92, 20, 0.28);
+  box-shadow: 0 0 12px rgba(255, 92, 20, 0.3);
 }
 
 #open-tts-button svg {
   width: 14px;
   height: 14px;
-  color: #6c5ce7;
+  color: #ff5c14;
 }
 
 #open-tts-label {
@@ -69,7 +69,7 @@
 
 /* Busy */
 #open-tts-widget.busy {
-  box-shadow: 0 4px 20px rgba(0, 0, 0, 0.4), 0 0 0 1px rgba(108, 92, 231, 0.2);
+  box-shadow: 0 4px 20px rgba(0, 0, 0, 0.4), 0 0 0 1px rgba(255, 92, 20, 0.28);
 }
 
 #open-tts-stop {

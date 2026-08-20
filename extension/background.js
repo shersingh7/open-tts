@@ -1,4 +1,4 @@
-// Open TTS v3.3 — Background Service Worker (routing + lifecycle only)
+// Open TTS v3.4 — Background Service Worker (routing + lifecycle only)
 importScripts(
   "shared/constants-umd.js",
   "shared/protocol-umd.js",

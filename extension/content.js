@@ -1,4 +1,4 @@
-// Open TTS v3.3 — Content Script
+// Open TTS v3.4 — Content Script
 
 let widget = null;
 let clientId = `c_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;

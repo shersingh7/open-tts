@@ -3,12 +3,12 @@
 from __future__ import annotations
 
 import io
-from typing import Tuple
+from typing import List, Optional, Tuple
 
 import numpy as np
 import soundfile as sf
 
-from .config import AudioFormat
+from .config import STREAM_PHRASE_SECONDS, STREAM_XFADE_SECONDS, AudioFormat
 from .errors import ErrorCode, http_exception
 
 
@@ -94,12 +94,91 @@ def time_stretch(audio: np.ndarray, speed: float, sample_rate: int = 24000) -> n
 
     nz = weight > 1e-6
     out[nz] /= weight[nz]
-    expected = max(1, int(round(x.size / rate)))
-    if out.size > expected:
-        return out[:expected]
-    if out.size < expected:
-        return np.pad(out, (0, expected - out.size))
+    used = np.flatnonzero(weight > 1e-6)
+    if used.size:
+        return out[int(used[0]) : int(used[-1]) + 1]
     return out
+
+
+class PhraseStreamPacker:
+    """Accumulate 1x PCM to a phrase, apply speed once, crossfade joins.
+
+    Independent WSOLA on word-sized grains fades every edge to silence.
+    This packer is the single stretch/join path the stream coordinator uses.
+    """
+
+    def __init__(
+        self,
+        *,
+        speed: float,
+        native: bool,
+        phrase_seconds: float = STREAM_PHRASE_SECONDS,
+        xfade_seconds: float = STREAM_XFADE_SECONDS,
+    ):
+        self.speed = float(speed)
+        self.native = bool(native)
+        self.phrase_seconds = float(phrase_seconds)
+        self.xfade_seconds = float(xfade_seconds)
+        self._parts: List[np.ndarray] = []
+        self._sr = 24000
+        self._tail: Optional[np.ndarray] = None
+
+    def _min_samples(self) -> int:
+        return max(int(self._sr * self.phrase_seconds), 64)
+
+    def _speed(self, audio: np.ndarray) -> np.ndarray:
+        if self.native or audio.size == 0 or abs(self.speed - 1.0) < 1e-3:
+            return audio
+        return time_stretch(audio, self.speed, self._sr)
+
+    def _crossfade(self, audio: np.ndarray, *, final: bool) -> Optional[np.ndarray]:
+        n = max(1, int(round(self._sr * self.xfade_seconds)))
+        if self._tail is None:
+            if final or audio.size <= n:
+                return audio
+            self._tail = audio[-n:].copy()
+            return audio[:-n]
+        xfade = min(n, self._tail.size, audio.size)
+        t = np.linspace(0.0, 1.0, xfade, dtype=np.float32)
+        fade_out = np.cos(t * np.pi / 2.0)
+        fade_in = np.sin(t * np.pi / 2.0)
+        prefix = self._tail[:-xfade] if xfade < self._tail.size else self._tail[:0]
+        overlap = self._tail[-xfade:]
+        mixed = overlap * fade_out + audio[:xfade] * fade_in
+        rest_audio = audio[xfade:]
+        pieces = []
+        if prefix.size:
+            pieces.append(prefix)
+        pieces.append(mixed)
+        if rest_audio.size:
+            pieces.append(rest_audio)
+        body = np.concatenate(pieces) if len(pieces) > 1 else pieces[0]
+        self._tail = None
+        if final or body.size <= n:
+            return body
+        self._tail = body[-n:].copy()
+        return body[:-n]
+
+    def push(self, audio: np.ndarray, sample_rate: int) -> Optional[np.ndarray]:
+        chunk = to_f32(audio).reshape(-1)
+        if chunk.size == 0:
+            return None
+        self._sr = int(sample_rate) or 24000
+        self._parts.append(chunk)
+        if sum(part.size for part in self._parts) < self._min_samples():
+            return None
+        return self.flush(final=False)
+
+    def flush(self, final: bool = True) -> Optional[np.ndarray]:
+        if self._parts:
+            merged = np.concatenate(self._parts) if len(self._parts) > 1 else self._parts[0]
+            self._parts = []
+            stretched = self._speed(merged)
+            return self._crossfade(stretched, final=final)
+        if final and self._tail is not None:
+            tail, self._tail = self._tail, None
+            return tail
+        return None
 
 
 def encode_audio(audio: np.ndarray, sample_rate: int, fmt: AudioFormat) -> Tuple[bytes, str]:

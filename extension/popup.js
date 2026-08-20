@@ -1,4 +1,4 @@
-/* Open TTS v3.3 — Popup */
+/* Open TTS v3.4 — Popup */
 
 const $ = (id) => document.getElementById(id);
 const modelSelect = $("model");
@@ -77,6 +77,10 @@ function hideError() {
 
 function setServerUI(state, message) {
   statusText.textContent = message;
+  const chassis = document.getElementById("app");
+  if (chassis) {
+    chassis.dataset.state = ({ running: "ready", stopped: "unavailable", loading: "waiting" }[state] || "unavailable");
+  }
   if (state === "running") {
     setDot("online");
     startBtn.disabled = true;
@@ -100,7 +104,7 @@ function setPlaybackUI(state, label) {
   playbackState = state;
   progressEl.textContent = label || "";
   speakBtn.disabled = state === "generating";
-  pauseBtn.disabled = !["playing", "paused"].includes(state);
+  pauseBtn.disabled = !["playing", "paused", "generating"].includes(state);
   stopBtnPlayback.disabled = state === "idle";
   pauseBtn.textContent = state === "paused" ? "Resume" : "Pause";
 }
@@ -482,10 +486,18 @@ async function handleSpeak() {
 async function handlePauseResume() {
   if (!activeRun?.runId) return;
   if (playbackState === "paused") {
-    await msg({ type: "RESUME", clientId, runId: activeRun?.runId });
+    const r = unwrap(await msg({ type: "RESUME", clientId, runId: activeRun.runId }));
+    if (!r.ok) {
+      showError(r.error || "Could not resume");
+      return;
+    }
     setPlaybackUI("playing", "Reading...");
-  } else if (playbackState === "playing") {
-    await msg({ type: "PAUSE", clientId, runId: activeRun?.runId });
+  } else if (playbackState === "playing" || playbackState === "generating") {
+    const r = unwrap(await msg({ type: "PAUSE", clientId, runId: activeRun.runId }));
+    if (!r.ok) {
+      showError(r.error || "Could not pause");
+      return;
+    }
     setPlaybackUI("paused", "Paused");
   }
 }
@@ -579,10 +591,13 @@ function wireEvents() {
     if (activeRun?.runId && msg.runId && msg.runId !== activeRun.runId) return;
     if (msg.type === "TTS_STATUS") {
       const label = msg.label || "Generating...";
+      if (playbackState === "paused" && label !== "Paused") return;
       const state = label === "Paused" ? "paused" : (/Reading|Playing/.test(label) ? "playing" : "generating");
       setPlaybackUI(state, label);
     }
-    if (msg.type === "TTS_PROGRESS") setPlaybackUI("playing", "Reading...");
+    if (msg.type === "TTS_PROGRESS") {
+      if (playbackState !== "paused") setPlaybackUI("playing", "Reading...");
+    }
     if (msg.type === "TTS_DONE") {
       const completedHistory = pendingHistory;
       pendingHistory = null;

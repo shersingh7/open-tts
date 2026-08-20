@@ -41,8 +41,8 @@
   root.OpenTTSConstants = {
     SERVER_URL: "http://127.0.0.1:8000",
     NATIVE_HOST: "com.open_tts.native_host",
-    CHUNK_TARGET: 2000,
-    FIRST_CHUNK_TARGET: 400,
+    CHUNK_TARGET: 4000,
+    FIRST_CHUNK_TARGET: 4000,
     MAX_HISTORY: 20,
     MAX_CHARS: 200000,
     LOAD_MODEL_TIMEOUT_MS: 300000,

@@ -1,4 +1,4 @@
-// Open TTS v3.3 — Offscreen synthesis + playback pipeline
+// Open TTS v3.4 — Offscreen synthesis + playback pipeline
 
 const { SERVER_URL, CHUNK_TARGET, FIRST_CHUNK_TARGET } = OpenTTSConstants;
 const { isStaleEvent, parseApiErrorBody } = OpenTTSProtocol;
@@ -15,6 +15,8 @@ let generationComplete = false;
 let abortCtl = null;
 let session = null;
 let sessionToken = "";
+let playClock = OpenTTSPlayback.createPlaybackClock(AUDIO_LEAD);
+let playGate = OpenTTSPlayback.createPlaybackGate();
 
 function getAuthHeaders() {
   const headers = { "Content-Type": "application/json" };
@@ -41,6 +43,8 @@ function resetPlayback(keepContext = true) {
   endedCount = 0;
   generationComplete = false;
   nextStartTime = 0;
+  playClock = OpenTTSPlayback.createPlaybackClock(AUDIO_LEAD);
+  playGate = OpenTTSPlayback.createPlaybackGate();
   if (!keepContext && audioCtx) {
     audioCtx.close().catch(() => {});
     audioCtx = null;
@@ -143,15 +147,15 @@ function maybeFinish(runId) {
 
 async function scheduleBuffer(buf, playbackRate = 1.0) {
   const ctx = getAudioCtx();
-  if (ctx.state === "suspended") await ctx.resume();
-  if (ctx.state !== "running") throw new Error("Audio playback is blocked by Chrome");
-  const startAt = Math.max(nextStartTime, ctx.currentTime + AUDIO_LEAD);
+  if (playGate.shouldResumeContext(ctx.state)) await ctx.resume();
+  if (!playGate.canStart(ctx.state)) throw new Error("Audio playback is blocked by Chrome");
+  const startAt = playClock.schedule(buf.duration / playbackRate, ctx.currentTime);
+  nextStartTime = startAt + (buf.duration / playbackRate);
   const src = ctx.createBufferSource();
   src.buffer = buf;
   src.playbackRate.value = playbackRate;
   src.connect(ctx.destination);
   src.start(startAt);
-  nextStartTime = startAt + (buf.duration / playbackRate);
   activeSources.add(src);
   scheduledCount++;
   const sourceRunId = session?.runId;
@@ -181,7 +185,9 @@ async function doSpeak(text, settings) {
         await scheduleBuffer(audioBuf, rate);
       },
       onStatus: () => {
-        emit("TTS_STATUS", { label: OpenTTSPlayback.speakStatus("read") });
+        if (!playGate.isPaused()) {
+          emit("TTS_STATUS", { label: OpenTTSPlayback.speakStatus("read") });
+        }
       },
     },
   );
@@ -327,11 +333,14 @@ chrome.runtime.onMessage.addListener((req, _sender, sendResponse) => {
       sendResponse({ success: true, ignored: true });
       return true;
     }
-    if (audioCtx?.state === "running") {
-      audioCtx.suspend();
-      emit("TTS_STATUS", { label: "Paused" });
-    }
-    sendResponse({ success: true, paused: true });
+    playGate.pause();
+    const ctx = audioCtx;
+    Promise.resolve(ctx && ctx.state === "running" ? ctx.suspend() : null)
+      .then(() => {
+        emit("TTS_STATUS", { label: "Paused" });
+        sendResponse({ success: true, paused: true });
+      })
+      .catch((err) => sendResponse({ success: false, error: err.message }));
     return true;
   }
 
@@ -340,11 +349,14 @@ chrome.runtime.onMessage.addListener((req, _sender, sendResponse) => {
       sendResponse({ success: true, ignored: true });
       return true;
     }
-    if (audioCtx?.state === "suspended") {
-      audioCtx.resume();
-      emit("TTS_STATUS", { label: "Reading..." });
-    }
-    sendResponse({ success: true, resumed: true });
+    playGate.resume();
+    const ctx = audioCtx;
+    Promise.resolve(ctx && ctx.state === "suspended" ? ctx.resume() : null)
+      .then(() => {
+        emit("TTS_STATUS", { label: "Reading..." });
+        sendResponse({ success: true, resumed: true });
+      })
+      .catch((err) => sendResponse({ success: false, error: err.message }));
     return true;
   }
 

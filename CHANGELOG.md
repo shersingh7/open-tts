@@ -1,5 +1,19 @@
 # Changelog
 
+## 3.4.0 — 2026-08-20
+
+### Added
+- Signal Chassis popup (warm bone, near-black LCD, signal orange) matching Volume Booster Pro
+- Sentence-safe generate units and ~1.2s phrase packing so pace/timbre stay stable
+
+### Fixed
+- Pause immediately resumed itself: the next stream buffer called `AudioContext.resume()`
+- Crossfade leftover tail mixed against the start of the held phrase (join click)
+- Mid-sentence 1x crumbs and join holes on long utterances
+
+### Changed
+- Version source of truth: 3.4.0 across manifest, server, UI
+
 ## 3.3.0 — 2026-08-18
 
 ### Added

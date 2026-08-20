@@ -39,7 +39,7 @@
     return out;
   }
 
-  function splitText(text, max = 2000, firstMax = 400) {
+  function splitText(text, max = 4000, firstMax = 4000) {
     const clean = norm(text);
     if (!clean) return [];
     const pieces = splitWithMax(clean, max);
@@ -77,6 +77,41 @@
     return { decoded, cancelled: false };
   }
 
+  function createPlaybackGate() {
+    let paused = false;
+    return {
+      isPaused() { return paused; },
+      pause() { paused = true; },
+      resume() { paused = false; },
+      reset() { paused = false; },
+      shouldResumeContext(state) {
+        return !paused && state === "suspended";
+      },
+      canStart(state) {
+        if (state === "closed") return false;
+        if (paused) return state === "suspended" || state === "running";
+        return state === "running";
+      },
+    };
+  }
+
+  function createPlaybackClock(lead = 0.05) {
+    let nextStart = 0;
+    let started = false;
+    return {
+      schedule(duration, currentTime) {
+        const startAt = started ? nextStart : (currentTime + lead);
+        started = true;
+        nextStart = startAt + duration;
+        return startAt;
+      },
+      reset() {
+        nextStart = 0;
+        started = false;
+      },
+    };
+  }
+
   function speakStatus(phase) {
     if (phase === "prepare") return "Preparing...";
     if (phase === "generate") return "Generating...";
@@ -84,5 +119,12 @@
     return "Reading...";
   }
 
-  root.OpenTTSPlayback = { splitText, consumePlaybackStream, speakStatus, norm };
+  root.OpenTTSPlayback = {
+    splitText,
+    consumePlaybackStream,
+    createPlaybackClock,
+    createPlaybackGate,
+    speakStatus,
+    norm,
+  };
 })(typeof globalThis !== "undefined" ? globalThis : self);

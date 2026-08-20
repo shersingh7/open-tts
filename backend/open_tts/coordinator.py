@@ -14,7 +14,7 @@ import numpy as np
 from fastapi import HTTPException
 
 from .adapters import build_gen_kwargs, get_model_voices, split_kokoro_chunks, split_stream_text
-from .audio import encode_audio, encode_wav, time_stretch, to_f32
+from .audio import PhraseStreamPacker, encode_audio, encode_wav, time_stretch, to_f32
 from .config import (
     BACKEND_DIR,
     DEFAULT_MODEL,
@@ -433,6 +433,8 @@ class ModelCoordinator:
 
                 try:
                     if supports_stream:
+                        packer = PhraseStreamPacker(speed=speed, native=supports_native)
+                        packer_sr = 24000
                         for slice_text in slices:
                             gen_kwargs, _ = build_gen_kwargs(
                                 model_id, slice_text, voice, speed, self.voices(model_id),
@@ -442,9 +444,6 @@ class ModelCoordinator:
                             )
                             if not supports_native:
                                 gen_kwargs["speed"] = 1.0
-                            pending: List[np.ndarray] = []
-                            pending_sr = 24000
-                            min_samples = 0
                             for audio, sr, _rtf in self._iter_audio_results(
                                 self.model,
                                 gen_kwargs,
@@ -452,28 +451,13 @@ class ModelCoordinator:
                                 cancel_check=cancel_check,
                                 deadline=deadline,
                             ):
-                                pending.append(audio)
-                                pending_sr = sr
-                                if min_samples == 0:
-                                    min_samples = max(int(sr * 0.05), 64)
-                                if sum(part.size for part in pending) < min_samples:
-                                    continue
-                                merged = np.concatenate(pending) if len(pending) > 1 else pending[0]
-                                pending = []
-                                yield self._pack_audio_frame(
-                                    idx,
-                                    self._apply_requested_speed(merged, speed, pending_sr, native=supports_native),
-                                    pending_sr,
-                                    speed,
-                                )
-                            if pending:
-                                merged = np.concatenate(pending) if len(pending) > 1 else pending[0]
-                                yield self._pack_audio_frame(
-                                    idx,
-                                    self._apply_requested_speed(merged, speed, pending_sr, native=supports_native),
-                                    pending_sr,
-                                    speed,
-                                )
+                                packer_sr = sr
+                                emitted = packer.push(audio, sr)
+                                if emitted is not None:
+                                    yield self._pack_audio_frame(idx, emitted, packer_sr, speed)
+                        leftover = packer.flush(final=True)
+                        if leftover is not None:
+                            yield self._pack_audio_frame(idx, leftover, packer_sr, speed)
                     else:
                         gen_kwargs, _ = build_gen_kwargs(
                             model_id, text, voice, speed, self.voices(model_id),

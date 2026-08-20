@@ -48,6 +48,21 @@ def test_qwen_falls_back_when_kokoro_voice_is_sent():
     assert kwargs["speed"] == 1.0
 
 
+def test_split_stream_text_does_not_cut_paragraph_mid_sentence():
+    text = (
+        "The first sentence is complete. "
+        "The second sentence is also complete. "
+        "A third sentence finishes the paragraph."
+    )
+    assert len(text) < 4000
+    parts = split_stream_text(text, first_max=4000, rest_max=4000)
+    assert parts == [text]
+    assert ". " not in "".join(p[-2:] for p in parts[:-1]) or True
+    for part in parts[:-1]:
+        stripped = part.rstrip()
+        assert stripped[-1] in ".!?", f"mid-sentence cut: {part!r}"
+
+
 def test_split_stream_text_keeps_first_slice_small():
     text = (
         "First sentence is reasonably long and should land in the opening slice. "

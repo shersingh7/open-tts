@@ -139,32 +139,71 @@ def split_kokoro_chunks(text: str, max_chars: int = 400) -> List[str]:
     return parts
 
 
-def split_stream_text(text: str, first_max: int = 400, rest_max: int = 2000) -> List[str]:
-    """Split so the first generate() is small enough for early first audio.
+def _sentence_units(text: str) -> List[str]:
+    """Exact sentence-sized substrings of the original input."""
+    if not text:
+        return []
+    units: List[str] = []
+    start = 0
+    i = 0
+    n = len(text)
+    while i < n:
+        ch = text[i]
+        if ch in ".!?" and (i + 1 >= n or text[i + 1].isspace() or text[i + 1] in "\"'”’)"):
+            j = i + 1
+            while j < n and text[j].isspace():
+                j += 1
+            units.append(text[start:j])
+            start = j
+            i = j
+            continue
+        i += 1
+    if start < n:
+        units.append(text[start:])
+    return units
 
-    Slices are exact substrings of the original input. A short first slice
-    keeps time-to-first-audio off an 8k-char generate() when the model
-    yields only once per call.
+
+def split_stream_text(text: str, first_max: int = 4000, rest_max: int = 4000) -> List[str]:
+    """Pack whole sentences into generate units.
+
+    A paragraph below the unit cap stays one slice so timbre/pace do not
+    reset mid-sentence. A single sentence longer than the cap is the only
+    case that hard-splits.
     """
     if not text:
         return []
-    if len(text) <= first_max:
+    sentences = _sentence_units(text)
+    if not sentences:
+        return [text]
+    if len(text) <= first_max and all(len(s) <= first_max for s in sentences):
         return [text]
 
-    head = split_kokoro_chunks(text, max_chars=first_max)
-    if not head:
-        return [text]
-    first = head[0]
-    if text.startswith(first):
-        remainder = text[len(first):]
-    else:
-        idx = text.find(first)
-        remainder = text[idx + len(first):] if idx >= 0 else ""
-    if not remainder:
-        return [first]
-    if len(remainder) <= rest_max:
-        return [first, remainder]
-    return [first, *split_kokoro_chunks(remainder, max_chars=rest_max)]
+    out: List[str] = []
+    buf = ""
+    for sent in sentences:
+        limit = first_max if not out else rest_max
+        if not buf:
+            if len(sent) <= limit:
+                buf = sent
+            else:
+                hard = split_kokoro_chunks(sent, max_chars=limit)
+                if len(hard) > 1:
+                    out.extend(hard[:-1])
+                buf = hard[-1] if hard else ""
+            continue
+        if len(buf) + len(sent) <= limit:
+            buf += sent
+        else:
+            out.append(buf)
+            if len(sent) <= rest_max:
+                buf = sent
+            else:
+                hard = split_kokoro_chunks(sent, max_chars=rest_max)
+                out.extend(hard[:-1])
+                buf = hard[-1] if hard else ""
+    if buf:
+        out.append(buf)
+    return out
 
 
 def model_capabilities(model_id: str, voices: Optional[List[str]] = None) -> dict:

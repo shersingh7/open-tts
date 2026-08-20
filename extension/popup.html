@@ -7,16 +7,22 @@
   <link rel="stylesheet" href="popup.css" />
 </head>
 <body>
-  <div class="app">
-    <header class="header">
-      <div class="logo" aria-hidden="true">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
-          <path d="M3 12h2l3-9 4 18 3-12 2 6h4"/>
-        </svg>
+  <div class="chassis" id="app" data-state="loading">
+    <div class="chassis-texture" aria-hidden="true"></div>
+
+    <header class="rack-header">
+      <div class="brand-block">
+        <span class="brand-mark" aria-hidden="true">TTS</span>
+        <div class="brand-lines">
+          <span class="brand-name">OPEN TTS</span>
+          <span class="brand-sub">LOCAL · MLX</span>
+        </div>
       </div>
-      <div>
-        <h1>Open TTS</h1>
-        <div class="subtitle">Local MLX speech synthesis</div>
+      <div class="led-status" role="status" aria-live="polite">
+        <span class="led-cluster" aria-hidden="true">
+          <span class="dot offline" id="statusDot" aria-label="Server offline"></span>
+        </span>
+        <span class="led-label" id="statusText">Checking server...</span>
       </div>
     </header>
 
@@ -25,118 +31,129 @@
       <button type="button" class="icon-btn" id="copyDiagnostics" aria-label="Copy diagnostics">Copy</button>
     </div>
 
-    <section class="status-card" aria-label="Server connection">
-      <div class="status-bar">
-        <div class="dot offline" id="statusDot" aria-label="Server offline"></div>
-        <span class="status-text" id="statusText">Checking server...</span>
-      </div>
-      <div class="status-actions">
-        <button class="server-btn" id="startBtn" type="button">Start</button>
-        <button class="server-btn danger" id="stopBtn" type="button" disabled>Stop</button>
-      </div>
-      <p class="hint">Install native host if Start fails. Run <code>backend/install_native_host.sh --extension-id YOUR_ID</code></p>
-    </section>
+    <main class="rack-main">
+      <section class="module" aria-label="Server connection">
+        <div class="module-label-row">
+          <h2 class="module-label">ENGINE</h2>
+          <span class="module-label-aux" aria-hidden="true">HOST</span>
+        </div>
+        <div class="status-actions">
+          <button class="server-btn" id="startBtn" type="button">Start</button>
+          <button class="server-btn danger" id="stopBtn" type="button" disabled>Stop</button>
+        </div>
+        <p class="hint">Install native host if Start fails. Run <code>backend/install_native_host.sh --extension-id YOUR_ID</code></p>
+      </section>
 
-    <section class="panel" aria-label="Configuration">
-      <div class="panel-label">Configuration</div>
+      <section class="module" aria-label="Configuration">
+        <div class="module-label-row">
+          <h2 class="module-label">CONFIGURATION</h2>
+          <span class="module-label-aux" aria-hidden="true">VOICE</span>
+        </div>
 
-      <div class="field">
-        <label class="field-label" for="model">Model</label>
-        <select id="model" class="select" disabled>
-          <option disabled selected>Loading...</option>
-        </select>
-        <div class="model-meta" id="modelMeta">—</div>
-      </div>
-
-      <div class="field">
-        <label class="field-label" for="voice">Voice</label>
-        <select id="voice" class="select" disabled>
-          <option disabled selected>Select model first</option>
-        </select>
-      </div>
-
-      <div class="field" id="fishStyleWrap" hidden>
-        <label class="field-label" for="fishStyle">Fish style tag</label>
-        <select id="fishStyle" class="select">
-          <option value="whisper">Whisper</option>
-          <option value="excited">Excited</option>
-          <option value="sad">Sad</option>
-          <option value="angry">Angry</option>
-          <option value="professional broadcast tone">Professional broadcast</option>
-        </select>
-      </div>
-
-      <div class="field" id="instructWrap" hidden>
-        <label class="field-label" for="instruct">Instruction</label>
-        <input id="instruct" class="input" type="text" placeholder="Optional style instruction" />
-      </div>
-
-      <div class="field-row">
         <div class="field">
-          <label class="field-label" for="language">Language</label>
-          <select id="language" class="select">
-            <option value="Auto">Auto-detect</option>
-            <option value="en">English</option>
-            <option value="zh">Chinese</option>
-            <option value="ja">Japanese</option>
-            <option value="ko">Korean</option>
+          <label class="field-label" for="model">Model</label>
+          <select id="model" class="select" disabled>
+            <option disabled selected>Loading...</option>
+          </select>
+          <div class="model-meta" id="modelMeta">—</div>
+        </div>
+
+        <div class="field">
+          <label class="field-label" for="voice">Voice</label>
+          <select id="voice" class="select" disabled>
+            <option disabled selected>Select model first</option>
           </select>
         </div>
-        <div class="field">
-          <label class="field-label" for="speed">Speed</label>
-          <div class="slider-wrap">
-            <input type="range" id="speed" class="slider" min="0.5" max="3" step="0.1" value="1.5" aria-valuemin="0.5" aria-valuemax="3" />
-            <span class="slider-value" id="speedValue">1.5x</span>
+
+        <div class="field" id="fishStyleWrap" hidden>
+          <label class="field-label" for="fishStyle">Fish style tag</label>
+          <select id="fishStyle" class="select">
+            <option value="whisper">Whisper</option>
+            <option value="excited">Excited</option>
+            <option value="sad">Sad</option>
+            <option value="angry">Angry</option>
+            <option value="professional broadcast tone">Professional broadcast</option>
+          </select>
+        </div>
+
+        <div class="field" id="instructWrap" hidden>
+          <label class="field-label" for="instruct">Instruction</label>
+          <input id="instruct" class="input" type="text" placeholder="Optional style instruction" />
+        </div>
+
+        <div class="field-row">
+          <div class="field">
+            <label class="field-label" for="language">Language</label>
+            <select id="language" class="select">
+              <option value="Auto">Auto-detect</option>
+              <option value="en">English</option>
+              <option value="zh">Chinese</option>
+              <option value="ja">Japanese</option>
+              <option value="ko">Korean</option>
+            </select>
+          </div>
+          <div class="field">
+            <label class="field-label" for="speed">Speed</label>
+            <div class="slider-wrap">
+              <input type="range" id="speed" class="slider" min="0.5" max="3" step="0.1" value="1.5" aria-valuemin="0.5" aria-valuemax="3" />
+              <span class="slider-value" id="speedValue">1.5x</span>
+            </div>
           </div>
         </div>
-      </div>
-    </section>
+      </section>
 
-    <section class="panel" aria-label="Synthesis">
-      <div class="panel-label">
-        <span>Synthesis</span>
-        <span class="char-count" id="charCount">0 chars</span>
-      </div>
+      <section class="module" aria-label="Synthesis">
+        <div class="module-label-row">
+          <h2 class="module-label">SYNTHESIS</h2>
+          <span class="char-count" id="charCount">0 chars</span>
+        </div>
 
-      <div class="textarea-wrap">
-        <textarea id="previewText" rows="3" placeholder="Enter text to synthesize..." aria-label="Preview text"></textarea>
-        <button class="copy-btn" id="copyBtn" type="button" title="Copy" aria-label="Copy text">
-          <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
-        </button>
-      </div>
+        <div class="textarea-wrap">
+          <textarea id="previewText" rows="3" placeholder="Enter text to synthesize..." aria-label="Preview text"></textarea>
+          <button class="copy-btn" id="copyBtn" type="button" title="Copy" aria-label="Copy text">
+            <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
+          </button>
+        </div>
 
-      <div class="playback-controls">
-        <button id="speakBtn" class="btn btn-primary" type="button">Speak</button>
-        <button id="pauseBtn" class="btn btn-secondary" type="button" disabled>Pause</button>
-        <button id="stopPlaybackBtn" class="btn btn-secondary" type="button" disabled>Stop</button>
-      </div>
+        <div class="playback-controls">
+          <button id="speakBtn" class="btn btn-primary" type="button">Speak</button>
+          <button id="pauseBtn" class="btn btn-secondary" type="button" disabled>Pause</button>
+          <button id="stopPlaybackBtn" class="btn btn-secondary" type="button" disabled>Stop</button>
+        </div>
 
-      <div class="progress" id="progress" aria-live="polite">Ready</div>
-    </section>
+        <div class="lcd-bezel">
+          <div class="lcd-screen">
+            <div class="lcd-toprow">
+              <span class="lcd-tag">PLAYBACK</span>
+              <span class="lcd-band" id="version">v3.4.0</span>
+            </div>
+            <div class="progress" id="progress" aria-live="polite">Ready</div>
+          </div>
+        </div>
+      </section>
 
-    <section class="panel history-panel collapsed" id="historyPanel" aria-label="Local history">
-      <div class="panel-label history-toggle" id="historyToggle" role="button" tabindex="0" aria-expanded="false">
-        <span>History <span class="privacy-label">(local only)</span></span>
-        <span class="history-meta">
-          <span class="mono" id="historyCount">0</span>
-          <span class="chevron">▼</span>
-        </span>
-      </div>
-      <div class="history-list" id="historyList" role="list">
-        <div class="history-empty">No history yet</div>
-      </div>
-      <div class="history-footer">
-        <label class="history-enable"><input id="historyEnabled" type="checkbox" checked /> Save history</label>
-        <button class="icon-btn" id="clearHistory" type="button">Clear all</button>
-      </div>
-    </section>
+      <section class="module history-panel collapsed" id="historyPanel" aria-label="Local history">
+        <div class="module-label-row history-toggle" id="historyToggle" role="button" tabindex="0" aria-expanded="false">
+          <h2 class="module-label">HISTORY <span class="privacy-label">(local only)</span></h2>
+          <span class="history-meta">
+            <span class="mono" id="historyCount">0</span>
+            <span class="chevron">▼</span>
+          </span>
+        </div>
+        <div class="history-list" id="historyList" role="list">
+          <div class="history-empty">No history yet</div>
+        </div>
+        <div class="history-footer">
+          <label class="history-enable"><input id="historyEnabled" type="checkbox" checked /> Save history</label>
+          <button class="icon-btn" id="clearHistory" type="button">Clear all</button>
+        </div>
+      </section>
+    </main>
 
-    <footer class="footer">
+    <footer class="rack-footer">
       <span id="genCount">GEN: 000</span>
       <span class="sep">|</span>
       <span id="latency">LAT: --</span>
-      <span class="sep">|</span>
-      <span id="version">v3.3.0</span>
     </footer>
   </div>
 
