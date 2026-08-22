@@ -29,6 +29,12 @@ export const MODEL_VOICES = {
   ],
 };
 
+export function resolveSpeed(value, fallback = DEFAULTS.speed) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.min(3, Math.max(0.5, n));
+}
+
 export function resolveVoice(model, settings = {}) {
   const modelId = model || DEFAULTS.model;
   if (modelId === "fish-s2-pro") {

@@ -23,6 +23,12 @@
     ],
   };
 
+  function resolveSpeed(value, fallback) {
+    const n = Number(value);
+    if (!Number.isFinite(n)) return fallback == null ? DEFAULTS.speed : fallback;
+    return Math.min(3, Math.max(0.5, n));
+  }
+
   function resolveVoice(model, settings) {
     settings = settings || {};
     const modelId = model || DEFAULTS.model;
@@ -49,6 +55,7 @@
     DEFAULTS,
     MODEL_DEFAULT_VOICES,
     MODEL_VOICES,
+    resolveSpeed,
     resolveVoice,
   };
 })(typeof globalThis !== "undefined" ? globalThis : self);

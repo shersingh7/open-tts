@@ -1,5 +1,15 @@
 # Changelog
 
+## 3.4.1 — 2026-08-22
+
+### Fixed
+- 3x (and other high speeds) paused between phrases: pack size now scales so each frame is ~1.2s of playback
+- Time-stretch output length is `N/speed` (2.5x/3x track the slider)
+- Phrase joins carry 1x overlap and mix at the end of the held tail
+
+### Changed
+- Version 3.4.1
+
 ## 3.4.0 — 2026-08-20
 
 ### Added

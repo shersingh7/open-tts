@@ -27,76 +27,66 @@ def encode_wav(audio: np.ndarray, sample_rate: int) -> bytes:
 def time_stretch(audio: np.ndarray, speed: float, sample_rate: int = 24000) -> np.ndarray:
     """Change duration by ``speed`` without changing pitch (WSOLA).
 
-    ``playbackRate`` in Web Audio speeds *and* raises pitch, which makes
-    Qwen/Fish voices cartoonish at 1.5x–2x. This keeps formants in place.
-
-    Short stream grains used to return identity (1x). Window size now shrinks
-    so every non-unity request still changes duration.
+    Output length is ``round(N / speed)`` so 2.5x is ~1/2.5 of 1x. First and
+    last windows are not faded to silence, which was causing sentence clicks.
     """
     x = to_f32(audio).reshape(-1)
     rate = float(speed)
     if x.size < 2 or abs(rate - 1.0) < 1e-3:
         return x
     rate = min(max(rate, 0.5), 3.0)
+    expected = max(1, int(round(x.size / rate)))
+    if expected == x.size:
+        return x.copy()
 
-    win = int(round(sample_rate * 0.02)) or 16
+    win = int(round(sample_rate * 0.02)) or 32
     if win % 2:
         win += 1
-    max_win = max(8, x.size // 2)
-    if max_win % 2:
-        max_win -= 1
+    max_win = max(8, (min(x.size, expected) // 2) & ~1)
     win = min(win, max(8, max_win))
     if win % 2:
         win += 1
-    if x.size < win:
-        pad = np.pad(x, (0, win - x.size))
-        stretched = time_stretch(pad, rate, sample_rate)
-        expected = max(1, int(round(x.size / rate)))
-        return stretched[:expected]
+    if x.size < win or expected < win:
+        idx = np.linspace(0, x.size - 1, expected)
+        return np.interp(idx, np.arange(x.size, dtype=np.float64), x).astype(np.float32)
 
     hop_out = max(1, win // 2)
-    hop_in = max(1, int(round(hop_out * rate)))
-    search = max(hop_in // 2, 4)
-    window = np.hanning(win).astype(np.float32)
+    n_win = max(2, int(round((expected - win) / hop_out)) + 1)
+    hann = np.hanning(win).astype(np.float32)
+    out = np.zeros(expected, dtype=np.float32)
+    weight = np.zeros(expected, dtype=np.float32)
+    max_in = max(0, x.size - win)
+    search = max(hop_out // 2, 4)
+    prev = None
 
-    n_frames = 1 + max(0, (x.size - win) // hop_in)
-    out = np.zeros(hop_out * n_frames + win, dtype=np.float32)
-    weight = np.zeros_like(out)
-
-    write = 0
-    read = 0
-    prev = x[:win]
-    out[:win] += prev * window
-    weight[:win] += window
-    write += hop_out
-    read += hop_in
-
-    for _ in range(1, n_frames):
-        target = prev[hop_out:]
-        lo = max(0, read - search)
-        hi = min(x.size - win, read + search)
-        if hi < lo:
-            break
-        region = x[lo : hi + hop_out]
-        if region.size < target.size:
-            best = min(max(read, 0), max(0, x.size - win))
-        else:
-            corr = np.correlate(region, target, mode="valid")
-            best = lo + int(np.argmax(corr))
-        frame = x[best : best + win]
+    for i in range(n_win):
+        frac = i / (n_win - 1)
+        in_pos = int(round(frac * max_in))
+        write = min(int(round(frac * (expected - win))), expected - win)
+        if prev is not None:
+            target = prev[hop_out:]
+            lo = max(0, in_pos - search)
+            hi = min(max_in, in_pos + search)
+            if hi >= lo and target.size:
+                region = x[lo : hi + target.size]
+                if region.size >= target.size:
+                    corr = np.correlate(region, target, mode="valid")
+                    in_pos = lo + int(np.argmax(corr))
+        frame = x[in_pos : in_pos + win]
         if frame.size < win:
             frame = np.pad(frame, (0, win - frame.size))
-        out[write : write + win] += frame * window
-        weight[write : write + win] += window
+        w = hann.copy()
+        if i == 0:
+            w[:hop_out] = 1.0
+        if i == n_win - 1:
+            w[hop_out:] = 1.0
+        sl = slice(write, write + win)
+        out[sl] += frame * w
+        weight[sl] += w
         prev = frame
-        write += hop_out
-        read += hop_in
 
     nz = weight > 1e-6
     out[nz] /= weight[nz]
-    used = np.flatnonzero(weight > 1e-6)
-    if used.size:
-        return out[int(used[0]) : int(used[-1]) + 1]
     return out
 
 
@@ -122,17 +112,32 @@ class PhraseStreamPacker:
         self._parts: List[np.ndarray] = []
         self._sr = 24000
         self._tail: Optional[np.ndarray] = None
+        self._carry_1x: Optional[np.ndarray] = None
 
     def _min_samples(self) -> int:
-        return max(int(self._sr * self.phrase_seconds), 64)
+        # At 3x, 1.2s of 1x PCM is only 0.4s of playback and the next
+        # generate overruns. Pack enough 1x so each emitted frame is about
+        # phrase_seconds of listening time.
+        seconds = self.phrase_seconds
+        if not self.native and self.speed > 1.0:
+            seconds = self.phrase_seconds * self.speed
+        return max(int(self._sr * seconds), 64)
 
     def _speed(self, audio: np.ndarray) -> np.ndarray:
         if self.native or audio.size == 0 or abs(self.speed - 1.0) < 1e-3:
             return audio
+        carry = self._carry_1x
+        if carry is not None and carry.size:
+            stretched = time_stretch(np.concatenate([carry, audio]), self.speed, self._sr)
+            skip = min(stretched.size, max(0, int(round(carry.size / self.speed))))
+            return stretched[skip:] if skip < stretched.size else stretched[-1:]
         return time_stretch(audio, self.speed, self._sr)
 
     def _crossfade(self, audio: np.ndarray, *, final: bool) -> Optional[np.ndarray]:
-        n = max(1, int(round(self._sr * self.xfade_seconds)))
+        xfade_s = self.xfade_seconds
+        if not self.native and self.speed > 1.0:
+            xfade_s = max(self.xfade_seconds, 0.015 * self.speed)
+        n = max(1, int(round(self._sr * xfade_s)))
         if self._tail is None:
             if final or audio.size <= n:
                 return audio
@@ -174,9 +179,15 @@ class PhraseStreamPacker:
             merged = np.concatenate(self._parts) if len(self._parts) > 1 else self._parts[0]
             self._parts = []
             stretched = self._speed(merged)
+            carry_s = 0.03 * (self.speed if not self.native and self.speed > 1.0 else 1.0)
+            n_carry = max(int(self._sr * carry_s), 1)
+            self._carry_1x = merged[-n_carry:].copy() if merged.size else None
+            if final:
+                self._carry_1x = None
             return self._crossfade(stretched, final=final)
         if final and self._tail is not None:
             tail, self._tail = self._tail, None
+            self._carry_1x = None
             return tail
         return None
 

@@ -178,6 +178,30 @@ def test_synthesize_stream_completes_without_waiting_for_frame_timeout(client, f
     assert elapsed < 5, f"stream stalled after last frame: {elapsed:.2f}s"
 
 
+def test_synthesize_stream_true_preserves_selected_speed(client, fake_loader):
+    headers = _auth()
+    assert client.post("/v1/load-model?model_id=qwen3-tts", headers=headers).status_code == 200
+    fake_loader["qwen3-tts"].stream_parts = 8
+    r = client.post(
+        "/v1/synthesize",
+        headers=headers,
+        json={
+            "text": "Speed must stay at two point five.",
+            "voice": "ryan",
+            "model": "qwen3-tts",
+            "stream": True,
+            "speed": 2.5,
+        },
+    )
+    assert r.status_code == 200
+    assert r.headers.get("x-tts-speed") == "2.5"
+    frames = _parse_frames(r.content)
+    audio_frames = [(h, a) for h, a in frames if a]
+    assert audio_frames
+    assert audio_frames[0][0].get("speed") == 2.5
+    assert any(h.get("done") for h, _ in frames)
+
+
 def test_synthesize_stream_true_first_audio_before_body_ends(client, fake_loader):
     headers = _auth()
     assert client.post("/v1/load-model?model_id=kokoro", headers=headers).status_code == 200

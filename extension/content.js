@@ -159,7 +159,7 @@ async function onClick(e) {
         const model = data.model || "kokoro";
         resolve({
           voice: OpenTTSConstants.resolveVoice(model, data),
-          speed: Number(data.speed) || 1.5,
+          speed: OpenTTSConstants.resolveSpeed(data.speed),
           language: data.language || "Auto",
           model,
           instruct: data.instruct || "",

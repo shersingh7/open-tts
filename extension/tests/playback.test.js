@@ -70,6 +70,14 @@ describe("playback consume loop", () => {
   });
 });
 
+describe("offscreen sends resolveSpeed", () => {
+  it("builds stream requests with resolveSpeed not a 1.5 fallback or", () => {
+    const src = readFileSync(join(root, "..", "offscreen.js"), "utf8");
+    expect(src).toMatch(/resolveSpeed\(settings\.speed\)/);
+    expect(src).not.toMatch(/Number\(settings\.speed\) \|\| 1\.5/);
+  });
+});
+
 describe("offscreen uses the abutting clock", () => {
   it("schedules through createPlaybackClock rather than re-applying lead", () => {
     const src = readFileSync(join(root, "..", "offscreen.js"), "utf8");

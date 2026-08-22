@@ -86,7 +86,7 @@ async function* streamBatch(texts, settings, signal) {
   const body = {
     texts,
     voice: settings.voice || "af_bella",
-    speed: Number(settings.speed) || 1.5,
+    speed: OpenTTSConstants.resolveSpeed(settings.speed),
     language: settings.language || "Auto",
   };
   if (settings.model) body.model = settings.model;
@@ -207,7 +207,7 @@ async function doSpeakFallback(text, settings) {
   const body = {
     texts: chunks,
     voice: settings.voice || "af_bella",
-    speed: Number(settings.speed) || 1.5,
+    speed: OpenTTSConstants.resolveSpeed(settings.speed),
     language: settings.language || "Auto",
     format: "wav",
   };

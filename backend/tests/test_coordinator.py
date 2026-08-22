@@ -297,6 +297,42 @@ def test_stream_emits_held_tail_when_last_grain_shorter_than_xfade(fake_loader):
     assert float(np.max(np.abs(np.diff(joined)))) < 0.15
 
 
+def test_stream_3x_keeps_joins_continuous(fake_loader):
+    coord = ModelCoordinator()
+    coord.load("qwen3-tts")
+    model = fake_loader["qwen3-tts"]
+    n_grains = 160
+    grain = np.full(800, 0.4, dtype=np.float32)
+    model.stream_parts = n_grains
+    model.part_signals = [grain.copy() for _ in range(n_grains)]
+    joined, parts, _ = _stream_pcm_parts(
+        coord, "qwen3-tts", "Three times speed must not pause after chunks.", "ryan", 3.0,
+    )
+    assert joined.size > 0
+    interior = joined[400 : max(401, joined.size - 400)]
+    zeros = np.abs(interior) < 0.05
+    longest = 0
+    run = 0
+    for z in zeros:
+        if z:
+            run += 1
+            longest = max(longest, run)
+        else:
+            run = 0
+    assert longest < 80, f"3x join hole of {longest} samples"
+    if len(parts) > 1:
+        jumps = []
+        pos = 0
+        for part in parts[:-1]:
+            pos += part.size
+            if 0 < pos < joined.size:
+                jumps.append(abs(float(joined[pos]) - float(joined[pos - 1])))
+        assert max(jumps) < 0.15, f"3x join click {max(jumps):.3f}"
+    one_x = 800 * n_grains
+    ratio = joined.size / one_x
+    assert abs(ratio - 1 / 3.0) < 0.12, f"3x ratio {ratio:.3f} not ~0.33"
+
+
 def test_stream_duration_scales_with_speed(fake_loader):
     coord = ModelCoordinator()
     coord.load("qwen3-tts")
@@ -308,9 +344,10 @@ def test_stream_duration_scales_with_speed(fake_loader):
     slow, _ = _stream_pcm(coord, "qwen3-tts", "Scale this utterance.", "ryan", 1.0)
     model.parts_yielded = 0
     model.part_signals = [grain.copy() for _ in range(n_grains)]
-    fast, _ = _stream_pcm(coord, "qwen3-tts", "Scale this utterance.", "ryan", 2.0)
+    fast, _ = _stream_pcm(coord, "qwen3-tts", "Scale this utterance.", "ryan", 2.5)
     assert slow.size > 0 and fast.size > 0
-    assert fast.size < slow.size * 0.7
+    ratio = fast.size / slow.size
+    assert abs(ratio - 1 / 2.5) < 0.12, f"2.5x ratio {ratio:.3f} not ~0.4"
 
 
 def test_qwen_stream_speeds_up_short_middle_grains(fake_loader):

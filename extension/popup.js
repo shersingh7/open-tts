@@ -451,7 +451,7 @@ async function handleSpeak() {
       text,
       settings: {
         voice,
-        speed: Number(settings.speed) || DEFAULTS.speed,
+        speed: OpenTTSConstants.resolveSpeed(settings.speed),
         language: settings.language || DEFAULTS.language,
         model: modelId,
         instruct: instructField?.value?.trim() || settings.instruct || "",
@@ -472,7 +472,7 @@ async function handleSpeak() {
       text,
       voice,
       model: modelId,
-      speed: Number(settings.speed) || DEFAULTS.speed,
+      speed: OpenTTSConstants.resolveSpeed(settings.speed),
       timestamp: Date.now(),
     };
   } catch (e) {

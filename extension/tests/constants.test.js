@@ -21,6 +21,15 @@ describe("model load timeout", () => {
   });
 });
 
+describe("resolveSpeed", () => {
+  it("keeps a slider value of 2.5 instead of falling back to 1.5", () => {
+    const { resolveSpeed } = constantsApi();
+    expect(resolveSpeed(2.5)).toBe(2.5);
+    expect(resolveSpeed("2.5")).toBe(2.5);
+    expect(resolveSpeed(undefined)).toBe(1.5);
+  });
+});
+
 describe("resolveVoice", () => {
   it("does not send Kokoro Bella to Qwen after a model switch", () => {
     const { resolveVoice } = constantsApi();
