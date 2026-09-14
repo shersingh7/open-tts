@@ -45,6 +45,37 @@ def client(fake_loader, monkeypatch, tmp_path):
         _reset_coordinator()
 
 
+def test_slow_semantic_generation_sends_keepalive_without_false_idle_timeout(client, fake_loader, monkeypatch):
+    monkeypatch.setattr("open_tts.api.STREAM_FRAME_TIMEOUT", 0.05)
+    monkeypatch.setattr("open_tts.api.GEN_TIMEOUT", 2)
+    monkeypatch.setattr("open_tts.api.STREAM_HEARTBEAT_SECONDS", 0.02, raising=False)
+    assert client.post("/v1/load-model?model_id=qwen3-tts").status_code == 200
+    fake_loader["qwen3-tts"].part_delay = 0.35
+    r = client.post("/v1/synthesize-stream-batch", json={
+        "texts": ["Slow semantic unit."], "model": "qwen3-tts", "voice": "ryan", "speed": 1.5,
+    })
+    frames = _parse_frames(r.content)
+    assert any(h.get("keepalive") is True and not audio for h, audio in frames)
+    assert any(audio for _, audio in frames)
+    assert not any(h.get("error") for h, _ in frames)
+    assert frames[-1][0] == {"done": True}
+
+
+def test_keepalive_does_not_extend_inference_deadline(client, fake_loader, monkeypatch):
+    monkeypatch.setattr("open_tts.api.STREAM_FRAME_TIMEOUT", 0.05)
+    monkeypatch.setattr("open_tts.api.GEN_TIMEOUT", 0.4)
+    monkeypatch.setattr("open_tts.api.STREAM_HEARTBEAT_SECONDS", 0.02)
+    assert client.post("/v1/load-model?model_id=qwen3-tts").status_code == 200
+    fake_loader["qwen3-tts"].part_delay = 0.35
+    r = client.post("/v1/synthesize-stream-batch", json={
+        "texts": ["Over-budget semantic unit."], "model": "qwen3-tts", "voice": "ryan", "speed": 1.5,
+    })
+    frames = _parse_frames(r.content)
+    assert any(h.get("keepalive") for h, _ in frames)
+    assert any(h.get("code") == "stream_timeout" for h, _ in frames)
+    assert not any(h.get("done") or audio for h, audio in frames)
+
+
 def test_health_readiness(client):
     r = client.get("/health")
     assert r.status_code == 200
@@ -291,13 +322,94 @@ def test_health_returns_while_generate_in_flight(client, fake_loader):
     started = time.perf_counter()
     health = client.get("/health")
     elapsed = time.perf_counter() - started
+    body = health.json()
     hold.set()
     t.join(timeout=10)
 
     assert not errors
     assert health.status_code == 200
     assert elapsed < 0.5
-    body = health.json()
     assert body["status"] == "ok"
     assert body.get("gpu_busy") is True
+    assert body.get("model_warm") is True
+    assert body.get("state") == "generating"
     assert coordinator.state == ModelState.READY
+
+
+def test_load_same_model_endpoint_during_generate_returns_immediately(client, fake_loader):
+    headers = _auth()
+    assert client.post("/v1/load-model?model_id=kokoro", headers=headers).status_code == 200
+    model = fake_loader["kokoro"]
+    hold = threading.Event()
+    model.hold_generate = hold
+    model.generate_started.clear()
+    errors = []
+
+    def worker():
+        try:
+            coordinator.generate_full("kokoro", "Hold this generate", "af_bella", 1.0)
+        except Exception as exc:
+            errors.append(exc)
+
+    t = threading.Thread(target=worker)
+    t.start()
+    assert model.generate_started.wait(timeout=5)
+    started = time.perf_counter()
+    resp = client.post("/v1/load-model?model_id=kokoro", headers=headers)
+    elapsed = time.perf_counter() - started
+    hold.set()
+    t.join(timeout=10)
+
+    assert not errors
+    assert resp.status_code == 200
+    assert elapsed < 0.5
+    data = resp.json()
+    assert data["success"] is True
+    assert data["model"] == "kokoro"
+
+@pytest.mark.parametrize("cancel_mode", ["close", "task_cancel"])
+def test_response_cancellation_closes_worker_on_owner_thread(client, monkeypatch, cancel_mode):
+    import asyncio
+    from open_tts.api import StreamBatchRequest
+    from open_tts.protocol import pack_frame
+    closed = threading.Event()
+    entered = threading.Event()
+    ids = []
+    monkeypatch.setattr("open_tts.api.STREAM_QUEUE_MAX", 1)
+
+    def stream(*args, **kwargs):
+        ids.append(threading.get_ident())
+        try:
+            entered.set()
+            if cancel_mode == "task_cancel":
+                while not kwargs["cancel_check"]():
+                    time.sleep(0.005)
+                return
+            for _ in range(1000):
+                if kwargs["cancel_check"]():
+                    return
+                yield pack_frame({"index": 0}, b"fixture")
+        finally:
+            ids.append(threading.get_ident())
+            closed.set()
+
+    monkeypatch.setattr(coordinator, "stream_batch_frames", stream)
+    endpoint = next(r.endpoint for r in client.app.routes if r.path == "/v1/synthesize-stream-batch")
+    class Request:
+        async def is_disconnected(self):
+            return False
+    async def check():
+        response = await endpoint(StreamBatchRequest(texts=["Fixture"], model="kokoro"), Request())
+        iterator = response.body_iterator
+        if cancel_mode == "close":
+            assert await iterator.__anext__()
+            await iterator.aclose()
+        else:
+            pending = asyncio.create_task(iterator.__anext__())
+            assert await asyncio.to_thread(entered.wait, 2)
+            pending.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await pending
+        assert await asyncio.to_thread(closed.wait, 2)
+        assert ids[0] == ids[1] != threading.get_ident()
+    asyncio.run(check())

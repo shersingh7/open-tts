@@ -8,10 +8,18 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from .config import MAX_BATCH_TEXTS, MAX_BATCH_TOTAL_CHARS, MAX_TEXT_LENGTH, AudioFormat
 from .errors import ErrorCode, http_exception
+from .text import normalize_text
 
 
 def validate_text(text: str, *, field: str = "text") -> str:
-    cleaned = (text or "").strip()
+    raw = text if text is not None else ""
+    if len(raw) > MAX_TEXT_LENGTH:
+        raise http_exception(
+            400,
+            ErrorCode.VALIDATION,
+            f"{field} exceeds maximum length of {MAX_TEXT_LENGTH}",
+        )
+    cleaned = normalize_text(raw)
     if not cleaned:
         raise http_exception(400, ErrorCode.VALIDATION, f"{field} must not be empty")
     if len(cleaned) > MAX_TEXT_LENGTH:

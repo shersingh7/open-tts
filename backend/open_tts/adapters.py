@@ -6,6 +6,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from .config import STREAMING_INTERVAL
 from .registry import FISH_VOICE_TAGS, MODEL_REGISTRY, normalize_lang
+from .text import pack_generation_units
 
 
 def resolve_voice(model_id: str, voice: str, supported: List[str]) -> str:
@@ -131,79 +132,23 @@ def split_kokoro_chunks(text: str, max_chars: int = 400) -> List[str]:
                     split_at = max_chars
 
         chunk, remaining = remaining[:split_at], remaining[split_at:]
-        if chunk.strip():
+        if chunk:
             parts.append(chunk)
         elif not remaining:
             break
-        # Pure-whitespace slices are skipped; they carry no phonemes.
-    return parts
-
-
-def _sentence_units(text: str) -> List[str]:
-    """Exact sentence-sized substrings of the original input."""
-    if not text:
-        return []
-    units: List[str] = []
-    start = 0
-    i = 0
-    n = len(text)
-    while i < n:
-        ch = text[i]
-        if ch in ".!?" and (i + 1 >= n or text[i + 1].isspace() or text[i + 1] in "\"'”’)"):
-            j = i + 1
-            while j < n and text[j].isspace():
-                j += 1
-            units.append(text[start:j])
-            start = j
-            i = j
-            continue
-        i += 1
-    if start < n:
-        units.append(text[start:])
-    return units
+        else:
+            parts.append(remaining[:max_chars] or remaining)
+            remaining = remaining[max(max_chars, 1):]
+    return parts or ([text] if text else [])
 
 
 def split_stream_text(text: str, first_max: int = 4000, rest_max: int = 4000) -> List[str]:
     """Pack whole sentences into generate units.
 
-    A paragraph below the unit cap stays one slice so timbre/pace do not
-    reset mid-sentence. A single sentence longer than the cap is the only
-    case that hard-splits.
+    Only the first unit uses *first_max*; the remainder is packed at
+    *rest_max*. A sentence is hard-split only when it exceeds the active cap.
     """
-    if not text:
-        return []
-    sentences = _sentence_units(text)
-    if not sentences:
-        return [text]
-    if len(text) <= first_max and all(len(s) <= first_max for s in sentences):
-        return [text]
-
-    out: List[str] = []
-    buf = ""
-    for sent in sentences:
-        limit = first_max if not out else rest_max
-        if not buf:
-            if len(sent) <= limit:
-                buf = sent
-            else:
-                hard = split_kokoro_chunks(sent, max_chars=limit)
-                if len(hard) > 1:
-                    out.extend(hard[:-1])
-                buf = hard[-1] if hard else ""
-            continue
-        if len(buf) + len(sent) <= limit:
-            buf += sent
-        else:
-            out.append(buf)
-            if len(sent) <= rest_max:
-                buf = sent
-            else:
-                hard = split_kokoro_chunks(sent, max_chars=rest_max)
-                out.extend(hard[:-1])
-                buf = hard[-1] if hard else ""
-    if buf:
-        out.append(buf)
-    return out
+    return pack_generation_units(text, first_max, rest_max)
 
 
 def model_capabilities(model_id: str, voices: Optional[List[str]] = None) -> dict:

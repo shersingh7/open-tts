@@ -1,4 +1,4 @@
-/* Open TTS v3.4 — Popup */
+/* Open TTS v3.4.3 — Popup */
 
 const $ = (id) => document.getElementById(id);
 const modelSelect = $("model");
@@ -36,10 +36,11 @@ const copyDiagnosticsBtn = $("copyDiagnostics");
 const versionEl = $("version");
 
 const { DEFAULTS, MAX_HISTORY } = OpenTTSConstants;
-const { unwrap, makeClientId, makeRunId } = OpenTTSProtocol;
+const { unwrap, makeClientId, makeRunId, interpretHealth } = OpenTTSProtocol;
 const { syncGet, syncSet, localGet, localSet, debouncedSyncSet, debouncedLocalSet } = OpenTTSStorage;
 
 let clientId = makeClientId();
+let playbackRevision = 0;
 let activeRun = null;
 let playbackState = "idle";
 let genCount = 0;
@@ -222,26 +223,36 @@ async function checkServer() {
       setServerUI("stopped", "Server offline");
       return false;
     }
-    const data = health.data;
-    if (data.model_warm) {
-      setServerUI("running", `Connected — ${data.model}`);
+    const info = interpretHealth(health.data);
+    if (info.status === "ready" || info.status === "idle") {
+      setServerUI("running", info.message);
       await loadModels();
       return true;
     }
-    if (data.status === "ok" && !data.model_loaded) {
-      setServerUI("running", "Connected — pick a model");
+    if (info.status === "failed") {
+      setServerUI("running", info.error || "Model failed");
+      showError(info.error || "Model failed");
       await loadModels();
-      return true;
+      return false;
     }
-    if (data.model_loaded) {
+    if (info.status === "warming") {
       setServerUI("loading", "Warming up model...");
       for (let i = 0; i < 30; i++) {
         await new Promise((r) => setTimeout(r, 1000));
         const h = unwrap(await msg({ type: "GET_HEALTH" }));
-        if (h.ok && h.data.model_warm) {
-          setServerUI("running", `Connected — ${h.data.model}`);
-          await loadModels();
-          return true;
+        if (h.ok) {
+          const pollInfo = interpretHealth(h.data);
+          if (pollInfo.status === "ready" || pollInfo.status === "idle") {
+            setServerUI("running", pollInfo.message);
+            await loadModels();
+            return true;
+          }
+          if (pollInfo.status === "failed") {
+            setServerUI("running", pollInfo.error || "Model failed");
+            showError(pollInfo.error || "Model failed");
+            await loadModels();
+            return false;
+          }
         }
       }
       setServerUI("stopped", "Server failed to warm up");
@@ -423,59 +434,53 @@ async function handleModelChange() {
 
 async function handleSpeak() {
   hideError();
-  if (activeRun?.runId) {
-    pendingHistory = null;
-    await msg({ type: "STOP_TTS", runId: activeRun.runId, clientId }).catch(() => {});
-  }
-
   const text = previewText.value.trim();
   if (!text) return;
-
+  if (text.length > OpenTTSConstants.MAX_CHARS) {
+    showError(`Text exceeds ${OpenTTSConstants.MAX_CHARS} characters`);
+    return;
+  }
+  playbackRevision++;
+  const previous = activeRun;
   const runId = makeRunId();
   activeRun = { clientId, runId, source: "popup" };
+  pendingHistory = null;
   setPlaybackUI("generating", "Generating...");
   const t0 = performance.now();
-
   try {
+    if (previous?.runId) {
+      await msg({ type: "STOP_TTS", runId: previous.runId, clientId: previous.clientId }).catch(() => {});
+      if (activeRun?.runId !== runId) return;
+    }
     const settings = await syncGet(["voice", "speed", "language", "model", "voicePrefs", "instruct", "fishStyle"]);
+    if (activeRun?.runId !== runId) return;
     voicePrefs = settings.voicePrefs || {};
     const modelId = settings.model || modelSelect.value || DEFAULTS.model;
     const voice = OpenTTSConstants.resolveVoice(modelId, {
-      voicePrefs,
-      voice: voiceSelect.value || settings.voice,
+      voicePrefs, voice: voiceSelect.value || settings.voice,
       fishStyle: settings.fishStyle || fishStyleSelect.value,
     });
-
+    // Register before dispatch: a short run can complete before its ACK arrives.
+    pendingHistory = {
+      runId, id: crypto.randomUUID(), text, voice, model: modelId,
+      speed: OpenTTSConstants.resolveSpeed(settings.speed), timestamp: Date.now(),
+    };
     const speakResult = unwrap(await msg({
-      type: "SPEAK",
-      text,
+      type: "SPEAK", text,
       settings: {
-        voice,
-        speed: OpenTTSConstants.resolveSpeed(settings.speed),
-        language: settings.language || DEFAULTS.language,
-        model: modelId,
+        voice, speed: OpenTTSConstants.resolveSpeed(settings.speed),
+        language: settings.language || DEFAULTS.language, model: modelId,
         instruct: instructField?.value?.trim() || settings.instruct || "",
       },
-      clientId,
-      runId,
-      source: "popup",
+      clientId, runId, source: "popup",
     }));
+    if (activeRun?.runId !== runId) return;
     if (!speakResult.ok) throw new Error(speakResult.error || "Playback failed to start");
-
-    latencyEl.textContent = `LAT: ${Math.round(performance.now() - t0)}ms`;
+    latencyEl.textContent = `ACK: ${Math.round(performance.now() - t0)}ms`;
     genCount++;
     genCountEl.textContent = `GEN: ${String(genCount).padStart(3, "0")}`;
-
-    pendingHistory = {
-      runId,
-      id: crypto.randomUUID(),
-      text,
-      voice,
-      model: modelId,
-      speed: OpenTTSConstants.resolveSpeed(settings.speed),
-      timestamp: Date.now(),
-    };
   } catch (e) {
+    if (activeRun?.runId !== runId) return;
     pendingHistory = null;
     activeRun = null;
     setPlaybackUI("idle", "Failed");
@@ -484,30 +489,33 @@ async function handleSpeak() {
 }
 
 async function handlePauseResume() {
-  if (!activeRun?.runId) return;
-  if (playbackState === "paused") {
-    const r = unwrap(await msg({ type: "RESUME", clientId, runId: activeRun.runId }));
-    if (!r.ok) {
-      showError(r.error || "Could not resume");
-      return;
-    }
-    setPlaybackUI("playing", "Reading...");
-  } else if (playbackState === "playing" || playbackState === "generating") {
-    const r = unwrap(await msg({ type: "PAUSE", clientId, runId: activeRun.runId }));
-    if (!r.ok) {
-      showError(r.error || "Could not pause");
-      return;
-    }
-    setPlaybackUI("paused", "Paused");
+  const target = activeRun;
+  if (!target?.runId) return;
+  const pause = playbackState !== "paused";
+  try {
+    const r = unwrap(await msg({ type: pause ? "PAUSE" : "RESUME", clientId: target.clientId, runId: target.runId }));
+    if (activeRun?.runId !== target.runId) return;
+    if (!r.ok || r.data?.ignored) throw new Error(r.error || "Playback control failed");
+    const paused = typeof r.data?.paused === "boolean" ? r.data.paused : pause;
+    setPlaybackUI(paused ? "paused" : "playing", paused ? "Paused" : "Reading...");
+  } catch (e) {
+    if (activeRun?.runId === target.runId) showError(e.message);
   }
 }
 
 async function handleStopPlayback() {
-  if (!activeRun?.runId) return;
+  playbackRevision++;
+  const target = activeRun;
+  if (!target?.runId) return;
   pendingHistory = null;
-  await msg({ type: "STOP", clientId, runId: activeRun.runId });
   activeRun = null;
   setPlaybackUI("idle", "Ready");
+  try {
+    const r = unwrap(await msg({ type: "STOP", clientId: target.clientId, runId: target.runId }));
+    if (!r.ok && !activeRun) showError(r.error || "Could not stop playback");
+  } catch (e) {
+    if (!activeRun) showError(e.message);
+  }
 }
 
 async function handleCopy() {
@@ -588,7 +596,7 @@ function wireEvents() {
   chrome.runtime.onMessage.addListener((msg) => {
     if (!msg._routedByBackground) return;
     if (msg.clientId && msg.clientId !== clientId) return;
-    if (activeRun?.runId && msg.runId && msg.runId !== activeRun.runId) return;
+    if (msg.runId && msg.runId !== activeRun?.runId) return;
     if (msg.type === "TTS_STATUS") {
       const label = msg.label || "Generating...";
       if (playbackState === "paused" && label !== "Paused") return;
@@ -617,13 +625,33 @@ function wireEvents() {
   });
 }
 
+async function restorePlaybackState() {
+  const revision = playbackRevision;
+  try {
+    const resp = unwrap(await msg({ type: "GET_PLAYBACK_STATE" }));
+    if (playbackRevision !== revision) return;
+    if (resp.ok && resp.data?.active) {
+      const { clientId: activeClientId, runId, source, paused } = resp.data;
+      if (activeClientId) clientId = activeClientId;
+      activeRun = { clientId, runId, source: source || "popup" };
+      if (paused) {
+        setPlaybackUI("paused", "Paused");
+      } else {
+        setPlaybackUI("playing", "Reading...");
+      }
+      return;
+    }
+  } catch (_) {}
+  if (playbackRevision === revision) setPlaybackUI("idle", "Ready");
+}
+
 async function init() {
   const manifest = chrome.runtime.getManifest();
   if (versionEl) versionEl.textContent = `v${manifest.version}`;
   await loadSettings();
   await loadHistory();
   wireEvents();
-  setPlaybackUI("idle", "Ready");
+  await restorePlaybackState();
   await checkServer();
 }
 

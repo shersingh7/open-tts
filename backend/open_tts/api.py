@@ -31,6 +31,9 @@ from .security import AuthAndRateLimitMiddleware, RateLimiter, build_cors_origin
 
 _health_cache = {"data": None, "ts": 0.0}
 _install_token = ""
+# Long semantic units (especially non-native speed processing) can legitimately
+# produce no output for more than the client's network-idle timeout.
+STREAM_HEARTBEAT_SECONDS = 15.0
 
 
 @asynccontextmanager
@@ -188,84 +191,124 @@ def register_routes(app: FastAPI) -> None:
         return {"success": True, **result}
 
     def _framed_stream(req: Request, model_id: str, texts: List[str], request, extra_headers: dict):
-        disconnected = False
-
         async def _response() -> AsyncGenerator[bytes, None]:
-            nonlocal disconnected
             q: queue.Queue = queue.Queue(maxsize=STREAM_QUEUE_MAX)
-            done = threading.Event()
+            cancel_event = threading.Event()
+            worker_done = threading.Event()
 
             def _offer(item) -> bool:
-                while not disconnected:
+                while not cancel_event.is_set():
                     try:
-                        q.put(item, timeout=0.5)
+                        q.put(item, timeout=0.2)
                         return True
                     except queue.Full:
                         continue
                 return False
 
-            def _worker():
+            def _put_sentinel() -> None:
                 try:
-                    for frame in coordinator.stream_batch_frames(
+                    q.put(None, timeout=0.2)
+                except Exception:
+                    try:
+                        q.put_nowait(None)
+                    except Exception:
+                        pass
+
+            def _worker():
+                gen = None
+                try:
+                    if cancel_event.is_set():
+                        return
+                    gen = coordinator.stream_batch_frames(
                         model_id,
                         texts,
                         request.voice,
                         request.speed,
                         language=request.language,
                         instruct=request.instruct,
-                        cancel_check=lambda: disconnected,
-                    ):
+                        cancel_check=cancel_event.is_set,
+                    )
+                    for frame in gen:
+                        if cancel_event.is_set():
+                            break
                         if not _offer(frame):
-                            return
+                            break
                 except Exception as exc:
-                    _offer(("error", exc))
+                    if not cancel_event.is_set():
+                        _offer(("error", exc))
                 finally:
-                    _offer(None)
-                    done.set()
+                    if gen is not None:
+                        try:
+                            gen.close()
+                        except Exception:
+                            pass
+                    _put_sentinel()
+                    worker_done.set()
 
             threading.Thread(target=_worker, daemon=True).start()
             loop = asyncio.get_running_loop()
             started = time.monotonic()
-            absolute_deadline = started + max(GEN_TIMEOUT, len(texts) * STREAM_FRAME_TIMEOUT)
+            last_frame_at = started
+            last_keepalive_at = started
+            inference_idle_budget = max(GEN_TIMEOUT, STREAM_FRAME_TIMEOUT)
 
-            while True:
-                if await req.is_disconnected():
-                    disconnected = True
-                    break
-                if time.monotonic() > absolute_deadline:
-                    disconnected = True
-                    yield pack_frame({
-                        "error": "Generation exceeded the absolute timeout",
-                        "code": ErrorCode.GENERATION_TIMEOUT.value,
-                    })
-                    break
-                try:
-                    frame = await loop.run_in_executor(None, lambda: q.get(timeout=STREAM_FRAME_TIMEOUT))
-                except queue.Empty:
-                    if done.is_set() and q.empty():
+            def _error_frame(message: str, code: str) -> bytes:
+                return pack_frame({"error": message, "code": code})
+
+            try:
+                while True:
+                    if await req.is_disconnected():
+                        cancel_event.set()
                         break
-                    continue
-                if frame is None:
-                    break
-                if isinstance(frame, tuple) and frame[0] == "error":
-                    # Keep the stream contract intact: never raise mid-body after
-                    # headers are sent. Encode failures as a terminal error frame.
-                    exc = frame[1]
-                    if isinstance(exc, HTTPException):
-                        detail = exc.detail if isinstance(exc.detail, dict) else {"message": str(exc.detail)}
-                        yield pack_frame({
-                            "error": detail.get("message", str(exc.detail)),
-                            "code": detail.get("code", ErrorCode.INTERNAL.value),
-                        })
-                    else:
-                        yield pack_frame({
-                            "error": str(exc),
-                            "code": ErrorCode.GENERATION_FAILED.value,
-                        })
-                    break
-                yield frame
-
-            yield terminal_frame()
+                    now = time.monotonic()
+                    try:
+                        frame = await loop.run_in_executor(None, lambda: q.get(timeout=0.25))
+                    except queue.Empty:
+                        if worker_done.is_set() and q.empty():
+                            break
+                        if cancel_event.is_set():
+                            break
+                        now = time.monotonic()
+                        if now - last_frame_at > inference_idle_budget:
+                            cancel_event.set()
+                            yield _error_frame(
+                                "Stream timed out waiting for audio",
+                                ErrorCode.STREAM_TIMEOUT.value,
+                            )
+                            break
+                        if now - last_keepalive_at >= STREAM_HEARTBEAT_SECONDS:
+                            yield pack_frame({"keepalive": True})
+                            resumed_at = time.monotonic()
+                            # Only consumer backpressure is excluded. Heartbeats
+                            # themselves must NOT reset the inference deadline.
+                            last_frame_at += resumed_at - now
+                            last_keepalive_at = resumed_at
+                        continue
+                    if frame is None:
+                        break
+                    last_frame_at = time.monotonic()
+                    if isinstance(frame, tuple) and frame[0] == "error":
+                        exc = frame[1]
+                        if isinstance(exc, HTTPException):
+                            detail = exc.detail if isinstance(exc.detail, dict) else {"message": str(exc.detail)}
+                            yield pack_frame({
+                                "error": detail.get("message", str(exc.detail)),
+                                "code": detail.get("code", ErrorCode.INTERNAL.value),
+                            })
+                        else:
+                            yield pack_frame({
+                                "error": str(exc),
+                                "code": ErrorCode.GENERATION_FAILED.value,
+                            })
+                        break
+                    yield frame
+                    # Consumer backpressure/pause is not inference idle time.
+                    last_frame_at = time.monotonic()
+                if not cancel_event.is_set():
+                    yield terminal_frame()
+            finally:
+                cancel_event.set()
+                _put_sentinel()
 
         return StreamingResponse(
             _response(),

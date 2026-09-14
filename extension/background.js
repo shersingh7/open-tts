@@ -1,4 +1,4 @@
-// Open TTS v3.4 — Background Service Worker (routing + lifecycle only)
+// Open TTS v3.4.3 — Background Service Worker (routing + lifecycle only)
 importScripts(
   "shared/constants-umd.js",
   "shared/protocol-umd.js",
@@ -10,27 +10,45 @@ const { unwrap, ok, fail, playbackContext, parseApiErrorBody, sendWithRetry, des
 const { getAuthHeaders, storeInstallToken } = OpenTTSStorage;
 
 let activeSession = null;
+let sessionRevision = 0;
 
+let offscreenCreation = null;
 async function ensureOffscreen() {
-  const exists = await chrome.offscreen.hasDocument?.().catch(() => null);
-  if (exists) return true;
-  try {
-    await chrome.offscreen.createDocument({
-      url: chrome.runtime.getURL("offscreen.html"),
-      reasons: ["AUDIO_PLAYBACK"],
+  if (await chrome.offscreen.hasDocument()) return true;
+  if (!offscreenCreation) {
+    offscreenCreation = chrome.offscreen.createDocument({
+      url: chrome.runtime.getURL("offscreen.html"), reasons: ["AUDIO_PLAYBACK"],
       justification: "Local TTS audio playback and synthesis",
-    });
-    return true;
-  } catch (e) {
-    if (e.message?.includes("already") || e.message?.includes("offscreen")) return true;
-    console.error("[Open TTS] Offscreen:", e);
-    return false;
+    }).then(() => true).catch(async (error) => {
+      if (await chrome.offscreen.hasDocument()) return true;
+      throw error;
+    }).finally(() => { offscreenCreation = null; });
   }
+  return offscreenCreation;
+}
+
+async function recoverSession() {
+  if (activeSession) return activeSession;
+  const revision = sessionRevision;
+  if (!await chrome.offscreen.hasDocument()) return activeSession;
+  if (sessionRevision !== revision) return activeSession;
+  const resp = await chrome.runtime.sendMessage({ type: "GET_PLAYBACK_STATE", _fromBackground: true });
+  // Both a new SPEAK and a terminal event invalidate an outstanding snapshot.
+  if (sessionRevision !== revision) return activeSession;
+  if (!activeSession && resp?.active && resp.runId && resp.clientId) {
+    activeSession = { ...resp };
+    sessionRevision++;
+  }
+  return activeSession;
 }
 
 async function sendToOffscreen(payload) {
   if (!await ensureOffscreen()) throw new Error("Offscreen unavailable");
+  if (payload.type === "SPEAK" && activeSession?.runId !== payload.runId) throw new Error("Superseded playback request");
   return sendWithRetry(() => new Promise((resolve, reject) => {
+    if (payload.type === "SPEAK" && activeSession?.runId !== payload.runId) {
+      reject(new Error("Superseded playback request")); return;
+    }
     chrome.runtime.sendMessage({ ...payload, _fromBackground: true }, (resp) => {
       if (chrome.runtime.lastError) {
         reject(new Error(chrome.runtime.lastError.message));
@@ -130,11 +148,10 @@ async function ensureBackendAvailable() {
 
 function notifyClient(session, payload) {
   const routed = { ...payload, _routedByBackground: true };
-  if (!session?.sourceTabId || session.source === "popup") {
-    chrome.runtime.sendMessage(routed).catch(() => {});
-    return;
+  chrome.runtime.sendMessage(routed).catch(() => {});
+  if (session?.sourceTabId && session.source !== "popup") {
+    chrome.tabs.sendMessage(session.sourceTabId, routed, { frameId: session.sourceFrameId || 0 }).catch(() => {});
   }
-  chrome.tabs.sendMessage(session.sourceTabId, routed, { frameId: session.sourceFrameId || 0 }).catch(() => {});
 }
 
 function ownsActiveSession(req) {
@@ -150,8 +167,12 @@ chrome.runtime.onMessage.addListener((req, sender, sendResponse) => {
         sendResponse({ ignored: true });
         return true;
       }
+      if (activeSession) activeSession.state = "active";
       notifyClient(activeSession || req, req);
-      if (req.type === "TTS_DONE" || req.type === "TTS_ERROR") activeSession = null;
+      if (req.type === "TTS_DONE" || req.type === "TTS_ERROR") {
+        sessionRevision++;
+        activeSession = null;
+      }
       sendResponse({ success: true });
       return true;
     }
@@ -163,6 +184,7 @@ chrome.runtime.onMessage.addListener((req, sender, sendResponse) => {
   if (type === "SPEAK") {
     const ctx = playbackContext(sender, req);
     const previous = activeSession;
+    sessionRevision++;
     activeSession = { ...ctx, state: "speaking" };
     Promise.resolve()
       .then(async () => {
@@ -171,9 +193,14 @@ chrome.runtime.onMessage.addListener((req, sender, sendResponse) => {
           notifyClient(previous, { type: "TTS_DONE", ...previous });
         }
       })
-      .then(() => ensureBackendAvailable())
+      .then(() => {
+        if (activeSession?.runId !== ctx.runId) throw new Error("Superseded playback request");
+        return ensureBackendAvailable();
+      })
       .then(async () => {
+        if (activeSession?.runId !== ctx.runId) throw new Error("Superseded playback request");
         const headers = await getAuthHeaders();
+        if (activeSession?.runId !== ctx.runId) throw new Error("Superseded playback request");
         const settings = {
           ...(req.settings || {}),
           authToken: headers["X-Open-TTS-Token"] || "",
@@ -188,22 +215,35 @@ chrome.runtime.onMessage.addListener((req, sender, sendResponse) => {
     return true;
   }
 
-  if (["STOP", "PAUSE", "RESUME"].includes(type)) {
-    if (!ownsActiveSession(req)) {
-      sendResponse(fail("Playback control does not own the active run", "stale_run"));
-      return true;
-    }
-    sendToOffscreen({ type, ...activeSession, _fromBackground: true })
-      .then((r) => sendResponse(r || { success: true }))
-      .catch((e) => sendResponse(fail(e.message)));
+  if (["STOP", "STOP_TTS", "PAUSE", "RESUME"].includes(type)) {
+    (async () => {
+      await recoverSession();
+      if (!ownsActiveSession(req)) return fail("Playback control does not own the active run", "stale_run");
+      const target = { ...activeSession };
+      const control = type === "STOP_TTS" ? "STOP" : type;
+      if (control === "STOP") {
+        sessionRevision++;
+        activeSession = null; // invalidate pending startup immediately
+      }
+      return await sendToOffscreen({ ...target, type: control });
+    })().then(sendResponse).catch(e => sendResponse(fail(e.message)));
     return true;
   }
 
-  if (type === "STOP_TTS") {
-    if (ownsActiveSession(req)) {
-      sendToOffscreen({ type: "STOP", ...activeSession, _fromBackground: true }).catch(() => {});
-    }
-    sendResponse({ success: true, stopped: true });
+  if (type === "GET_PLAYBACK_STATE" || type === "GET_STATUS") {
+    (async () => {
+      const target = await recoverSession();
+      if (!target) return ok({ active: false });
+      if (!await chrome.offscreen.hasDocument()) return ok({ active: true, ...target, paused: false });
+      const resp = await chrome.runtime.sendMessage({ type: "GET_PLAYBACK_STATE", _fromBackground: true });
+      if (activeSession?.runId !== target.runId) return ok({ active: !!activeSession, ...activeSession });
+      if (!resp?.active) {
+        // A run may still be preparing the backend, before offscreen SPEAK.
+        if (target.state === "speaking") return ok({ active: true, ...target, paused: false });
+        activeSession = null; return ok({ active: false });
+      }
+      return ok(resp);
+    })().then(sendResponse).catch(e => sendResponse(fail(e.message)));
     return true;
   }
 
@@ -253,7 +293,7 @@ chrome.runtime.onMessage.addListener((req, sender, sendResponse) => {
     (async () => {
       try {
         const existing = await fetchHealth(2000);
-        if (existing?.model_warm || existing?.status === "ok") {
+        if (existing?.model_warm || existing?.gpu_busy || existing?.status === "ok") {
           sendResponse(ok({ message: "Already running", model: existing.model, voices: existing.voices, lazy: !existing.model_loaded }));
           return;
         }
@@ -267,7 +307,7 @@ chrome.runtime.onMessage.addListener((req, sender, sendResponse) => {
           await new Promise((r) => setTimeout(r, 1000));
           const h = await fetchHealth(3000);
           if (!h) continue;
-          if (h.model_warm) {
+          if (h.model_warm || h.gpu_busy) {
             sendResponse(ok({ message: `Server ready — ${h.model}`, model: h.model, voices: h.voices }));
             return;
           }
@@ -297,7 +337,7 @@ chrome.runtime.onMessage.addListener((req, sender, sendResponse) => {
   if (type === "ENSURE_SERVER") {
     (async () => {
       const h = await fetchHealth(2000);
-      if (h?.model_warm || h?.status === "ok") {
+      if (h?.model_warm || h?.gpu_busy || h?.status === "ok") {
         sendResponse(ok({ ready: true }));
         return;
       }

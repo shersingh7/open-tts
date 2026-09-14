@@ -35,10 +35,12 @@ def validate_token(provided: Optional[str], expected: str) -> bool:
         return True
     if not provided:
         return False
-    # compare_digest raises ValueError on length mismatch in some Python builds;
-    # treat that as a failed auth check rather than a 500 from middleware.
+    # compare_digest on str requires ASCII. Malformed header values must fail
+    # authentication rather than raising TypeError and turning into HTTP 500.
     candidate = provided.strip()
     if not candidate or len(candidate) != len(expected):
+        return False
+    if not candidate.isascii() or not expected.isascii():
         return False
     return secrets.compare_digest(candidate, expected)
 

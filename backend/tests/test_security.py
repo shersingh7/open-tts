@@ -3,6 +3,10 @@ from __future__ import annotations
 from open_tts.security import validate_token
 
 
+def test_validate_token_rejects_non_ascii_without_exception():
+    assert validate_token("é" * 32, "a" * 32) is False
+
+
 def test_validate_token_rejects_length_mismatch():
     assert validate_token("short", "a" * 32) is False
     assert validate_token("a" * 32, "b" * 32) is False

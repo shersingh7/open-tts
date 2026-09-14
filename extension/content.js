@@ -1,4 +1,4 @@
-// Open TTS v3.4 — Content Script
+// Open TTS v3.4.3 — Content Script
 
 let widget = null;
 let clientId = `c_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
@@ -7,6 +7,7 @@ let isSpeaking = false;
 let isPaused = false;
 let savedSelection = "";
 let _lastRect = null;
+let errorTimer = null;
 
 const MAX_CHARS = OpenTTSConstants?.MAX_CHARS || 200000;
 
@@ -92,11 +93,14 @@ function setBusy(b, t) {
 }
 
 function flashError(msg) {
+  clearTimeout(errorTimer);
+  const owner = currentRunId;
   setLabel(msg);
   widget?.classList.add("error");
-  setTimeout(() => {
+  errorTimer = setTimeout(() => {
+    if (currentRunId !== owner) return;
     widget?.classList.remove("error");
-    setLabel("Speak");
+    setLabel(isSpeaking ? (isPaused ? "Paused" : "Reading...") : "Speak");
   }, 3000);
 }
 
@@ -116,14 +120,14 @@ async function onStop(e) {
   e.preventDefault();
   e.stopPropagation();
   const runId = currentRunId;
-  if (runId) {
-    await send({ type: "STOP", clientId, runId }).catch(() => {});
-  }
+  // Invalidate before awaiting the background: delayed settings/SPEAK must not
+  // resurrect this run or clear a replacement started while STOP is pending.
   currentRunId = null;
   isSpeaking = false;
   isPaused = false;
   widget?.classList.remove("paused");
   setBusy(false, "Speak");
+  if (runId) await send({ type: "STOP", clientId, runId }).catch(() => {});
 }
 
 async function onClick(e) {
@@ -134,25 +138,30 @@ async function onClick(e) {
   if (!text) return;
 
   if (isSpeaking) {
-    if (isPaused) {
-      await send({ type: "RESUME", clientId, runId: currentRunId }).catch(() => {});
-      isPaused = false;
-      widget?.classList.remove("paused");
-      setBusy(true, "Reading...");
-      return;
+    const runId = currentRunId;
+    const pause = !isPaused;
+    try {
+      const response = await send({ type: pause ? "PAUSE" : "RESUME", clientId, runId });
+      if (currentRunId !== runId) return;
+      if (response?.success === false || response?.ignored) throw new Error(response.error || "Playback control failed");
+      isPaused = typeof response?.paused === "boolean" ? response.paused : pause;
+      widget?.classList.toggle("paused", isPaused);
+      setBusy(true, isPaused ? "Paused" : "Reading...");
+    } catch (err) {
+      if (currentRunId === runId) flashError(err.message || "Playback control failed");
     }
-    await send({ type: "PAUSE", clientId, runId: currentRunId }).catch(() => {});
-    isPaused = true;
-    widget?.classList.add("paused");
-    setBusy(true, "Paused");
     return;
   }
 
   currentRunId = `r_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+  const runId = currentRunId;
+  clearTimeout(errorTimer);
+  widget?.classList.remove("error");
   isSpeaking = true;
   isPaused = false;
 
   try {
+    if (text.length > MAX_CHARS) throw new Error(`Selection exceeds ${MAX_CHARS} characters`);
     setBusy(true, "Generating...");
     const settings = await new Promise((resolve) => {
       chrome.storage.sync.get(["voice", "speed", "language", "model", "voicePrefs", "instruct", "fishStyle"], (data) => {
@@ -167,21 +176,24 @@ async function onClick(e) {
       });
     });
 
+    if (currentRunId !== runId) return;
     const response = await send({
       type: "SPEAK",
-      text: text.slice(0, MAX_CHARS),
+      text,
       settings,
       clientId,
-      runId: currentRunId,
+      runId,
       source: "content",
     });
+    if (currentRunId !== runId) return;
     if (response?.success === false) throw new Error(response.error || "Playback failed to start");
   } catch (err) {
-    flashError(err.message || "Couldn't read");
+    if (currentRunId !== runId) return;
     isSpeaking = false;
     isPaused = false;
     currentRunId = null;
     setBusy(false, "Speak");
+    flashError(err.message || "Couldn't read");
   }
 }
 
@@ -191,7 +203,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     sendResponse({ ignored: true });
     return true;
   }
-  if (currentRunId && msg.runId && msg.runId !== currentRunId) {
+  if (msg.runId && msg.runId !== currentRunId) {
     sendResponse({ ignored: true });
     return true;
   }
@@ -211,7 +223,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     return true;
   }
   if (msg.type === "TTS_PROGRESS") {
-    setBusy(true, "Reading...");
+    setBusy(true, isPaused ? "Paused" : "Reading...");
     sendResponse({ ok: true });
     return true;
   }
@@ -219,8 +231,9 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     isSpeaking = false;
     isPaused = false;
     currentRunId = null;
-    flashError(msg.message || "Error");
+    widget?.classList.remove("paused");
     setBusy(false, "Speak");
+    flashError(msg.message || "Error");
     sendResponse({ ok: true });
     return true;
   }
@@ -240,7 +253,7 @@ document.addEventListener("mouseup", () => {
   const sel = window.getSelection();
   const text = sel?.toString().trim();
   if (text) {
-    savedSelection = text.slice(0, MAX_CHARS);
+    savedSelection = text;
     if (sel.rangeCount > 0) _lastRect = sel.getRangeAt(0).getBoundingClientRect();
     showWidget();
   } else {

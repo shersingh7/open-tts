@@ -1,5 +1,38 @@
 # Changelog
 
+## 3.4.3 — Unreleased
+
+### Fixed
+- Rebase playback after a stall without overlapping late buffers; preserve adjacency when buffered.
+- Run-scoped offscreen state and contexts prevent stale decode/startup/resume from affecting a replacement run.
+- Strict final/done validation, idle deadlines and terminal errors replace silent skipped passages and whole-text replay.
+- Native PCM packetization preserves every sample; remove destructive crossfades at arbitrary transport boundaries.
+- Preserve paragraph/list structure, abbreviations and Unicode; reject oversized selections instead of truncating.
+- Cancel response workers on disconnect and prevent cancelled waiters from entering inference.
+- Recover playback ownership after service-worker restart and make duplicate SPEAK delivery idempotent.
+- Prevent delayed popup state restoration from overwriting a new or stopped run.
+- Prevent background recovery from resurrecting a completed session, and use the actual pause state reported by offscreen playback.
+- Reject non-ASCII authentication tokens instead of raising a server error.
+- Release the session and report an error when an audio-device pause/resume operation fails.
+- Send bounded inference keepalives so slow semantic generation does not falsely hit the shorter network-idle deadline; keepalives never extend the inference deadline.
+
+### Changed
+- Bound scheduled audio (20 seconds plus startup lead), decoded PCM (16 MiB) and individual wire frames (8 MiB).
+- Process non-native speed once per bounded semantic unit, independently of model frame size.
+- Full responses use semantic units too, with explicit PCM accumulation limits.
+- Added production-script offline extension/race/soak tests and backend DSP/cancellation regressions. Real-model listening and Chrome lifecycle verification remain separate release gates.
+
+## 3.4.2 — 2026-08-24
+
+### Fixed
+- Popup stuck on "Warming up model..." when reopened while TTS is generating
+- `POST /v1/load-model` returns immediately for the same model during generation without waiting on the lock
+- Popup re-open restores active playback session state (`clientId`/`runId`) so Pause and Stop controls work on in-flight audio
+- Health snapshots report `model_warm: true` during active generation
+
+### Changed
+- Version 3.4.2
+
 ## 3.4.1 — 2026-08-22
 
 ### Fixed

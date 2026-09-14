@@ -45,6 +45,32 @@
       }
       return { message: fallback, code: body.code };
     },
+    interpretHealth(data) {
+      if (!data || typeof data !== "object" || data.status !== "ok") {
+        return { status: "offline", message: "Server offline" };
+      }
+      if (data.state === "failed") {
+        const error = data.warm_error || data.load_error || "Model failed";
+        return { status: "failed", error, message: error };
+      }
+      if (data.model_warm || data.gpu_busy || data.state === "generating" || data.state === "ready") {
+        return {
+          status: "ready",
+          model: data.model || "ready",
+          message: `Connected — ${data.model || "ready"}`,
+        };
+      }
+      if (data.state === "loading" || data.state === "warming" || data.state === "loaded") {
+        return { status: "warming", model: data.model || null, message: "Warming up model..." };
+      }
+      if (!data.model_loaded || data.state === "unloaded") {
+        return { status: "idle", message: "Connected — pick a model" };
+      }
+      if (data.model_loaded) {
+        return { status: "warming", model: data.model || null, message: "Warming up model..." };
+      }
+      return { status: "offline", message: "Server offline" };
+    },
     ok(data = {}) {
       return { success: true, data };
     },
@@ -79,6 +105,23 @@
     isTransientDeliveryError(err) {
       const message = String(err && err.message ? err.message : err || "");
       return /Receiving end does not exist|message port closed|Could not establish connection/i.test(message);
+    },
+    isRetryableCompatibilityError(err) {
+      if (!err || err.name === "AbortError") return false;
+      const code = err.code;
+      const blocked = {
+        unauthorized: true,
+        validation_error: true,
+        stream_cancelled: true,
+        batch_too_large: true,
+        voice_unsupported: true,
+        rate_limited: true,
+        format_unsupported: true,
+      };
+      if (code && blocked[code]) return false;
+      const message = String(err.message || "");
+      if (/unauthor|not be empty|exceeds maximum|cancelled/i.test(message)) return false;
+      return true;
     },
     async sendWithRetry(sendOnce, options) {
       const opts = options || {};

@@ -4,7 +4,14 @@ export const CHUNK_TARGET = 4000;
 export const FIRST_CHUNK_TARGET = 4000;
 export const MAX_HISTORY = 20;
 export const MAX_CHARS = 200000;
+export const MAX_BATCH_TEXTS = 50;
 export const LOAD_MODEL_TIMEOUT_MS = 300000;
+export const PLAYBACK_HIGH_WATER_SECONDS = 20;
+export const PLAYBACK_LOW_WATER_SECONDS = 10;
+export const PLAYBACK_MAX_DECODED_BYTES = 16 * 1024 * 1024;
+export const PLAYBACK_STARTUP_LEAD = 0.25;
+export const STREAM_IDLE_TIMEOUT_MS = 60000;
+export const FALLBACK_WINDOW = 4;
 export const DEFAULTS = {
   model: "kokoro",
   voice: "af_bella",

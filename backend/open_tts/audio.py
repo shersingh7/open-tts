@@ -1,4 +1,10 @@
-"""Audio encoding helpers."""
+"""Audio encoding helpers.
+
+Native-speed PCM is sample-preserving concatenation. Non-native speed uses a
+single WSOLA time-stretch on a bounded semantic unit. Speed=1 is identity.
+This module does not insert silence, fades, overlap-add, or amplitude
+normalization at transport or generation-unit boundaries.
+"""
 
 from __future__ import annotations
 
@@ -8,14 +14,33 @@ from typing import List, Optional, Tuple
 import numpy as np
 import soundfile as sf
 
-from .config import STREAM_PHRASE_SECONDS, STREAM_XFADE_SECONDS, AudioFormat
-from .errors import ErrorCode, http_exception
+from .config import CLIENT_DECODED_BYTE_CAP, STREAM_MAX_EMIT_SECONDS, STREAM_PHRASE_SECONDS, AudioFormat
+from .errors import AudioValidationError, ErrorCode, http_exception
 
 
 def to_f32(arr) -> np.ndarray:
     if hasattr(arr, "dtype") and arr.dtype == np.float32 and isinstance(arr, np.ndarray):
         return arr
     return np.asarray(arr, dtype=np.float32)
+
+
+def as_mono_pcm(arr) -> np.ndarray:
+    """Return 1-D finite float32 PCM. Stereo is rejected, not interleaved."""
+    x = to_f32(arr)
+    if x.size == 0:
+        return np.zeros(0, dtype=np.float32)
+    if x.ndim == 0:
+        raise AudioValidationError("PCM must be an array of samples")
+    if x.ndim == 2:
+        if 1 in x.shape:
+            x = x.reshape(-1)
+        else:
+            raise AudioValidationError("multi-channel PCM is not supported")
+    elif x.ndim != 1:
+        raise AudioValidationError(f"invalid PCM shape {x.shape}")
+    if not np.isfinite(x).all():
+        raise AudioValidationError("PCM contains nonfinite samples")
+    return np.ascontiguousarray(x, dtype=np.float32)
 
 
 def encode_wav(audio: np.ndarray, sample_rate: int) -> bytes:
@@ -27,14 +52,16 @@ def encode_wav(audio: np.ndarray, sample_rate: int) -> bytes:
 def time_stretch(audio: np.ndarray, speed: float, sample_rate: int = 24000) -> np.ndarray:
     """Change duration by ``speed`` without changing pitch (WSOLA).
 
-    Output length is ``round(N / speed)`` so 2.5x is ~1/2.5 of 1x. First and
-    last windows are not faded to silence, which was causing sentence clicks.
+    Output length is ``round(N / speed)``. Speed=1 is an exact identity.
+    Short crumbs reduce the analysis window rather than using linear
+    interpolation, which would pitch-shift speech.
     """
-    x = to_f32(audio).reshape(-1)
+    x = as_mono_pcm(audio)
     rate = float(speed)
     if x.size < 2 or abs(rate - 1.0) < 1e-3:
         return x
-    rate = min(max(rate, 0.5), 3.0)
+    if not np.isfinite(rate) or not 0.5 <= rate <= 3.0:
+        raise AudioValidationError("invalid speed")
     expected = max(1, int(round(x.size / rate)))
     if expected == x.size:
         return x.copy()
@@ -47,24 +74,32 @@ def time_stretch(audio: np.ndarray, speed: float, sample_rate: int = 24000) -> n
     if win % 2:
         win += 1
     if x.size < win or expected < win:
-        idx = np.linspace(0, x.size - 1, expected)
-        return np.interp(idx, np.arange(x.size, dtype=np.float64), x).astype(np.float32)
+        win = max(8, (min(x.size, expected) // 2) * 2)
+        if win % 2:
+            win += 1
+    if x.size < win or expected < win:
+        # Sub-millisecond crumbs have no meaningful pitch period; nearest-sample
+        # resampling is limited to this exceptional short-input case.
+        idx = np.round(np.linspace(0, x.size - 1, expected)).astype(np.int64)
+        return x[idx]
 
     hop_out = max(1, win // 2)
-    n_win = max(2, int(round((expected - win) / hop_out)) + 1)
+    n_win = max(2, int(np.ceil((expected - win) / hop_out)) + 1)
     hann = np.hanning(win).astype(np.float32)
     out = np.zeros(expected, dtype=np.float32)
     weight = np.zeros(expected, dtype=np.float32)
     max_in = max(0, x.size - win)
     search = max(hop_out // 2, 4)
     prev = None
+    prev_write = 0
 
     for i in range(n_win):
         frac = i / (n_win - 1)
         in_pos = int(round(frac * max_in))
-        write = min(int(round(frac * (expected - win))), expected - win)
+        write = min(i * hop_out, expected - win)
+        actual_hop = write - prev_write if prev is not None else hop_out
         if prev is not None:
-            target = prev[hop_out:]
+            target = prev[actual_hop:]
             lo = max(0, in_pos - search)
             hi = min(max_in, in_pos + search)
             if hi >= lo and target.size:
@@ -84,6 +119,7 @@ def time_stretch(audio: np.ndarray, speed: float, sample_rate: int = 24000) -> n
         out[sl] += frame * w
         weight[sl] += w
         prev = frame
+        prev_write = write
 
     nz = weight > 1e-6
     out[nz] /= weight[nz]
@@ -91,10 +127,11 @@ def time_stretch(audio: np.ndarray, speed: float, sample_rate: int = 24000) -> n
 
 
 class PhraseStreamPacker:
-    """Accumulate 1x PCM to a phrase, apply speed once, crossfade joins.
+    """Accumulate 1x PCM to a phrase-sized unit, then emit processed audio.
 
-    Independent WSOLA on word-sized grains fades every edge to silence.
-    This packer is the single stretch/join path the stream coordinator uses.
+    Native speed and speed=1 concatenate input samples exactly. Non-native
+    speed runs one WSOLA pass on the accumulated unit. Adjacent units are
+    concatenated with no overlap, fade, or amplitude normalization.
     """
 
     def __init__(
@@ -103,105 +140,118 @@ class PhraseStreamPacker:
         speed: float,
         native: bool,
         phrase_seconds: float = STREAM_PHRASE_SECONDS,
-        xfade_seconds: float = STREAM_XFADE_SECONDS,
+        xfade_seconds: float = 0.0,
+        max_emit_seconds: float = STREAM_MAX_EMIT_SECONDS,
+        max_decoded_bytes: int = CLIENT_DECODED_BYTE_CAP,
     ):
         self.speed = float(speed)
         self.native = bool(native)
         self.phrase_seconds = float(phrase_seconds)
-        self.xfade_seconds = float(xfade_seconds)
+        self.xfade_seconds = float(xfade_seconds)  # retained for callers; unused
+        self.max_emit_seconds = float(max_emit_seconds)
+        self.max_decoded_bytes = int(max_decoded_bytes)
         self._parts: List[np.ndarray] = []
-        self._sr = 24000
-        self._tail: Optional[np.ndarray] = None
-        self._carry_1x: Optional[np.ndarray] = None
+        self._sr: Optional[int] = None
+        self._part_samples = 0
+        self._pending: List[np.ndarray] = []
 
     def _min_samples(self) -> int:
-        # At 3x, 1.2s of 1x PCM is only 0.4s of playback and the next
-        # generate overruns. Pack enough 1x so each emitted frame is about
-        # phrase_seconds of listening time.
+        sr = self._sr or 24000
         seconds = self.phrase_seconds
         if not self.native and self.speed > 1.0:
             seconds = self.phrase_seconds * self.speed
-        return max(int(self._sr * seconds), 64)
+        return max(int(sr * seconds), 64)
 
-    def _speed(self, audio: np.ndarray) -> np.ndarray:
-        if self.native or audio.size == 0 or abs(self.speed - 1.0) < 1e-3:
+    def _max_emit_samples(self) -> int:
+        sr = self._sr or 24000
+        by_time = max(int(sr * self.max_emit_seconds), 64)
+        by_bytes = max(self.max_decoded_bytes // 4, 64)
+        return min(by_time, by_bytes)
+
+    def _identity(self) -> bool:
+        return self.native or abs(self.speed - 1.0) < 1e-3
+
+    def _process(self, audio: np.ndarray) -> np.ndarray:
+        if audio.size == 0 or self._identity():
             return audio
-        carry = self._carry_1x
-        if carry is not None and carry.size:
-            stretched = time_stretch(np.concatenate([carry, audio]), self.speed, self._sr)
-            skip = min(stretched.size, max(0, int(round(carry.size / self.speed))))
-            return stretched[skip:] if skip < stretched.size else stretched[-1:]
-        return time_stretch(audio, self.speed, self._sr)
+        return time_stretch(audio, self.speed, self._sr or 24000)
 
-    def _crossfade(self, audio: np.ndarray, *, final: bool) -> Optional[np.ndarray]:
-        xfade_s = self.xfade_seconds
-        if not self.native and self.speed > 1.0:
-            xfade_s = max(self.xfade_seconds, 0.015 * self.speed)
-        n = max(1, int(round(self._sr * xfade_s)))
-        if self._tail is None:
-            if final or audio.size <= n:
-                return audio
-            self._tail = audio[-n:].copy()
-            return audio[:-n]
-        xfade = min(n, self._tail.size, audio.size)
-        t = np.linspace(0.0, 1.0, xfade, dtype=np.float32)
-        fade_out = np.cos(t * np.pi / 2.0)
-        fade_in = np.sin(t * np.pi / 2.0)
-        prefix = self._tail[:-xfade] if xfade < self._tail.size else self._tail[:0]
-        overlap = self._tail[-xfade:]
-        mixed = overlap * fade_out + audio[:xfade] * fade_in
-        rest_audio = audio[xfade:]
-        pieces = []
-        if prefix.size:
-            pieces.append(prefix)
-        pieces.append(mixed)
-        if rest_audio.size:
-            pieces.append(rest_audio)
-        body = np.concatenate(pieces) if len(pieces) > 1 else pieces[0]
-        self._tail = None
-        if final or body.size <= n:
-            return body
-        self._tail = body[-n:].copy()
-        return body[:-n]
+    def _accept_rate(self, sample_rate: int) -> int:
+        sr = int(sample_rate)
+        if sr < 8000 or sr > 192000:
+            raise AudioValidationError("invalid sample rate")
+        if self._sr is None:
+            self._sr = sr
+        elif sr != self._sr:
+            raise AudioValidationError("mid-stream sample rate change")
+        return sr
+
+    def _queue_processed(self, processed: np.ndarray) -> None:
+        if processed.size == 0:
+            return
+        cap = self._max_emit_samples()
+        if processed.size <= cap:
+            self._pending.append(processed)
+            return
+        for i in range(0, processed.size, cap):
+            piece = processed[i : i + cap]
+            if piece.size:
+                self._pending.append(piece)
+
+    def take(self) -> Optional[np.ndarray]:
+        if not self._pending:
+            return None
+        return self._pending.pop(0)
+
+    def take_all(self) -> List[np.ndarray]:
+        out = self._pending
+        self._pending = []
+        return out
 
     def push(self, audio: np.ndarray, sample_rate: int) -> Optional[np.ndarray]:
-        chunk = to_f32(audio).reshape(-1)
+        chunk = as_mono_pcm(audio)
         if chunk.size == 0:
-            return None
-        self._sr = int(sample_rate) or 24000
+            return self.take()
+        self._accept_rate(sample_rate)
+        self._part_samples += chunk.size
+        if not self._identity() and self._part_samples * 4 > 32 * 1024 * 1024:
+            raise AudioValidationError("semantic audio unit exceeds 32 MiB; use shorter text units")
         self._parts.append(chunk)
-        if sum(part.size for part in self._parts) < self._min_samples():
-            return None
-        return self.flush(final=False)
+        if self._identity() and self._part_samples >= self._min_samples():
+            merged = np.concatenate(self._parts) if len(self._parts) > 1 else self._parts[0]
+            self._parts = []
+            self._part_samples = 0
+            self._queue_processed(self._process(merged))
+        return self.take()
 
     def flush(self, final: bool = True) -> Optional[np.ndarray]:
         if self._parts:
             merged = np.concatenate(self._parts) if len(self._parts) > 1 else self._parts[0]
             self._parts = []
-            stretched = self._speed(merged)
-            carry_s = 0.03 * (self.speed if not self.native and self.speed > 1.0 else 1.0)
-            n_carry = max(int(self._sr * carry_s), 1)
-            self._carry_1x = merged[-n_carry:].copy() if merged.size else None
-            if final:
-                self._carry_1x = None
-            return self._crossfade(stretched, final=final)
-        if final and self._tail is not None:
-            tail, self._tail = self._tail, None
-            self._carry_1x = None
-            return tail
-        return None
+            self._part_samples = 0
+            self._queue_processed(self._process(merged))
+        return self.take()
+
+    def drain(self) -> List[np.ndarray]:
+        first = self.flush(final=True)
+        rest = self.take_all()
+        if first is None:
+            return rest
+        return [first, *rest]
 
 
 def encode_audio(audio: np.ndarray, sample_rate: int, fmt: AudioFormat) -> Tuple[bytes, str]:
     if fmt == AudioFormat.WAV:
-        return encode_wav(audio, sample_rate), fmt.mime_type
+        return encode_wav(as_mono_pcm(audio), sample_rate), fmt.mime_type
 
     try:
         from mlx_audio.audio_io import write as audio_write
 
         buf = io.BytesIO()
-        audio_write(buf, audio, sample_rate, format=fmt.value)
+        audio_write(buf, as_mono_pcm(audio), sample_rate, format=fmt.value)
         return buf.getvalue(), fmt.mime_type
+    except AudioValidationError:
+        raise
     except Exception as exc:
         raise http_exception(
             500,

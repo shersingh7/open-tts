@@ -290,11 +290,10 @@ def test_stream_emits_held_tail_when_last_grain_shorter_than_xfade(fake_loader):
         np.linspace(0.2, 0.35, short, dtype=np.float32),
     ]
     joined, _ = _stream_pcm(coord, "kokoro", "Tail must not vanish.", "af_bella", 1.0)
-    overlap = short
-    expected = phrase + short - overlap
+    expected = phrase + short
     assert joined.size > 0
     assert abs(joined.size - expected) <= 8, f"got {joined.size} expected ~{expected} (discarded tail)"
-    assert float(np.max(np.abs(np.diff(joined)))) < 0.15
+    np.testing.assert_allclose(joined, np.concatenate(model.part_signals), atol=1/32768)
 
 
 def test_stream_3x_keeps_joins_continuous(fake_loader):
@@ -417,7 +416,80 @@ def test_generate_serialized_while_health_snapshot_stays_unlocked(fake_loader):
     snap = coord.snapshot()
     assert time.perf_counter() - started < 0.05
     assert snap["gpu_busy"] is True
+    assert snap["model_warm"] is True
+    assert snap["state"] == ModelState.GENERATING.value
     hold.set()
     t.join(timeout=10)
     assert not errors
     assert coord.state == ModelState.READY
+
+
+def test_load_same_model_while_generate_in_flight_returns_immediately(fake_loader):
+    coord = ModelCoordinator()
+    coord.load("kokoro")
+    model = fake_loader["kokoro"]
+    hold = threading.Event()
+    model.hold_generate = hold
+    model.generate_started.clear()
+
+    errors = []
+
+    def worker():
+        try:
+            coord.generate_full("kokoro", "Hello in flight", "af_bella", 1.0)
+        except Exception as exc:
+            errors.append(exc)
+
+    t = threading.Thread(target=worker)
+    t.start()
+    assert model.generate_started.wait(timeout=5)
+    try:
+        started = time.perf_counter()
+        res = coord.load("kokoro")
+        elapsed = time.perf_counter() - started
+        assert elapsed < 0.1
+        assert res["model"] == "kokoro"
+        assert res["state"] == ModelState.GENERATING.value
+    finally:
+        hold.set()
+        t.join(timeout=10)
+    assert not errors
+    assert coord.state == ModelState.READY
+
+
+def test_snapshot_model_warm_and_gpu_busy_states():
+    coord = ModelCoordinator()
+    # Unloaded
+    snap = coord.snapshot()
+    assert snap["model_warm"] is False
+    assert snap["gpu_busy"] is False
+
+    # Loading / Loaded / Warming
+    coord.state = ModelState.LOADING
+    assert coord.snapshot()["model_warm"] is False
+    assert coord.snapshot()["gpu_busy"] is False
+
+    coord.state = ModelState.LOADED
+    assert coord.snapshot()["model_warm"] is False
+    assert coord.snapshot()["gpu_busy"] is False
+
+    coord.state = ModelState.WARMING
+    assert coord.snapshot()["model_warm"] is False
+    assert coord.snapshot()["gpu_busy"] is False
+
+    # Ready
+    coord.state = ModelState.READY
+    snap_ready = coord.snapshot()
+    assert snap_ready["model_warm"] is True
+    assert snap_ready["gpu_busy"] is False
+
+    # Generating
+    coord.state = ModelState.GENERATING
+    snap_gen = coord.snapshot()
+    assert snap_gen["model_warm"] is True
+    assert snap_gen["gpu_busy"] is True
+
+    # Failed
+    coord.state = ModelState.FAILED
+    assert coord.snapshot()["model_warm"] is False
+    assert coord.snapshot()["gpu_busy"] is False

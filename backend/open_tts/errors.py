@@ -24,7 +24,16 @@ class ErrorCode(str, Enum):
     RATE_LIMITED = "rate_limited"
     STREAM_CANCELLED = "stream_cancelled"
     STREAM_TIMEOUT = "stream_timeout"
+    AUDIO_INVALID = "audio_invalid"
     INTERNAL = "internal_error"
+
+
+class AudioValidationError(ValueError):
+    """Invalid PCM that must not be silently coerced."""
+
+    def __init__(self, message: str, code: ErrorCode = ErrorCode.AUDIO_INVALID):
+        super().__init__(message)
+        self.code = code
 
 
 def error_detail(

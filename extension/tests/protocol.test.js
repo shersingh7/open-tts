@@ -127,3 +127,95 @@ describe("offscreen delivery retry", () => {
     expect(calls).toBe(1);
   });
 });
+
+describe("interpretHealth", () => {
+  let protocol;
+  beforeAll(() => {
+    const g = {};
+    new Function("globalThis", readFileSync(join(sharedDir, "protocol-umd.js"), "utf8"))(g);
+    protocol = g.OpenTTSProtocol;
+  });
+
+  it("treats generating + gpu_busy + model_loaded as ready / connected (not warming)", () => {
+    const res = protocol.interpretHealth({
+      status: "ok",
+      state: "generating",
+      gpu_busy: true,
+      model_loaded: true,
+      model_warm: true,
+      model: "kokoro",
+    });
+    expect(res.status).toBe("ready");
+    expect(res.message).toBe("Connected — kokoro");
+  });
+
+  it("treats ready + model_warm as ready", () => {
+    const res = protocol.interpretHealth({
+      status: "ok",
+      state: "ready",
+      gpu_busy: false,
+      model_loaded: true,
+      model_warm: true,
+      model: "kokoro",
+    });
+    expect(res.status).toBe("ready");
+    expect(res.message).toBe("Connected — kokoro");
+  });
+
+  it("treats unloaded / !model_loaded + status ok as idle (pick a model)", () => {
+    const res = protocol.interpretHealth({
+      status: "ok",
+      state: "unloaded",
+      model_loaded: false,
+      model_warm: false,
+      gpu_busy: false,
+    });
+    expect(res.status).toBe("idle");
+    expect(res.message).toBe("Connected — pick a model");
+  });
+
+  it("treats warming/loading/loaded as warming even before model_loaded is true", () => {
+    for (const state of ["warming", "loading", "loaded"]) {
+      const res = protocol.interpretHealth({
+        status: "ok",
+        state,
+        model_loaded: state !== "loading",
+        model_warm: false,
+        gpu_busy: false,
+        model: "kokoro",
+      });
+      expect(res.status).toBe("warming");
+      expect(res.message).toBe("Warming up model...");
+    }
+  });
+
+  it("treats failed + warm_error or load_error as failed immediately", () => {
+    const resWarm = protocol.interpretHealth({
+      status: "ok",
+      state: "failed",
+      warm_error: "Warmup OOM",
+      model_loaded: false,
+      model_warm: false,
+      gpu_busy: false,
+    });
+    expect(resWarm.status).toBe("failed");
+    expect(resWarm.error).toBe("Warmup OOM");
+
+    const resLoad = protocol.interpretHealth({
+      status: "ok",
+      state: "failed",
+      load_error: "Corrupt weights",
+      model_loaded: false,
+      model_warm: false,
+      gpu_busy: false,
+    });
+    expect(resLoad.status).toBe("failed");
+    expect(resLoad.error).toBe("Corrupt weights");
+  });
+
+  it("treats missing or not ok as offline", () => {
+    expect(protocol.interpretHealth(null).status).toBe("offline");
+    expect(protocol.interpretHealth(undefined).status).toBe("offline");
+    expect(protocol.interpretHealth({ status: "error" }).status).toBe("offline");
+  });
+});

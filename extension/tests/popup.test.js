@@ -30,3 +30,17 @@ describe("popup Signal Chassis", () => {
     }
   });
 });
+
+describe("popup health check & playback restore contracts", () => {
+  it("checkServer uses interpretHealth to treat generating/gpu_busy as connected", () => {
+    const js = readFileSync(join(root, "..", "popup.js"), "utf8");
+    expect(js).toMatch(/interpretHealth/);
+    expect(js).not.toMatch(/if\s*\(\s*data\.model_loaded\s*\)\s*\{\s*setServerUI\(\s*["']loading["']/);
+  });
+
+  it("init restores in-flight playback state via GET_PLAYBACK_STATE", () => {
+    const js = readFileSync(join(root, "..", "popup.js"), "utf8");
+    expect(js).toMatch(/GET_PLAYBACK_STATE/);
+    expect(js).toMatch(/restorePlaybackState/);
+  });
+});

@@ -48,10 +48,8 @@ def test_packer_emits_held_tail_when_next_phrase_shorter_than_xfade():
     if leftover is not None:
         frames.append(leftover)
     joined = np.concatenate(frames)
-    overlap = min(int(round(sr * xfade)), short.size)
-    expected = first.size + short.size - overlap
-    assert abs(joined.size - expected) <= 2, f"got {joined.size} expected ~{expected}"
-    assert float(np.max(np.abs(np.diff(joined)))) < 0.15
+    np.testing.assert_array_equal(joined, np.concatenate([first, short]))
+
 
 
 def test_packer_3x_phrase_is_long_enough_to_avoid_underrun():

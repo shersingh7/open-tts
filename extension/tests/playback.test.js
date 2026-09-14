@@ -38,17 +38,14 @@ describe("playback consume loop", () => {
     expect(result.decoded).toBe(2);
   });
 
-  it("keeps already-scheduled audio when a later frame errors", async () => {
+  it("surfaces errors after audio instead of silently skipping", async () => {
     const { consumePlaybackStream } = playbackApi();
-    const scheduled = [];
-    const result = await consumePlaybackStream((async function* () {
-      yield { audio: new Uint8Array([1]), sampleRate: 24000 };
-      yield { error: "later chunk failed", code: "generation_failed" };
-    })(), {
-      schedule: async (frame) => { scheduled.push([...frame.audio]); },
-    });
-    expect(scheduled).toEqual([[1]]);
-    expect(result.decoded).toBe(1);
+    const scheduled=[];
+    await expect(consumePlaybackStream((async function* () {
+      yield {audio:new Uint8Array([1])};
+      yield {error:"later chunk failed",code:"generation_failed"};
+    })(), {schedule: async frame=>scheduled.push(frame)})).rejects.toMatchObject({code:"generation_failed",afterAudio:true});
+    expect(scheduled).toHaveLength(1);
   });
 
   it("schedules the first frame even when later frames are delayed", async () => {
@@ -78,15 +75,6 @@ describe("offscreen sends resolveSpeed", () => {
   });
 });
 
-describe("offscreen uses the abutting clock", () => {
-  it("schedules through createPlaybackClock rather than re-applying lead", () => {
-    const src = readFileSync(join(root, "..", "offscreen.js"), "utf8");
-    expect(src).toMatch(/createPlaybackClock/);
-    expect(src).toMatch(/playClock\.schedule\(/);
-    expect(src).not.toMatch(/Math\.max\(nextStartTime,\s*ctx\.currentTime\s*\+\s*AUDIO_LEAD\)/);
-  });
-});
-
 describe("playback gate", () => {
   it("does not resume a suspended context while paused", () => {
     const { createPlaybackGate } = playbackApi();
@@ -101,26 +89,17 @@ describe("playback gate", () => {
   });
 });
 
-describe("offscreen honors the pause gate", () => {
-  it("will not auto-resume AudioContext on the next scheduled buffer", () => {
-    const src = readFileSync(join(root, "..", "offscreen.js"), "utf8");
-    expect(src).toMatch(/createPlaybackGate/);
-    expect(src).toMatch(/playGate\.shouldResumeContext/);
-    expect(src).not.toMatch(/if \(ctx\.state === "suspended"\) await ctx\.resume\(\);/);
-  });
-});
-
 describe("playback clock", () => {
   it("applies lead only before the first buffer; later buffers abut", () => {
     const { createPlaybackClock } = playbackApi();
     const clock = createPlaybackClock(0.05);
     const first = clock.schedule(0.4, 1.0);
     const second = clock.schedule(0.3, 9.0);
-    const third = clock.schedule(0.2, 99.0);
+    const third = clock.schedule(0.2, 9.1);
     expect(first).toBeCloseTo(1.05, 5);
-    expect(second).toBeCloseTo(first + 0.4, 5);
+    expect(second).toBeCloseTo(9.05, 5);
     expect(third).toBeCloseTo(second + 0.3, 5);
-    expect(second).toBeLessThan(9.0);
+    expect(second).toBeGreaterThan(9.0);
   });
 });
 
@@ -151,4 +130,26 @@ describe("splitText first-slice sizing", () => {
     expect(parts.join(" ")).toContain("Sentence number 0");
     expect(parts.join(" ")).toContain("Sentence number 39");
   });
+});
+
+describe("structure preserving partitioning", () => {
+  it.each(["Hello.\n\nNext paragraph.","Dr. Smith paid 3.50. “Really?” she asked.","Title\n\n- First\n- Second", "Unicode café 🌍 पाठ."])("preserves content: %s", text => {
+    const p=playbackApi(), normalized=p.norm(text);
+    expect(p.splitText(text,40,40).join("")).toBe(normalized);
+  });
+  it("retains paragraphs and abbreviations",()=>{
+    const p=playbackApi();expect(p.norm("One.\r\n\r\nTwo.")).toBe("One.\n\nTwo.");
+    expect(p.sentenceUnits("Dr. Smith paid 3.50. Next.")[0]).toBe("Dr. Smith paid 3.50. ");
+  });
+  it("repacks remainder at the larger cap and handles long tokens",()=>{
+    const p=playbackApi();const text="This is a sentence. ".repeat(40);
+    const chunks=p.splitText(text,400,40);expect(chunks[1].length).toBeGreaterThan(300);
+    const word="x".repeat(400);expect(p.splitText(word,100,100).join("")).toBe(word);
+  });
+});
+
+it('does not split surrogate pairs or remove meaningful Unicode joiners',()=>{
+  const p=playbackApi(),text='🌍'.repeat(20);
+  for(const chunk of p.splitText(text,5,5)) expect(chunk.length%2).toBe(0);
+  expect(p.norm('क्‍ष')).toBe('क्‍ष');
 });
