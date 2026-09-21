@@ -1,5 +1,18 @@
 # Changelog
 
+## 3.5.0 — 2026-09-21 (source/package candidate)
+
+- Model-aware short opening/later generation units; two-second default packets, capped at four seconds.
+- Rolling remaining-audio look-ahead, lazy frame parsing, and byte-bounded transport/decode.
+- Single model-owner thread with bounded admission, disconnect cancellation, retained leases for noncooperative native work, and output/body limits.
+- Negotiated stream v2 with sequences, source coverage, unit progress, sample counts and explicit terminal outcomes; v1 API compatibility retained.
+- Shared Reader/offscreen engine; visible Reader for long selections and slower models, worker recovery, owner-loss errors and explicit passage retry.
+- Snapshot current popup controls for Speak; keep instructions local with verified migration, surface storage failures, and save only completed history without requiring an open popup.
+- Detect reported token exhaustion rather than treating it as completion.
+- Verify isolated process groups before group signals, check child exit with poll(), and retain PID records until confirmed stop. LaunchAgent defaults to on-demand.
+- Isolated offline tests, measured generation/processed-audio RTF, incremental opt-in qualification runners and updated privacy/API documentation.
+- Real models, audible Chrome behavior, long pauses/sleep-wake and natural speech boundaries remain separately authorized release gates. No runtime installation is performed by this build.
+
 ## 3.4.3 — Unreleased
 
 ### Fixed

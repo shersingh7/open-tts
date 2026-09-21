@@ -13,20 +13,21 @@ from typing import Any, Callable, Dict, Generator, List, Optional, Tuple
 import numpy as np
 from fastapi import HTTPException
 
-from .adapters import build_gen_kwargs, get_model_voices, split_kokoro_chunks, split_stream_text
+from .adapters import build_gen_kwargs, get_model_voices, split_kokoro_chunks
 from .audio import PhraseStreamPacker, as_mono_pcm, encode_audio, encode_wav, time_stretch
 from .errors import AudioValidationError, ErrorCode, http_exception
 from .config import (
     BACKEND_DIR,
     DEFAULT_MODEL,
     GEN_TIMEOUT,
-    STREAM_FIRST_CHUNK_CHARS,
-    STREAM_REST_CHUNK_CHARS,
     STREAMING_INTERVAL,
     WARMUP_TEXT,
     AudioFormat,
 )
 from .protocol import pack_frame
+from .text import plan_generation_units
+from .runtime import check_job
+from .config import MAX_BATCH_OUTPUT_BYTES, MAX_FULL_PCM_BYTES
 from .registry import MODEL_REGISTRY
 
 
@@ -117,6 +118,7 @@ class ModelCoordinator:
         _clear_gpu_memory()
 
     def load(self, model_id: str, *, force: bool = False) -> dict:
+        check_job()
         if model_id not in MODEL_REGISTRY:
             raise http_exception(404, ErrorCode.MODEL_NOT_FOUND, f"Unknown model: {model_id}")
 
@@ -196,7 +198,13 @@ class ModelCoordinator:
                 kwargs["voice"] = default
                 if reg.get("supports_lang_code"):
                     kwargs["lang_code"] = "en"
-            next(self.model.generate(**kwargs))
+            check_job()
+            warmup = self.model.generate(**kwargs)
+            try:
+                next(warmup)
+            finally:
+                warmup.close()
+            check_job()
             self.warm_error = None
             self.state = ModelState.READY
         except Exception as exc:
@@ -236,25 +244,45 @@ class ModelCoordinator:
             if self._cancel.is_set() or (cancel_check and cancel_check()):
                 raise http_exception(499, ErrorCode.STREAM_CANCELLED, "Generation cancelled")
             nonlocal stop_at
-            for result in model.generate(**kwargs):
+            def check():
+                check_job()
                 if self._cancel.is_set() or (cancel_check and cancel_check()):
                     raise http_exception(499, ErrorCode.STREAM_CANCELLED, "Generation cancelled")
                 if time.perf_counter() > stop_at:
                     raise http_exception(504, ErrorCode.GENERATION_TIMEOUT, f"Exceeded {GEN_TIMEOUT}s")
-                audio = as_mono_pcm(result.audio)
-                if audio.size == 0:
-                    continue
-                sr = int(result.sample_rate)
-                if sr < 8000 or sr > 192000:
-                    raise http_exception(500, ErrorCode.AUDIO_INVALID, "invalid sample rate")
-                paused_at = time.perf_counter()
-                yield (
-                    audio,
-                    int(result.sample_rate),
-                    float(getattr(result, "real_time_factor", 0.0) or 0.0),
-                )
-                # Time blocked by HTTP/playback backpressure is not inference.
-                stop_at += time.perf_counter() - paused_at
+
+            check()
+            iterator = iter(model.generate(**kwargs))
+            try:
+                while True:
+                    check()
+                    started = time.perf_counter()
+                    try:
+                        result = next(iterator)
+                    except StopIteration:
+                        check()
+                        return
+                    check()
+                    count = getattr(result, "token_count", 0) or 0
+                    if getattr(result, "finish_reason", None) in ("length", "max_tokens") or (
+                        kwargs.get("max_tokens") and count >= kwargs["max_tokens"]
+                    ):
+                        raise http_exception(422, ErrorCode.GENERATION_FAILED, "Output token limit reached; passage may be incomplete")
+                    audio = as_mono_pcm(result.audio)
+                    if audio.size == 0:
+                        continue
+                    sr = int(result.sample_rate)
+                    if sr < 8000 or sr > 192000:
+                        raise http_exception(500, ErrorCode.AUDIO_INVALID, "invalid sample rate")
+                    rtf = (time.perf_counter() - started) / (audio.size / sr)
+                    paused_at = time.perf_counter()
+                    yield audio, sr, rtf
+                    # Time blocked by HTTP/playback backpressure is not inference.
+                    stop_at += time.perf_counter() - paused_at
+            finally:
+                close = getattr(iterator, "close", None)
+                if close:
+                    close()
 
         yielded = False
         try:
@@ -283,12 +311,15 @@ class ModelCoordinator:
         sr: Optional[int] = None
         rtf = 0.0
         sample_bytes = 0
+        generation_seconds = audio_seconds = 0.0
         for audio, part_sr, part_rtf in self._iter_audio_results(model, gen_kwargs, model_id):
             if sr is None:
                 sr = part_sr
                 rtf = part_rtf
             elif int(part_sr) != int(sr):
                 raise http_exception(500, ErrorCode.AUDIO_INVALID, "mid-stream sample rate change")
+            generation_seconds += part_rtf * audio.size / part_sr
+            audio_seconds += audio.size / part_sr
             sample_bytes += audio.nbytes
             if sample_bytes > 32 * 1024 * 1024:
                 raise http_exception(500, ErrorCode.AUDIO_INVALID, "Semantic audio exceeds 32 MiB")
@@ -298,29 +329,33 @@ class ModelCoordinator:
             raise http_exception(500, ErrorCode.GENERATION_FAILED, "No audio generated")
 
         audio = np.concatenate(parts) if len(parts) > 1 else parts[0]
-        return audio, sr or 24000, rtf
+        return audio, sr or 24000, generation_seconds / audio_seconds
 
     def _synthesize_pcm(self, model, gen_kwargs: dict, model_id: str, speed: float):
         """Full responses use the same bounded semantic/speed units as streaming."""
         outputs = []
         sr = None
         total_bytes = 0
+        generation_seconds = audio_seconds = 0.0
         rtf = 0.0
         native = MODEL_REGISTRY.get(model_id, {}).get("supports_native_speed", False)
-        for text in split_stream_text(gen_kwargs["text"], STREAM_FIRST_CHUNK_CHARS, STREAM_REST_CHUNK_CHARS):
-            pcm, rate, rtf = self._generate_parts(model, {**gen_kwargs, "text": text}, model_id)
+        for unit in plan_generation_units(gen_kwargs["text"], model_id):
+            check_job()
+            pcm, rate, rtf = self._generate_parts(model, {**gen_kwargs, "text": unit.text}, model_id)
             if sr is not None and sr != rate:
                 raise http_exception(500, ErrorCode.AUDIO_INVALID, "mid-stream sample rate change")
             sr = rate
+            generation_seconds += rtf * pcm.size / rate
             pcm = self._apply_requested_speed(pcm, speed, rate, native=native)
+            audio_seconds += pcm.size / rate
             total_bytes += pcm.nbytes
-            if total_bytes > 128 * 1024 * 1024:
+            if total_bytes > MAX_FULL_PCM_BYTES:
                 raise http_exception(413, ErrorCode.AUDIO_INVALID, "Full audio exceeds 128 MiB; use streaming")
             outputs.append(pcm)
         if not outputs:
             raise http_exception(500, ErrorCode.GENERATION_FAILED, "No audio generated")
         assert sr is not None
-        return np.concatenate(outputs) if len(outputs) > 1 else outputs[0], sr, rtf
+        return np.concatenate(outputs) if len(outputs) > 1 else outputs[0], sr, generation_seconds / audio_seconds
 
     def _apply_requested_speed(self, audio: np.ndarray, speed: float, sample_rate: int, *, native: bool) -> np.ndarray:
         pcm = as_mono_pcm(audio)
@@ -337,6 +372,7 @@ class ModelCoordinator:
             "apply_playback_rate": False,
             "playback_rate": 1.0,
             "final": False,
+            "samples": int(audio.size),
             **extra,
         }, wav)
 
@@ -396,6 +432,7 @@ class ModelCoordinator:
             raise http_exception(503, ErrorCode.GPU_BUSY, "GPU busy")
 
         results: List[dict] = []
+        output_bytes = 0
         try:
             self._cancel.clear()
             if self.model_id != model_id or self.model is None:
@@ -405,6 +442,7 @@ class ModelCoordinator:
             self.state = ModelState.GENERATING
 
             for idx, text in enumerate(texts):
+                check_job()
                 try:
                     gen_kwargs, _ = build_gen_kwargs(
                         model_id, text, voice, speed, self.voices(model_id),
@@ -412,12 +450,17 @@ class ModelCoordinator:
                     )
                     audio, sr, rtf = self._synthesize_pcm(self.model, gen_kwargs, model_id, speed)
                     audio_bytes, _ = encode_audio(audio, sr, fmt)
+                    output_bytes += ((len(audio_bytes) + 2) // 3) * 4
+                    if output_bytes > MAX_BATCH_OUTPUT_BYTES:
+                        raise http_exception(413, ErrorCode.BATCH_TOO_LARGE, "Batch audio exceeds memory budget; use streaming")
                     results.append({
                         "index": idx,
                         "audio_base64": base64.b64encode(audio_bytes).decode(),
                         "rtf": rtf,
                     })
                 except HTTPException as exc:
+                    if exc.status_code in (413, 499, 504):
+                        raise
                     detail = exc.detail if isinstance(exc.detail, dict) else {"message": str(exc.detail)}
                     results.append({"index": idx, "error": detail.get("message", str(exc.detail)), "code": detail.get("code")})
                 except Exception as exc:
@@ -442,7 +485,10 @@ class ModelCoordinator:
         language: str = "Auto",
         instruct: Optional[str] = None,
         cancel_check: Optional[Callable[[], bool]] = None,
+        protocol_version: int = 1,
     ) -> Generator[bytes, None, None]:
+        stream_started = time.perf_counter()
+        first_pcm_seconds = None
         reg = MODEL_REGISTRY.get(model_id, {})
         supports_stream = reg.get("supports_streaming", True)
         supports_native = reg.get("supports_native_speed", False)
@@ -489,44 +535,65 @@ class ModelCoordinator:
                 return
             self.state = ModelState.GENERATING
 
+            model_ready_seconds = time.perf_counter() - stream_started
+            next_unit_id = 0
             for idx, text in enumerate(texts):
                 if cancel_check and cancel_check():
                     self._cancel.set()
                     yield pack_frame({"index": idx, "error": "cancelled", "code": ErrorCode.STREAM_CANCELLED.value})
                     return
 
-                slices = split_stream_text(text, STREAM_FIRST_CHUNK_CHARS, STREAM_REST_CHUNK_CHARS)
+                units = plan_generation_units(text, model_id, transport_index=idx, first_unit_id=next_unit_id)
+                next_unit_id += len(units)
                 try:
                     packer = PhraseStreamPacker(speed=speed, native=supports_native)
                     packer_sr = 24000
                     emitted_any = False
-                    for slice_text in slices:
+                    for unit in units:
+                        check_job()
+                        frame_meta = ({} if supports_stream else {"fallback": "non-streaming"})
+                        if protocol_version == 2:
+                            frame_meta.update(unit_id=unit.unit_id, start=unit.start, end=unit.end)
                         gen_kwargs, _ = build_gen_kwargs(
-                            model_id, slice_text, voice, speed, self.voices(model_id),
+                            model_id, unit.text, voice, speed, self.voices(model_id),
                             language=language, instruct=instruct,
                             stream=supports_stream, streaming_interval=STREAMING_INTERVAL,
                         )
                         unit_had_audio = False
+                        unit_generation_seconds = 0.0
+                        unit_processed_seconds = 0.0
                         for audio, sr, _rtf in self._iter_audio_results(
                             self.model, gen_kwargs, model_id, cancel_check=cancel_check,
                         ):
                             unit_had_audio = True
+                            if first_pcm_seconds is None:
+                                first_pcm_seconds = time.perf_counter() - stream_started
+                            unit_generation_seconds += _rtf * audio.size / sr
+                            if protocol_version == 2:
+                                frame_meta.update(model_ready_seconds=model_ready_seconds, first_pcm_seconds=first_pcm_seconds)
                             packer_sr = sr
                             emitted = packer.push(audio, sr)
                             if emitted is not None:
                                 emitted_any = True
+                                unit_processed_seconds += emitted.size / sr
                                 yield self._pack_audio_frame(idx, emitted, sr, speed, **frame_meta)
                             for extra in packer.take_all():
                                 emitted_any = True
+                                unit_processed_seconds += extra.size / sr
                                 yield self._pack_audio_frame(idx, extra, sr, speed, **frame_meta)
                         if not unit_had_audio:
                             raise http_exception(500, ErrorCode.GENERATION_FAILED, "No audio generated for a text unit")
                         # Non-native speed is transformed once per semantic unit,
                         # independent of the model's transport packetization.
-                        if not supports_native:
-                            for emitted in packer.drain():
-                                emitted_any = True
-                                yield self._pack_audio_frame(idx, emitted, packer_sr, speed, **frame_meta)
+                        for emitted in packer.drain():
+                            emitted_any = True
+                            unit_processed_seconds += emitted.size / packer_sr
+                            yield self._pack_audio_frame(idx, emitted, packer_sr, speed, **frame_meta)
+                        if protocol_version == 2:
+                            yield pack_frame({"index": idx, "unit_final": True, **frame_meta,
+                                              "generation_seconds": unit_generation_seconds,
+                                              "processed_audio_seconds": unit_processed_seconds,
+                                              "normalized_rtf": unit_generation_seconds / unit_processed_seconds})
                     for emitted in packer.drain():
                         emitted_any = True
                         yield self._pack_audio_frame(idx, emitted, packer_sr, speed, **frame_meta)

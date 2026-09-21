@@ -27,7 +27,7 @@ Multi-model, fully local text-to-speech on Apple Silicon. Switch between **Kokor
 | Qwen3-TTS (8-bit) | 2.9 GB | 24 kHz | 9 preset + instruct | Server-side time stretch | Multilingual, streaming support |
 | Fish S2 Pro (8-bit) | 6.3 GB | 44.1 kHz | SSML voice tags | Server-side time stretch | High-fidelity, voice cloning ready |
 
-Only one model is loaded at a time. Model changes serialize with generation and may require load/warmup time.
+Only one model is loaded at a time. A model change while work is active is rejected as busy; stop the current reading first. Loading and warmup run on the same model-owner thread as inference.
 
 ### Known Limitations
 
@@ -38,6 +38,47 @@ Only one model is loaded at a time. Model changes serialize with generation and 
 - Cancellation is cooperative between model yields. A noncooperative native MLX call cannot be forcibly interrupted safely by an HTTP request.
 - The extension requires the matching backend stream contract: processed-speed metadata, ordered per-index finals and a terminal done frame. Truncation is an error.
 - Real-model listening and real Chrome lifecycle checks are separate release gates; the offline suite uses fake models and a simulated audio clock.
+
+## Progressive reading (3.5.0 candidate)
+
+Chrome **116+** and the matching backend are required. Short Kokoro selections use the lightweight offscreen player. Selections over 4,000 characters, Qwen3, and Fish use a visible **Reader tab**. Keep that tab open while listening. Closing/discarding the owner is an interruption, not completion.
+
+The backend separates large HTTP text partitions from small generation passages and roughly two-second audio packets:
+
+| Model | First target / hard maximum | Later target / hard maximum |
+|---|---|---|
+| Kokoro | 300 / 600 characters | 900 / 1,200 characters |
+| Qwen3 | 160 / 320 characters | 480 / 720 characters |
+| Fish | 160 / 300 characters | 300 / 500 characters |
+
+These are deterministic starting profiles, **not measured naturalness or latency claims**. Boundaries prefer sentences/words; source coverage uses Unicode code points. Reader progress means fully played passages, not merely generated text. Stop, replacement, failure and owner loss never create completed history.
+
+`GET /v1/capabilities` advertises protocol versions and resource limits. The extension explicitly requests `protocol_version: 2`, requires the matching response header, validates increasing frame sequences and exact source coverage, and rejects an incompatible backend. Legacy API clients may still request v1. V2 adds unit IDs/source offsets, sample counts, per-unit generation timings and explicit terminal outcomes.
+
+### Resource and API contracts
+
+- Raw JSON upload: 4 MiB, at most four concurrent body handlers; per-text 50,000 and aggregate 200,000 characters by default, at most 50 batch texts; instructions at most 2,000 characters.
+- One model owner, one active job plus one pending job. Cancellation retains the lease until native work actually returns. Model switches require an idle owner.
+- Server transport queue: both item and 8 MiB byte bounds. Extension: incremental parser, one decode, 16 MiB decoded reservation budget and 20 seconds of remaining audio plus 250 ms lead.
+- Semantic PCM: 32 MiB. Full response PCM: 128 MiB. Batch base64 output: 128 MiB. These exclude MLX/model allocations and are not total-process RSS guarantees.
+- `/v1/synthesize` defaults to a complete WAV. Use `stream:true` for framed output, not a directly playable file. `/v1/audio/speech` and `/v1/speech` return complete files and **reject** `stream:true` with guidance to the framed endpoint.
+- The old `OPEN_TTS_STREAM_FIRST_CHARS` / `OPEN_TTS_STREAM_REST_CHARS` knobs are legacy helper settings; model-aware generation now uses the profiles above.
+
+### Qualification without disturbing live audio
+
+`npm test` is offline. Real synthesis, Chrome lifecycle and listening are separate gates. The guarded HTTP runner never launches/stops a server or switches an already loaded different model. On a separately authorized, already-running isolated instance:
+
+```bash
+env -u PYTHONPATH backend/venv/bin/python scripts/verify-long-text.py \
+  --authorize-real-audio --base-url http://127.0.0.1:18001 \
+  --runtime-dir /absolute/path/to/isolated-runtime \
+  --text-file /absolute/path/to/synthetic-fixture.txt --model kokoro --speed 1.5 \
+  --output /absolute/path/to/http-qualification.json
+```
+
+The runner refuses default port 8000 and the production runtime directory. No source text, instructions or token enter the JSON report. HTTP arrival timing is not proof of audible Chrome playback. The larger model-matrix script now also requires explicit URL/runtime/model/audio opt-in, with an additional flag for model switching.
+
+Reader diagnostics distinguish first packet, first scheduled source, observed audio-clock start, generation finish, terminal time, normalized generation/audio RTF and underflow counters. Audio-clock start is **not** an acoustic speaker measurement. Native cancellation-release time is available in capability runtime diagnostics.
 
 ## Requirements
 
@@ -58,8 +99,8 @@ chmod +x setup.sh
 
 This will:
 - Create a Python virtual environment
-- Install dependencies (mlx-audio >= 0.4.2, kokoro-mlx)
-- Download models (Kokoro bf16 + Qwen3-TTS 8-bit + Fish S2 Pro 8-bit)
+- Install the dependencies pinned in `backend/requirements.txt`
+- Download Kokoro by default. Add `--with-qwen`, `--with-fish`, or `--all-models` for optional models.
 
 ### 2. Install Chrome Extension
 
@@ -115,13 +156,14 @@ Click the extension icon to:
 - **Select model** — Kokoro, Qwen3-TTS, or Fish S2 Pro (auto-swaps on demand)
 - **Select voice** — 19 preset voices for Kokoro (Bella default), 9 for Qwen3, SSML tags for Fish
 - **Select language** — Auto, English, Chinese, Japanese, Korean (Qwen3 only; Kokoro uses internal lang codes)
-- **Adjust speed** — 0.5x - 3.0x (Kokoro: natural speed at synthesis; Qwen3: playbackRate)
+- **Adjust speed** — 0.5x - 3.0x (Kokoro: native synthesis speed; Qwen3/Fish: server-side pitch-preserving stretch; browser always 1×)
 
-## Auto-Start on Login (macOS)
+## Optional LaunchAgent (macOS, on-demand by default)
 
 ```bash
 cd backend
-./install_launch_agent.sh
+./install_launch_agent.sh  # installs without starting the server
+# Explicit opt-in only: ./install_launch_agent.sh --auto-start
 ```
 
 To uninstall:
@@ -170,13 +212,13 @@ curl -X POST http://127.0.0.1:8000/v1/synthesize \
 curl -X POST http://127.0.0.1:8000/v1/synthesize \
   -H "Content-Type: application/json" \
   -d '{"text": "Hello, this is a test.", "model": "qwen3-tts", "voice": "ryan", "speed": 1.0}' \
-  --output output.ogg
+  --output output.wav
 
 # Fish S2 Pro with SSML voice tag
 curl -X POST http://127.0.0.1:8000/v1/synthesize \
   -H "Content-Type: application/json" \
   -d '{"text": "Hello, this is a test.", "model": "fish-s2-pro", "voice": "whisper"}' \
-  --output output.ogg
+  --output output.wav
 ```
 
 ### Streaming transport
@@ -202,8 +244,8 @@ While a slow semantic unit is generating, the server sends an empty `{ "keepaliv
 | `OPEN_TTS_STREAM_QUEUE_MAX` | `32` | Bounded backend transport queue |
 | `OPEN_TTS_STREAM_FRAME_TIMEOUT` | `60` | Inference-idle floor; effective generated-frame timeout is the larger of this value and `OPEN_TTS_GEN_TIMEOUT`. Consumer backpressure is excluded. |
 | `OPEN_TTS_STREAMING_INTERVAL` | `1.0` | Model streaming interval where supported |
-| `OPEN_TTS_STREAM_FIRST_CHARS` / `OPEN_TTS_STREAM_REST_CHARS` | `4000` | Semantic generation-unit caps |
-| `OPEN_TTS_STREAM_MAX_EMIT_SECONDS` | `20` | Maximum emitted PCM duration; do not increase beyond the extension's frame cap |
+| `OPEN_TTS_RUNTIME_DIR` | `backend/` | Token/lock/PID/log directory; use a separate directory for an authorized isolated runtime |
+| `OPEN_TTS_STREAM_MAX_EMIT_SECONDS` | `2` | Maximum emitted PCM duration, validated in `(0, 4]` |
 
 The extension bounds scheduled audio to 20 seconds plus 250 ms scheduling lead and decoded PCM to 16 MiB. It reserves memory before decoding, retains at most one decode in flight, and stops consuming frames when over budget. Non-native semantic PCM accumulation is limited to 32 MiB; a full non-streaming response is limited to 128 MiB of processed PCM. These are application buffer limits, not a bound on a model's own MLX allocation or total process RSS.
 
@@ -212,13 +254,13 @@ The extension bounds scheduled audio to 20 seconds plus 250 ms scheduling lead a
 ```text
 content.js / popup.js: text + UI + playback controls
   → background.js: on-demand server lifecycle, routing, run ownership
-    → offscreen.js: direct HTTP stream, validation, decode, bounded playback
+    → Reader tab or offscreen document: shared offscreen.js transport/decode/playback
       → backend/open_tts/api.py: framed transport and disconnect handling
         → coordinator.py: serialized model lifecycle / semantic generation units
           → audio.py: sample-preserving native PCM / semantic time stretch
 ```
 
-Audio never travels through Chrome runtime messages. Each offscreen run owns its controller, AudioContext, sources, timers and completion state. A replacement tears down only its predecessor. The background worker can recover playback state from an existing offscreen document after restart without creating one for an idle status check.
+Audio never travels through Chrome runtime messages. Each playback run owns its controller, AudioContext, sources, timers and completion state. A replacement tears down only its predecessor. The background worker can recover playback state from an existing Reader or offscreen document after restart without creating one for an idle status check.
 
 There is **no automatic whole-document fallback**. Invalid, interrupted or failed audio stops with a visible error; a user-initiated retry is a new run. This avoids hidden replay and all-audio JSON accumulation.
 
@@ -232,7 +274,7 @@ git diff --check
 
 The offline suite loads the real extension scripts with controlled Chrome/Web Audio/fetch substitutes and the real Python coordinator with fake model adapters. It includes a 2,000-frame simulated playback soak, cancellation interleavings, strict framing, text preservation and synthetic DSP tests. It is not a real-model latency benchmark or a listening verdict.
 
-See [implementation plan](docs/plans/long-text-audio-reliability.md) and [verification report](docs/reports/long-text-audio-implementation.md). Version 3.4.3 is a source/package candidate, not an automatically installed release. Reload the unpacked extension and restart the matching backend **only when existing audio work is idle and after authorizing that operation**. No model or lifecycle tests should interrupt another audio job.
+See [progressive implementation plan](docs/plans/2026-09-15-progressive-long-form-tts.md) and [verification report](docs/reports/progressive-long-form-verification.md). Version 3.5.0 is a source/package candidate, not an automatically installed release. Reload the unpacked extension and restart the matching backend **only when existing audio work is idle and after authorizing that operation**. No model or lifecycle tests should interrupt another audio job.
 
 ## Project Structure
 
@@ -241,7 +283,7 @@ backend/
   server.py           # FastAPI server (multi-model, lazy loading, streaming)
   native_host.py      # Native messaging host for extension (start/stop/status)
   requirements.txt    # Python dependencies
-  setup.sh            # Setup script (downloads all models)
+  setup.sh            # Setup script (Kokoro default; optional models via flags)
   models/             # Downloaded model files
     kokoro-82M/         # Kokoro 82M bf16 (~170 MB)
     qwen3-tts-8bit/     # Qwen3-TTS 8-bit (~2.9 GB)
@@ -254,7 +296,8 @@ extension/
   manifest.json       # Chrome MV3 extension config
   background.js       # Service worker: routing and server lifecycle
   content.js          # Content script: selection and widget
-  offscreen.js        # Run-scoped audio transport/decode/playback
+  offscreen.js        # Shared run-scoped audio transport/decode/playback
+  reader.html/js/css   # Visible long-reading owner, controls, progress and explicit retry
   shared/             # Bounded playback sessions, text and framing helpers
   popup.html/js/css   # Extension popup with model selector
   content.css         # Widget styling
@@ -268,8 +311,8 @@ extension/
 # Check if port is in use
 lsof -i :8000
 
-# Kill existing process
-kill -9 <PID>
+# Inspect ownership; never kill an unrelated port owner.
+# Stop Open TTS through its native host only after ongoing audio work is idle.
 ```
 
 ### Native messaging error
@@ -300,8 +343,9 @@ If you see "Native messaging error" when clicking Start/Stop:
   ```
 
 ### Streaming audio cuts off
-- Check console for "Stream read timeout" — the 30s idle timeout may be too short for very long text on slow hardware
-- Fish S2 Pro doesn't support streaming — it auto-falls back to non-streaming
+- Check the Reader status and local timing diagnostics. The transport idle limit is 60 seconds; inference keepalives are not completion.
+- Fish generates one bounded passage at a time inside the streaming transport. Slower-than-realtime inference can still cause genuine buffering.
+- After an error, Reader retry restarts at the last fully played passage boundary; it may repeat the interrupted passage. No whole-essay retry happens automatically.
 
 ### "resource_tracker: leaked semaphore" warning in server logs
 This is a known Python multiprocessing issue, not our bug. Safe to ignore.

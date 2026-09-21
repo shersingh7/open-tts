@@ -7,9 +7,12 @@ Open TTS processes all speech synthesis locally on your Mac. No text or audio is
 | Data | Location | Purpose |
 |------|----------|---------|
 | Model/voice/speed settings | `chrome.storage.sync` | Restore preferences across signed-in Chrome profiles |
+| Free-form voice instructions | `chrome.storage.local` | Keep direction text local; legacy sync values are copied, verified locally, then removed from sync |
 | Preview text | `chrome.storage.local` | Restore popup draft without syncing spoken text to Chrome cloud storage |
-| Playback history (max 20 items) | `chrome.storage.local` | Replay recent phrases — never synced |
+| Completed playback history (max 20 items, optional) | `chrome.storage.local` | Written by the worker only after actual playback completion; stops, errors and replacements are not saved |
 | API install token | `chrome.storage.local` + `backend/.open_tts_token` | Authenticate local API requests |
+
+The visible Reader holds the current text in page memory. Local timing diagnostics contain counters/timestamps, not selected text, voice instructions or the API token. Deleting a legacy synced instruction stops this extension from retaining that sync key; it cannot promise deletion from prior provider backups.
 
 ## Network access
 

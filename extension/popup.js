@@ -1,4 +1,4 @@
-/* Open TTS v3.4.3 — Popup */
+/* Open TTS v3.5.0 — Popup */
 
 const $ = (id) => document.getElementById(id);
 const modelSelect = $("model");
@@ -447,18 +447,22 @@ async function handleSpeak() {
   pendingHistory = null;
   setPlaybackUI("generating", "Generating...");
   const t0 = performance.now();
+  const requested = {model:modelSelect.value || DEFAULTS.model, voice:voiceSelect.value,
+    speed:OpenTTSConstants.resolveSpeed(speedSlider.value || DEFAULTS.speed),
+    language:langSelect.value || DEFAULTS.language, instruct:instructField?.value?.trim() || "",
+    fishStyle:fishStyleSelect?.value};
   try {
     if (previous?.runId) {
       await msg({ type: "STOP_TTS", runId: previous.runId, clientId: previous.clientId }).catch(() => {});
       if (activeRun?.runId !== runId) return;
     }
-    const settings = await syncGet(["voice", "speed", "language", "model", "voicePrefs", "instruct", "fishStyle"]);
+    const settings = {...await syncGet(["voicePrefs"]), ...requested};
     if (activeRun?.runId !== runId) return;
     voicePrefs = settings.voicePrefs || {};
-    const modelId = settings.model || modelSelect.value || DEFAULTS.model;
+    const modelId = settings.model;
     const voice = OpenTTSConstants.resolveVoice(modelId, {
-      voicePrefs, voice: voiceSelect.value || settings.voice,
-      fishStyle: settings.fishStyle || fishStyleSelect.value,
+      voicePrefs, voice: settings.voice,
+      fishStyle: settings.fishStyle,
     });
     // Register before dispatch: a short run can complete before its ACK arrives.
     pendingHistory = {
@@ -470,7 +474,7 @@ async function handleSpeak() {
       settings: {
         voice, speed: OpenTTSConstants.resolveSpeed(settings.speed),
         language: settings.language || DEFAULTS.language, model: modelId,
-        instruct: instructField?.value?.trim() || settings.instruct || "",
+        instruct: settings.instruct,
       },
       clientId, runId, source: "popup",
     }));
@@ -529,19 +533,21 @@ async function handleCopy() {
 }
 
 async function loadSettings() {
-  const data = await syncGet(["model", "voice", "speed", "language", "voicePrefs", "instruct", "fishStyle"]);
+  const data = await syncGet(["model", "voice", "speed", "language", "voicePrefs", "fishStyle"]);
+  const instruction = await OpenTTSStorage.localInstruction();
   const local = await localGet(["previewText"]);
   voicePrefs = data.voicePrefs || {};
   speedSlider.value = Number(data.speed ?? DEFAULTS.speed);
   speedVal.textContent = `${speedSlider.value}x`;
   langSelect.value = data.language || DEFAULTS.language;
   previewText.value = local.previewText || DEFAULTS.previewText;
-  if (instructField) instructField.value = data.instruct || "";
+  if (instructField) instructField.value = instruction;
   if (fishStyleSelect) fishStyleSelect.value = data.fishStyle || "whisper";
   updateCharCount();
 }
 
 function wireEvents() {
+  OpenTTSStorage.onError = error => showError(error.message);
   speedSlider.addEventListener("input", () => {
     speedVal.textContent = `${speedSlider.value}x`;
     debouncedSyncSet("speed", Number(speedSlider.value));
@@ -557,7 +563,7 @@ function wireEvents() {
     debouncedLocalSet("previewText", previewText.value);
   });
   if (instructField) {
-    instructField.addEventListener("input", () => debouncedSyncSet("instruct", instructField.value));
+    instructField.addEventListener("input", () => debouncedLocalSet("instruct", instructField.value));
   }
   if (fishStyleSelect) {
     fishStyleSelect.addEventListener("change", () => debouncedSyncSet("fishStyle", fishStyleSelect.value));
@@ -594,6 +600,7 @@ function wireEvents() {
   });
 
   chrome.runtime.onMessage.addListener((msg) => {
+    if (msg._routedByBackground && msg.type === "TTS_HISTORY_ERROR") { showError(`Audio completed, but history could not be saved: ${msg.message}`); return; }
     if (!msg._routedByBackground) return;
     if (msg.clientId && msg.clientId !== clientId) return;
     if (msg.runId && msg.runId !== activeRun?.runId) return;
@@ -607,12 +614,8 @@ function wireEvents() {
       if (playbackState !== "paused") setPlaybackUI("playing", "Reading...");
     }
     if (msg.type === "TTS_DONE") {
-      const completedHistory = pendingHistory;
       pendingHistory = null;
-      if (completedHistory?.runId === msg.runId) {
-        const { runId: _runId, ...entry } = completedHistory;
-        addHistory(entry).catch(() => {});
-      }
+      if (msg.outcome === "completed") loadHistory().catch(e=>showError(e.message));
       activeRun = null;
       setPlaybackUI("idle", "Ready");
     }
@@ -637,7 +640,8 @@ async function restorePlaybackState() {
       if (paused) {
         setPlaybackUI("paused", "Paused");
       } else {
-        setPlaybackUI("playing", "Reading...");
+        const starting = ["speaking","buffering"].includes(resp.data.state);
+        setPlaybackUI(starting ? "generating" : "playing", starting ? "Preparing / buffering..." : "Reading...");
       }
       return;
     }
@@ -655,4 +659,4 @@ async function init() {
   await checkServer();
 }
 
-init();
+init().catch(e=>showError(e.message));

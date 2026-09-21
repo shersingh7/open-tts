@@ -17,7 +17,9 @@
     let queuedSeconds = 0, decodedBytes = 0, scheduledCount = 0, endedCount = 0;
     let peakBytes = 0, peakHorizon = 0, generationComplete = false, terminal = false;
     let decoding = false, context = null, pendingBytes = 0;
+    const remaining = () => controller.signal.aborted || !context ? 0 : Math.max(0, clock.peekNext() - context.currentTime);
     const notify = () => { for (const check of [...waiters]) check(); };
+    if (!(high > low && low >= 0 && maxBytes > 0 && Number.isFinite(high))) throw new Error("Invalid playback limits");
     controller.signal.addEventListener("abort", notify, { once: true });
     const run = {
       ...opts, controller, clock, gate, sources, maxBytes,
@@ -27,7 +29,7 @@
       get scheduledAny() { return scheduledCount > 0; },
       get scheduledCount() { return scheduledCount; },
       get endedCount() { return endedCount; },
-      get queuedSeconds() { return queuedSeconds; },
+      get queuedSeconds() { return remaining(); },
       get decodedBytes() { return decodedBytes + pendingBytes; },
       get peakBytes() { return peakBytes; },
       get peakHorizon() { return peakHorizon; },
@@ -36,14 +38,22 @@
       async waitForBudget(seconds = 0, bytes = 0) {
         run.assertActive();
         if (seconds > high || bytes > maxBytes) throw new Error("Audio frame exceeds playback budget");
-        let throttled = queuedSeconds + seconds > high || decodedBytes + bytes > maxBytes;
+        let throttled = remaining() + seconds > high + lead || decodedBytes + bytes > maxBytes;
         if (!throttled) return;
         await new Promise((resolve, reject) => {
+          let timer = null;
+          const finish = (error) => {
+            clearTimeout(timer); waiters.delete(check);
+            error ? reject(error) : resolve();
+          };
           const check = () => {
-            if (controller.signal.aborted) { waiters.delete(check); reject(abortError()); return; }
-            if (queuedSeconds <= low && queuedSeconds + seconds <= high && decodedBytes + bytes <= maxBytes) {
-              waiters.delete(check); resolve();
+            clearTimeout(timer);
+            if (controller.signal.aborted) { finish(abortError()); return; }
+            const secondsLeft = remaining();
+            if (secondsLeft <= low && secondsLeft + seconds <= high + lead && decodedBytes + bytes <= maxBytes) {
+              finish(); return;
             }
+            timer = setTimeout(check, 50);
           };
           waiters.add(check); check();
         });

@@ -9,6 +9,8 @@ punctuation stay intact. Packing never drops or reorders non-whitespace.
 from __future__ import annotations
 
 import re
+from bisect import bisect_right
+from dataclasses import dataclass
 from typing import List
 
 ZERO_WIDTH = dict.fromkeys(map(ord, "\u200b\ufeff"), None)
@@ -74,15 +76,17 @@ def sentence_units(text: str) -> List[str]:
     n = len(text)
     while i < n:
         ch = text[i]
-        if ch in ".!?" and _is_sentence_end(text, i):
+        if ch in ".!?。！？" and _is_sentence_end(text, i):
             j = i + 1
             while j < n and text[j] in "\"'”’)]]":
                 j += 1
             k = j
             while k < n and text[k].isspace() and text[k] != "\n":
                 k += 1
-            rest = text[k:] if k < n else ""
-            nxt = next((c for c in rest if not c.isspace()), "")
+            nxt_pos = k
+            while nxt_pos < n and text[nxt_pos].isspace():
+                nxt_pos += 1
+            nxt = text[nxt_pos] if nxt_pos < n else ""
             if nxt and nxt.islower():
                 i += 1
                 continue
@@ -111,6 +115,8 @@ def _word_before_period(text: str, i: int) -> str:
 def _is_sentence_end(text: str, i: int) -> bool:
     ch = text[i]
     n = len(text)
+    if ch in "。！？":
+        return True
     if ch == ".":
         if i > 0 and text[i - 1].isdigit() and i + 1 < n and text[i + 1].isdigit():
             return False
@@ -234,6 +240,51 @@ def pack_generation_units(text: str, first_max: int, rest_max: int) -> List[str]
     if buf:
         out.append(buf)
     return out
+
+
+@dataclass(frozen=True)
+class GenerationUnit:
+    unit_id: int
+    transport_index: int
+    start: int
+    end: int
+    text: str
+    boundary: str
+
+
+def plan_generation_units(text: str, model_id: str, *, transport_index: int = 0,
+                          first_unit_id: int = 0) -> List[GenerationUnit]:
+    """Plan exact normalized source spans; startup sizing applies once per run."""
+    from .config import GENERATION_PROFILES
+    profile = GENERATION_PROFILES[model_id]
+    boundaries = []
+    offset = 0
+    for sentence in sentence_units(text):
+        offset += len(sentence)
+        boundaries.append(offset)
+    boundaries = sorted(set(boundaries + [m.end() for m in re.finditer(r"\n+", text)]))
+    units = []
+    start = 0
+    while start < len(text):
+        uid = first_unit_id + len(units)
+        target, hard = profile[:2] if uid == 0 else profile[2:]
+        ceiling = min(start + hard, len(text))
+        lo, hi = bisect_right(boundaries, start), bisect_right(boundaries, ceiling)
+        candidates = boundaries[lo:hi]
+        if candidates:
+            end = min(candidates, key=lambda p: abs(p - start - target))
+            boundary = "paragraph" if text[end-1:end] == "\n" else "sentence"
+        else:
+            end = ceiling
+            spaces = list(re.finditer(r"\s+", text[start:ceiling]))
+            if spaces and spaces[-1].end() >= hard // 2:
+                end = start + spaces[-1].end()
+            boundary = "hard_limit"
+        if end == len(text) or not text[end:].strip():
+            end = len(text)
+        units.append(GenerationUnit(uid, transport_index, start, end, text[start:end], boundary))
+        start = end
+    return units
 
 
 def non_whitespace_key(text: str) -> str:

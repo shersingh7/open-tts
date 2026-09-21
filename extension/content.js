@@ -1,4 +1,4 @@
-// Open TTS v3.4.3 — Content Script
+// Open TTS v3.5.0 — Content Script
 
 let widget = null;
 let clientId = `c_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
@@ -163,18 +163,10 @@ async function onClick(e) {
   try {
     if (text.length > MAX_CHARS) throw new Error(`Selection exceeds ${MAX_CHARS} characters`);
     setBusy(true, "Generating...");
-    const settings = await new Promise((resolve) => {
-      chrome.storage.sync.get(["voice", "speed", "language", "model", "voicePrefs", "instruct", "fishStyle"], (data) => {
-        const model = data.model || "kokoro";
-        resolve({
-          voice: OpenTTSConstants.resolveVoice(model, data),
-          speed: OpenTTSConstants.resolveSpeed(data.speed),
-          language: data.language || "Auto",
-          model,
-          instruct: data.instruct || "",
-        });
-      });
-    });
+    const data = await OpenTTSStorage.syncGet(["voice", "speed", "language", "model", "voicePrefs", "fishStyle"]);
+    const model = data.model || "kokoro";
+    const settings = {voice:OpenTTSConstants.resolveVoice(model,data),speed:OpenTTSConstants.resolveSpeed(data.speed),
+      language:data.language || "Auto",model,instruct:await OpenTTSStorage.localInstruction()};
 
     if (currentRunId !== runId) return;
     const response = await send({

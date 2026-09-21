@@ -39,13 +39,13 @@ export function harness(opts = {}) {
         end(){c.currentTime=Math.max(c.currentTime,this.endAt);this.onended?.();}};return s;
     }
   }
-  const sandbox={console,AbortController,AbortSignal,setTimeout,clearTimeout,TextEncoder,TextDecoder,Uint8Array,DataView,
+  const sandbox={OpenTTSHostKind:opts.hostKind || "offscreen",OpenTTSHostEvent:opts.onEvent,console,AbortController,AbortSignal,setTimeout,clearTimeout,TextEncoder,TextDecoder,Uint8Array,DataView,
     window:{AudioContext:Context},chrome:{runtime:{onMessage:{addListener(fn){listener=fn;}},sendMessage(e){events.push(e);return Promise.resolve();}}},
     fetch:async(url,req)=>{requests.push({url,...req});return opts.fetch ? opts.fetch(url,req) : response([audioFrame(),...ending()]);}};
   const context=vm.createContext(sandbox);
   const load=(name)=>vm.runInContext(readFileSync(resolve('extension',name),'utf8'),context,{filename:name});
   for(const f of ['shared/constants-umd.js','shared/protocol-umd.js','shared/playback-umd.js','shared/playback-session-umd.js','shared/stream-decoder-umd.js','offscreen.js'])load(f);
-  const send=(req)=>new Promise(resolve=>listener({_fromBackground:true,...req},{},resolve));
+  const send=(req)=>new Promise(resolve=>listener({_fromBackground:true,hostKind:opts.hostKind || "offscreen",...req},{},resolve));
   const speak=(id='A',text='Hello.\n\nNext paragraph.')=>send({type:'SPEAK',runId:id,clientId:'client',text,settings:{speed:1}});
   return {context,events,contexts,requests,send,speak,load,Context};
 }

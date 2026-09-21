@@ -81,6 +81,35 @@ class FakeModel:
             yield FakeResult(audio=audio, is_final_chunk=(i == n - 1))
 
 
+@pytest.fixture(autouse=True)
+def isolated_runtime(monkeypatch, tmp_path):
+    """Ordinary tests must never sign, signal, launch or load production assets."""
+    import native_host
+    import open_tts.security as security
+    import open_tts.coordinator as coordinator_module
+    import mlx_audio.tts.utils as utils
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("Live runtime operation forbidden in offline tests")
+
+    monkeypatch.setenv("HF_HUB_OFFLINE", "1")
+    monkeypatch.setenv("TRANSFORMERS_OFFLINE", "1")
+    monkeypatch.setenv("OPEN_TTS_EAGER_LOAD", "0")
+    monkeypatch.setattr(utils, "load_model", forbidden)
+    monkeypatch.setattr(coordinator_module, "_clear_gpu_memory", lambda: None)
+    monkeypatch.setattr(native_host, "_sign_native_dylibs_if_darwin", lambda: None)
+    monkeypatch.setattr(native_host.subprocess, "Popen", forbidden)
+    monkeypatch.setattr(native_host.os, "kill", forbidden)
+    monkeypatch.setattr(native_host.os, "killpg", forbidden)
+    monkeypatch.setattr(native_host, "is_port_in_use", forbidden)
+    monkeypatch.setattr(native_host, "get_pid_on_port", forbidden)
+    monkeypatch.setattr(native_host, "_fetch_health", forbidden)
+    monkeypatch.setattr(native_host, "RUNTIME_DIR", tmp_path)
+    for name in ("PID_FILE", "LOG_FILE", "LOCK_FILE", "TOKEN_FILE"):
+        monkeypatch.setattr(native_host, name, tmp_path / name.lower())
+    monkeypatch.setattr(security, "TOKEN_FILE", tmp_path / "token")
+
+
 @pytest.fixture
 def fake_loader(monkeypatch):
     models = {}

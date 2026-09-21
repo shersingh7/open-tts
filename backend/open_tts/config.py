@@ -7,8 +7,9 @@ from enum import Enum
 from pathlib import Path
 
 BACKEND_DIR = Path(__file__).resolve().parent.parent
-TOKEN_FILE = BACKEND_DIR / ".open_tts_token"
-LOCK_FILE = BACKEND_DIR / ".open_tts.lock"
+RUNTIME_DIR = Path(os.getenv("OPEN_TTS_RUNTIME_DIR", str(BACKEND_DIR))).expanduser().resolve()
+TOKEN_FILE = RUNTIME_DIR / ".open_tts_token"
+LOCK_FILE = RUNTIME_DIR / ".open_tts.lock"
 
 HOST = os.getenv("OPEN_TTS_HOST", "127.0.0.1")
 PORT = int(os.getenv("OPEN_TTS_PORT", "8000"))
@@ -25,12 +26,40 @@ STREAM_FIRST_CHUNK_CHARS = int(os.getenv("OPEN_TTS_STREAM_FIRST_CHARS", "4000"))
 STREAM_REST_CHUNK_CHARS = int(os.getenv("OPEN_TTS_STREAM_REST_CHARS", "4000"))
 STREAM_PHRASE_SECONDS = float(os.getenv("OPEN_TTS_STREAM_PHRASE_SECONDS", "1.2"))
 STREAM_XFADE_SECONDS = float(os.getenv("OPEN_TTS_STREAM_XFADE_SECONDS", "0.02"))
-STREAM_MAX_EMIT_SECONDS = float(os.getenv("OPEN_TTS_STREAM_MAX_EMIT_SECONDS", "20"))
+STREAM_MAX_EMIT_SECONDS = float(os.getenv("OPEN_TTS_STREAM_MAX_EMIT_SECONDS", "2"))
 CLIENT_DECODED_BYTE_CAP = int(os.getenv("OPEN_TTS_CLIENT_DECODED_BYTE_CAP", str(16 * 1024 * 1024)))
 RATE_LIMIT_PER_MIN = int(os.getenv("OPEN_TTS_RATE_LIMIT", "120"))
 
-VERSION = "3.4.3"
+VERSION = "3.5.0"
 ENGINE_ID = "open-tts"
+STREAM_QUEUE_BYTES = 8 * 1024 * 1024
+MAX_BODY_BYTES = 4 * 1024 * 1024
+MAX_INSTRUCT_CHARS = 2000
+MAX_FULL_PCM_BYTES = 128 * 1024 * 1024
+MAX_BATCH_OUTPUT_BYTES = 128 * 1024 * 1024
+MAX_FRAME_BYTES = 8 * 1024 * 1024
+GENERATION_PROFILES = {
+    "kokoro": (300, 600, 900, 1200),
+    "qwen3-tts": (160, 320, 480, 720),
+    "fish-s2-pro": (160, 300, 300, 500),
+}
+
+
+def validate_config():
+    import math
+    for name in ("GEN_TIMEOUT", "MAX_TEXT_LENGTH", "MAX_BATCH_TEXTS", "MAX_BATCH_TOTAL_CHARS",
+                 "STREAM_QUEUE_MAX", "STREAM_FRAME_TIMEOUT", "STREAMING_INTERVAL",
+                 "STREAM_PHRASE_SECONDS", "CLIENT_DECODED_BYTE_CAP"):
+        value = globals()[name]
+        if not math.isfinite(value) or value <= 0:
+            raise ValueError(f"{name} must be finite and positive")
+    if not 0 < STREAM_MAX_EMIT_SECONDS <= 4:
+        raise ValueError("OPEN_TTS_STREAM_MAX_EMIT_SECONDS must be in (0, 4]")
+    if not 1 <= PORT <= 65535:
+        raise ValueError("OPEN_TTS_PORT out of range")
+
+
+validate_config()
 
 
 class AudioFormat(str, Enum):

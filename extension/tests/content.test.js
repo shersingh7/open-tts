@@ -11,6 +11,7 @@ function contentHarness() {
   const context = vm.createContext({
     console, setTimeout: () => 1, clearTimeout(){},
     OpenTTSConstants: { MAX_CHARS: 200000, resolveVoice: () => 'af_bella', resolveSpeed: () => 1 },
+    OpenTTSStorage: {syncGet:()=>new Promise(resolve=>{settingsCallback=resolve;}),localInstruction:async()=>""},
     MutationObserver: class { observe(){} },
     document: { querySelectorAll: () => [], documentElement: {}, addEventListener(){} },
     window: { getSelection: () => ({ toString: () => 'Selected text.' }) },

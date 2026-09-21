@@ -111,7 +111,8 @@ def test_semantic_audio_memory_limit_is_explicit():
 def test_empty_semantic_unit_is_not_silently_skipped(fake_loader, monkeypatch, model_id):
     coord = ModelCoordinator()
     coord.load(model_id)
-    monkeypatch.setattr("open_tts.coordinator.split_stream_text", lambda *args: ["First.", "Missing.", "Last."])
+    from open_tts.text import GenerationUnit
+    monkeypatch.setattr("open_tts.coordinator.plan_generation_units", lambda *args, **kw: [GenerationUnit(i, 0, i*10, i*10+len(t), t, "sentence") for i,t in enumerate(["First.", "Missing.", "Last."])])
     calls = []
     def generate(**kwargs):
         calls.append(kwargs["text"])

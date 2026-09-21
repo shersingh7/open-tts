@@ -1,4 +1,4 @@
-// Open TTS v3.4.3 — Background Service Worker (routing + lifecycle only)
+// Open TTS v3.5.0 — Background Service Worker (routing + lifecycle only)
 importScripts(
   "shared/constants-umd.js",
   "shared/protocol-umd.js",
@@ -13,14 +13,57 @@ let activeSession = null;
 let sessionRevision = 0;
 
 let offscreenCreation = null;
+let readerCreation = null;
+async function hostExists(kind) {
+  if (kind === "offscreen" && chrome.offscreen.hasDocument) return chrome.offscreen.hasDocument();
+  const contexts = await chrome.runtime.getContexts({documentUrls:[chrome.runtime.getURL(kind === "reader" ? "reader.html" : "offscreen.html")]});
+  return contexts.length > 0;
+}
+async function ensureReader() {
+  if (await hostExists("reader")) return true;
+  if (!readerCreation) readerCreation = (async () => {
+    await chrome.tabs.create({url:chrome.runtime.getURL("reader.html"), active:true});
+    for (let n=0;n<50;n++) {
+      try {
+        const r = await chrome.runtime.sendMessage({type:"PING_HOST",_fromBackground:true,hostKind:"reader"});
+        if (r?.ready) return true;
+      } catch (_) {}
+      await new Promise(r=>setTimeout(r,100));
+    }
+    throw new Error("Reader did not become ready");
+  })().finally(()=>{readerCreation=null;});
+  return readerCreation;
+}
+async function hostSnapshot(kind) {
+  if (!await hostExists(kind)) return null;
+  const snapshot = await chrome.runtime.sendMessage({type:"GET_PLAYBACK_STATE",_fromBackground:true,hostKind:kind});
+  return snapshot ? {...snapshot,hostKind:kind} : null;
+}
+function ownerLost(target) {
+  if (activeSession?.runId !== target.runId) return;
+  sessionRevision++; activeSession=null;
+  notifyClient(target,{type:"TTS_ERROR",...target,outcome:"owner_lost",message:"Playback page closed or was discarded. Start a new reading."});
+}
+let historyWrite = Promise.resolve();
+function persistCompletion(entry) {
+  if (!entry) return Promise.resolve();
+  historyWrite = historyWrite.catch(()=>{}).then(async()=>{
+    const {historyEnabled,ttsHistory=[]} = await OpenTTSStorage.localGet(["historyEnabled","ttsHistory"]);
+    if (historyEnabled === false) return;
+    const history = ttsHistory.filter(e=>e.id!==entry.id);
+    history.push(entry);
+    await OpenTTSStorage.localSet({ttsHistory:history.slice(-OpenTTSConstants.MAX_HISTORY)});
+  });
+  return historyWrite;
+}
 async function ensureOffscreen() {
-  if (await chrome.offscreen.hasDocument()) return true;
+  if (await hostExists("offscreen")) return true;
   if (!offscreenCreation) {
     offscreenCreation = chrome.offscreen.createDocument({
       url: chrome.runtime.getURL("offscreen.html"), reasons: ["AUDIO_PLAYBACK"],
       justification: "Local TTS audio playback and synthesis",
     }).then(() => true).catch(async (error) => {
-      if (await chrome.offscreen.hasDocument()) return true;
+      if (await hostExists("offscreen")) return true;
       throw error;
     }).finally(() => { offscreenCreation = null; });
   }
@@ -30,11 +73,10 @@ async function ensureOffscreen() {
 async function recoverSession() {
   if (activeSession) return activeSession;
   const revision = sessionRevision;
-  if (!await chrome.offscreen.hasDocument()) return activeSession;
+  const reader = await hostSnapshot("reader");
+  const resp = reader?.active ? reader : await hostSnapshot("offscreen");
   if (sessionRevision !== revision) return activeSession;
-  const resp = await chrome.runtime.sendMessage({ type: "GET_PLAYBACK_STATE", _fromBackground: true });
   // Both a new SPEAK and a terminal event invalidate an outstanding snapshot.
-  if (sessionRevision !== revision) return activeSession;
   if (!activeSession && resp?.active && resp.runId && resp.clientId) {
     activeSession = { ...resp };
     sessionRevision++;
@@ -43,7 +85,10 @@ async function recoverSession() {
 }
 
 async function sendToOffscreen(payload) {
-  if (!await ensureOffscreen()) throw new Error("Offscreen unavailable");
+  const kind = payload.hostKind || "offscreen";
+  if (payload.type === "SPEAK") {
+    if (!await (kind === "reader" ? ensureReader() : ensureOffscreen())) throw new Error("Playback host unavailable");
+  } else if (!await hostExists(kind)) return {success:true,ignored:true};
   if (payload.type === "SPEAK" && activeSession?.runId !== payload.runId) throw new Error("Superseded playback request");
   return sendWithRetry(() => new Promise((resolve, reject) => {
     if (payload.type === "SPEAK" && activeSession?.runId !== payload.runId) {
@@ -83,6 +128,7 @@ async function fetchHealth(timeoutMs = 3000) {
     });
     if (!r.ok) return null;
     const data = await r.json();
+    if (data.engine !== "open-tts" || typeof data.version !== "string") throw new Error("Port is not an Open TTS backend");
     if (!headers["X-Open-TTS-Token"]) {
       try {
         const status = await nativeMsg("status");
@@ -146,12 +192,19 @@ async function ensureBackendAvailable() {
   throw new Error("Open TTS server did not become ready");
 }
 
+const deliveredTerminals = new Set();
 function notifyClient(session, payload) {
+  if (["TTS_DONE","TTS_ERROR"].includes(payload.type) && payload.runId) {
+    if (deliveredTerminals.has(payload.runId)) return false;
+    deliveredTerminals.add(payload.runId);
+    if (deliveredTerminals.size > 200) deliveredTerminals.delete(deliveredTerminals.values().next().value);
+  }
   const routed = { ...payload, _routedByBackground: true };
   chrome.runtime.sendMessage(routed).catch(() => {});
   if (session?.sourceTabId && session.source !== "popup") {
     chrome.tabs.sendMessage(session.sourceTabId, routed, { frameId: session.sourceFrameId || 0 }).catch(() => {});
   }
+  return true;
 }
 
 function ownsActiveSession(req) {
@@ -161,19 +214,26 @@ function ownsActiveSession(req) {
 }
 
 chrome.runtime.onMessage.addListener((req, sender, sendResponse) => {
+  if (req._routedByBackground) return false;
   if (req._fromOffscreen) {
+    const expectedURL = chrome.runtime.getURL(req.hostKind === "reader" ? "reader.html" : "offscreen.html");
+    if (sender.url !== expectedURL) { sendResponse(fail("Invalid playback sender")); return false; }
     if (["TTS_STATUS", "TTS_ERROR", "TTS_DONE", "TTS_PROGRESS"].includes(req.type)) {
       if (OpenTTSProtocol.isStaleEvent(activeSession, req)) {
         sendResponse({ ignored: true });
         return true;
       }
       if (activeSession) activeSession.state = "active";
-      notifyClient(activeSession || req, req);
+      const delivered = notifyClient(activeSession || req, req);
       if (req.type === "TTS_DONE" || req.type === "TTS_ERROR") {
         sessionRevision++;
         activeSession = null;
       }
-      sendResponse({ success: true });
+      if (delivered && req.type === "TTS_DONE" && req.outcome === "completed") {
+        persistCompletion(req.historyEntry).then(()=>sendResponse({success:true})).catch(e=>{
+          notifyClient(req,{type:"TTS_HISTORY_ERROR",runId:req.runId,clientId:req.clientId,message:e.message}); sendResponse(fail(e.message));
+        });
+      } else sendResponse({ success: true });
       return true;
     }
     return false;
@@ -183,15 +243,23 @@ chrome.runtime.onMessage.addListener((req, sender, sendResponse) => {
 
   if (type === "SPEAK") {
     const ctx = playbackContext(sender, req);
+    ctx.hostKind = (String(req.text || "").length > 4000 || ["qwen3-tts","fish-s2-pro"].includes(req.settings?.model) || req.source === "reader") ? "reader" : "offscreen";
     const previous = activeSession;
     sessionRevision++;
     activeSession = { ...ctx, state: "speaking" };
     Promise.resolve()
       .then(async () => {
-        if (previous?.runId && previous.runId !== ctx.runId) {
-          await sendToOffscreen({ type: "STOP", ...previous }).catch(() => {});
-          notifyClient(previous, { type: "TTS_DONE", ...previous });
+        // Inspect physical owners too: service-worker memory may have been lost.
+        for (const kind of ["reader","offscreen"]) {
+          const owner = await hostSnapshot(kind);
+          if (activeSession?.runId !== ctx.runId) throw new Error("Superseded playback request");
+          if (owner?.active && owner.runId !== ctx.runId) {
+            const stopped = await sendToOffscreen({...owner,type:"STOP",outcome:"superseded"});
+            if (stopped?.success === false || !stopped) throw new Error("Could not stop previous audio owner");
+            notifyClient(owner,{...owner,type:"TTS_DONE",outcome:"superseded"});
+          }
         }
+        if (previous?.runId && previous.runId !== ctx.runId) notifyClient(previous, { ...previous, type: "TTS_DONE", outcome:"superseded" });
       })
       .then(() => {
         if (activeSession?.runId !== ctx.runId) throw new Error("Superseded playback request");
@@ -199,13 +267,17 @@ chrome.runtime.onMessage.addListener((req, sender, sendResponse) => {
       })
       .then(async () => {
         if (activeSession?.runId !== ctx.runId) throw new Error("Superseded playback request");
+        const caps = await (await apiFetch("/v1/capabilities")).json();
+        if (caps.engine !== "open-tts" || !caps.protocol_versions?.includes(2)) throw new Error("Update the backend to support progressive streaming v2");
         const headers = await getAuthHeaders();
         if (activeSession?.runId !== ctx.runId) throw new Error("Superseded playback request");
         const settings = {
           ...(req.settings || {}),
-          authToken: headers["X-Open-TTS-Token"] || "",
+          authToken: headers["X-Open-TTS-Token"] || "", protocolVersion:2,
         };
-        return sendToOffscreen({ type: "SPEAK", text: req.text, settings, ...ctx });
+        const historyEntry = {id:ctx.runId,text:req.text,voice:settings.voice,model:settings.model,
+          speed:settings.speed,timestamp:Date.now()};
+        return sendToOffscreen({ type: "SPEAK", text: req.text, settings, historyEntry, ...ctx });
       })
       .then((r) => sendResponse(r || { success: true, started: true }))
       .catch((e) => {
@@ -221,11 +293,16 @@ chrome.runtime.onMessage.addListener((req, sender, sendResponse) => {
       if (!ownsActiveSession(req)) return fail("Playback control does not own the active run", "stale_run");
       const target = { ...activeSession };
       const control = type === "STOP_TTS" ? "STOP" : type;
+      if (control !== "STOP" && !await hostExists(target.hostKind || "offscreen")) { ownerLost(target); return fail("Playback host was lost", "owner_lost"); }
+      if (control !== "STOP" && target.state === "speaking") return fail("Still preparing playback", "not_ready");
       if (control === "STOP") {
         sessionRevision++;
         activeSession = null; // invalidate pending startup immediately
       }
-      return await sendToOffscreen({ ...target, type: control });
+      const response = await sendToOffscreen({ ...target, type: control });
+      if (control !== "STOP" && response?.ignored) { ownerLost(target); return fail("Playback session was lost", "owner_lost"); }
+      if (control === "STOP") notifyClient(target,{...target,type:"TTS_DONE",outcome:"stopped"});
+      return response;
     })().then(sendResponse).catch(e => sendResponse(fail(e.message)));
     return true;
   }
@@ -234,13 +311,12 @@ chrome.runtime.onMessage.addListener((req, sender, sendResponse) => {
     (async () => {
       const target = await recoverSession();
       if (!target) return ok({ active: false });
-      if (!await chrome.offscreen.hasDocument()) return ok({ active: true, ...target, paused: false });
-      const resp = await chrome.runtime.sendMessage({ type: "GET_PLAYBACK_STATE", _fromBackground: true });
+      const resp = await hostSnapshot(target.hostKind || "offscreen");
       if (activeSession?.runId !== target.runId) return ok({ active: !!activeSession, ...activeSession });
       if (!resp?.active) {
         // A run may still be preparing the backend, before offscreen SPEAK.
         if (target.state === "speaking") return ok({ active: true, ...target, paused: false });
-        activeSession = null; return ok({ active: false });
+        ownerLost(target); return ok({ active: false, outcome:"owner_lost" });
       }
       return ok(resp);
     })().then(sendResponse).catch(e => sendResponse(fail(e.message)));
@@ -329,7 +405,7 @@ chrome.runtime.onMessage.addListener((req, sender, sendResponse) => {
   }
 
   if (type === "STOP_SERVER") {
-    nativeMsg("stop").then((resp) => sendResponse(ok({ message: resp?.message })))
+    nativeMsg("stop").then((resp) => sendResponse(resp?.success === false ? fail(resp.message || "Stop failed") : ok({ message: resp?.message })))
       .catch((e) => sendResponse(fail(e.message)));
     return true;
   }

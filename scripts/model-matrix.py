@@ -14,6 +14,9 @@ import urllib.request
 from pathlib import Path
 
 import soundfile as sf
+from stream_probe import measure_stream
+
+AUTH_HEADERS = {}
 
 DEFAULT_SPEEDS = (0.5, 1.0, 1.5, 2.0, 3.0)
 VOICES = {"kokoro": "af_bella", "qwen3-tts": "ryan", "fish-s2-pro": "whisper"}
@@ -30,7 +33,7 @@ LONG_TEXT = " ".join(
 
 def request_json(url: str, *, method: str = "GET", body=None, timeout: int = 900):
     payload = None if body is None else json.dumps(body).encode()
-    req = urllib.request.Request(url, data=payload, method=method)
+    req = urllib.request.Request(url, data=payload, method=method, headers=AUTH_HEADERS)
     if payload is not None:
         req.add_header("Content-Type", "application/json")
     with urllib.request.urlopen(req, timeout=timeout) as response:
@@ -50,7 +53,7 @@ def synthesize(base: str, model: str, speed: float, text: str, timeout: int):
         f"{base}/v1/synthesize",
         data=json.dumps(body).encode(),
         method="POST",
-        headers={"Content-Type": "application/json"},
+        headers={"Content-Type": "application/json", **AUTH_HEADERS},
     )
     with urllib.request.urlopen(req, timeout=timeout) as response:
         audio = response.read()
@@ -75,71 +78,47 @@ def synthesize(base: str, model: str, speed: float, text: str, timeout: int):
 
 
 def synthesize_stream(base: str, model: str, speed: float, text: str, timeout: int):
-    body = {
-        "texts": [text],
-        "model": model,
-        "voice": VOICES[model],
-        "speed": speed,
-    }
-    req = urllib.request.Request(
-        f"{base}/v1/synthesize-stream-batch",
-        data=json.dumps(body).encode(),
-        method="POST",
-        headers={"Content-Type": "application/json"},
-    )
-    with urllib.request.urlopen(req, timeout=timeout) as response:
-        payload = response.read()
-
-    offset = 0
-    audio_frames = 0
-    audio_bytes = 0
-    terminal = False
-    while offset + 8 <= len(payload):
-        header_size = struct.unpack_from("<I", payload, offset)[0]
-        header_start = offset + 4
-        header_end = header_start + header_size
-        if header_end + 4 > len(payload):
-            raise ValueError("Truncated streaming header")
-        header = json.loads(payload[header_start:header_end])
-        size = struct.unpack_from("<I", payload, header_end)[0]
-        end = header_end + 4 + size
-        if end > len(payload):
-            raise ValueError("Truncated streaming audio")
-        audio = payload[header_end + 4:end]
-        if header.get("error"):
-            raise RuntimeError(header["error"])
-        if header.get("done"):
-            terminal = True
-        if audio:
-            with sf.SoundFile(io.BytesIO(audio)) as wav:
-                if len(wav) <= 0 or wav.samplerate <= 0:
-                    raise ValueError("Streaming WAV frame is empty")
-            audio_frames += 1
-            audio_bytes += len(audio)
-        offset = end
-    if offset != len(payload) or not terminal or audio_frames == 0:
-        raise ValueError("Streaming response is incomplete")
-    return {
-        "ok": True,
-        "frames": audio_frames,
-        "audio_bytes": audio_bytes,
-        "terminal": terminal,
-    }
+    body = {"texts":[text], "model":model, "voice":VOICES[model], "speed":speed, "protocol_version":2}
+    req = urllib.request.Request(f"{base}/v1/synthesize-stream-batch",data=json.dumps(body).encode(),
+                                 method="POST",headers={"Content-Type":"application/json",**AUTH_HEADERS})
+    started=time.perf_counter()
+    with urllib.request.urlopen(req,timeout=timeout) as response:
+        return measure_stream(response,started=started,version=2)
 
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--base-url", default="http://127.0.0.1:8000")
-    parser.add_argument("--models", nargs="+", default=list(VOICES))
+    parser.add_argument("--base-url", required=True)
+    parser.add_argument("--authorize-real-audio", action="store_true")
+    parser.add_argument("--authorize-model-switches", action="store_true")
+    parser.add_argument("--runtime-dir", type=Path, required=True)
+    parser.add_argument("--models", nargs="+", choices=list(VOICES), required=True)
     parser.add_argument("--speeds", nargs="+", type=float, default=list(DEFAULT_SPEEDS))
     parser.add_argument("--timeout", type=int, default=1200)
     parser.add_argument("--output", type=Path, default=Path("artifacts/model-matrix.json"))
     parser.add_argument("--skip-long", action="store_true")
     args = parser.parse_args()
+    if not args.authorize_real_audio:
+        parser.error("Explicit --authorize-real-audio is required")
+    parsed=urllib.parse.urlsplit(args.base_url)
+    if parsed.scheme != "http" or parsed.hostname not in ("127.0.0.1","::1") or not parsed.port or parsed.port == 8000 or parsed.username or parsed.password or parsed.query or parsed.fragment or parsed.path not in ("", "/"):
+        parser.error("An isolated loopback URL/port is required; production port 8000 refused")
+    if len(args.models)>1 and not args.authorize_model_switches:
+        parser.error("Multiple models require --authorize-model-switches")
+    runtime=args.runtime_dir.resolve()
+    if runtime == (Path(__file__).resolve().parents[1]/"backend").resolve():
+        parser.error("Production runtime directory refused")
+    global AUTH_HEADERS
+    AUTH_HEADERS={"X-Open-TTS-Token":(runtime/".open_tts_token").read_text().strip(),
+                  "Origin":"chrome-extension://"+"a"*32}
     base = args.base_url.rstrip("/")
     report = {"base_url": base, "models": {}, "started_at": time.time()}
 
     health, _ = request_json(f"{base}/health", timeout=10)
+    if health.get("gpu_busy") or health.get("state") in ("loading","warming","generating"):
+        parser.error("Target is busy; refusing model matrix")
+    if health.get("model_loaded") and health.get("model") != args.models[0] and not args.authorize_model_switches:
+        parser.error("Refusing to switch the loaded model without --authorize-model-switches")
     if health.get("engine") != "open-tts":
         raise RuntimeError("Endpoint is not Open TTS")
 
@@ -148,7 +127,7 @@ def main() -> int:
         report["models"][model] = model_report
         try:
             load, _ = request_json(
-                f"{base}/v1/load-model?{urllib.parse.urlencode({'model_id': model, 'force': 'true'})}",
+                f"{base}/v1/load-model?{urllib.parse.urlencode({'model_id': model, 'force': 'false'})}",
                 method="POST",
                 timeout=args.timeout,
             )

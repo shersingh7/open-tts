@@ -17,6 +17,13 @@ if [[ ! -f "$SCRIPT_DIR/server.py" ]]; then
   exit 1
 fi
 
+AUTOSTART=false
+for arg in "$@"; do
+  case "$arg" in
+    --auto-start) AUTOSTART=true ;;
+    *) printf "Unknown option: %s\nUsage: %s [--auto-start]\n" "$arg" "$0" >&2; exit 2 ;;
+  esac
+done
 UID_NUM="$(id -u)"
 mkdir -p "$(dirname "$PLIST_PATH")"
 OLD_PLIST="$HOME/Library/LaunchAgents/com.qwen-tts.server.plist"
@@ -44,7 +51,7 @@ cat > "$PLIST_PATH" << EOF
     <key>WorkingDirectory</key>
     <string>$SCRIPT_DIR</string>
     <key>RunAtLoad</key>
-    <true/>
+    <$AUTOSTART/>
     <key>KeepAlive</key>
     <false/>
     <key>StandardOutPath</key>
@@ -57,8 +64,10 @@ EOF
 
 plutil -lint "$PLIST_PATH" >/dev/null
 launchctl bootstrap "gui/$UID_NUM" "$PLIST_PATH"
-launchctl kickstart -k "gui/$UID_NUM/$PLIST_NAME"
+if [[ "$AUTOSTART" == true ]]; then
+  launchctl kickstart -k "gui/$UID_NUM/$PLIST_NAME"
+fi
 launchctl print "gui/$UID_NUM/$PLIST_NAME" >/dev/null
 
-echo "✓ Launch agent installed and started: $PLIST_PATH"
+echo "✓ Launch agent installed (auto-start=$AUTOSTART): $PLIST_PATH"
 echo "Stop: launchctl bootout gui/$UID_NUM $PLIST_PATH"

@@ -80,6 +80,55 @@ def build_cors_origins(extension_origins: Optional[List[str]] = None) -> List[st
     return origins
 
 
+
+
+class BoundedBodyMiddleware:
+    """Bound raw upload bytes/concurrency before JSON parsing, even without length."""
+    def __init__(self, app):
+        import threading
+        self.app = app
+        self._lock = threading.Lock()
+        self._reading = 0
+
+    async def __call__(self, scope, receive, send):
+        import asyncio
+        from .config import MAX_BODY_BYTES
+        if scope["type"] != "http" or scope.get("method") != "POST":
+            return await self.app(scope, receive, send)
+        with self._lock:
+            admitted = self._reading < 4
+            if admitted:
+                self._reading += 1
+        if not admitted:
+            return await JSONResponse({"code": "gpu_busy", "message": "Too many uploads"}, 503)(scope, receive, send)
+        body = bytearray()
+        try:
+            deadline = time.monotonic() + 30
+            while True:
+                message = await asyncio.wait_for(receive(), max(0.01, deadline-time.monotonic()))
+                if message["type"] == "http.disconnect":
+                    return
+                part = message.get("body", b"")
+                if len(body) + len(part) > MAX_BODY_BYTES:
+                    return await JSONResponse({"code": "validation", "message": "JSON body exceeds 4 MiB; partition text"}, 413)(scope, receive, send)
+                body.extend(part)
+                if not message.get("more_body", False):
+                    break
+            delivered = False
+            async def replay():
+                nonlocal delivered
+                if not delivered:
+                    delivered = True
+                    return {"type": "http.request", "body": bytes(body), "more_body": False}
+                return await receive()
+            await self.app(scope, replay, send)
+        except asyncio.TimeoutError:
+            await JSONResponse({"code": "validation", "message": "Upload timeout"}, 408)(scope, receive, send)
+        finally:
+            with self._lock:
+                self._reading -= 1
+
+
 class AuthAndRateLimitMiddleware(BaseHTTPMiddleware):
     def __init__(self, app, rate_limiter: RateLimiter):
         super().__init__(app)

@@ -42,6 +42,7 @@ def client(fake_loader, monkeypatch, tmp_path):
     try:
         yield TestClient(app)
     finally:
+        assert app.state.runtime.shutdown(timeout=5)
         _reset_coordinator()
 
 

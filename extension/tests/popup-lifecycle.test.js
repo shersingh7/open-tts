@@ -76,3 +76,13 @@ it('popup rejects late status after terminal error',async()=>{
   h.deliver({type:'TTS_STATUS',runId,label:'Reading...'});
   expect(h.state().playbackState).toBe('idle');expect(h.nodes.get('progress').textContent).toBe('Error');
 });
+it('Speak snapshots current controls rather than stale debounced preferences',async()=>{
+  const h=popupHarness(),gate=deferred();h.settings(gate.promise);
+  h.nodes.get('speed').value='2.5';h.nodes.get('model').value='kokoro';
+  h.nodes.get('voice').value='af_bella';h.nodes.get('instruct').value='';
+  const speaking=h.invoke('handleSpeak');h.nodes.get('speed').value='3';
+  gate.resolve({speed:1,instruct:'stale synced instruction'});await flush();
+  const request=h.pending.find(p=>p.req.type==='SPEAK').req;
+  expect(request.settings.speed).toBe(2.5);expect(request.settings.instruct).toBe('');
+  h.respond('SPEAK');await speaking;
+});

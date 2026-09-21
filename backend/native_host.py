@@ -21,10 +21,11 @@ SCRIPT_DIR = Path(__file__).parent.resolve()
 BACKEND_DIR = SCRIPT_DIR
 SERVER_SCRIPT = BACKEND_DIR / "server.py"
 VENV_PYTHON = BACKEND_DIR / "venv" / "bin" / "python"
-PID_FILE = BACKEND_DIR / ".server.pid"
-LOCK_FILE = BACKEND_DIR / ".open_tts.lock"
-TOKEN_FILE = BACKEND_DIR / ".open_tts_token"
-LOG_FILE = BACKEND_DIR / "server.log"
+RUNTIME_DIR = Path(os.getenv("OPEN_TTS_RUNTIME_DIR", str(BACKEND_DIR)))
+PID_FILE = RUNTIME_DIR / ".server.pid"
+LOCK_FILE = RUNTIME_DIR / ".open_tts.lock"
+TOKEN_FILE = RUNTIME_DIR / ".open_tts_token"
+LOG_FILE = RUNTIME_DIR / "server.log"
 DEFAULT_PORT = int(os.getenv("OPEN_TTS_PORT", "8000"))
 MAX_MESSAGE_BYTES = 1_048_576
 ENGINE_ID = "open-tts"
@@ -270,8 +271,8 @@ def get_server_pid():
 
 def _kill_process_group(pid: int, sig: int) -> None:
     try:
-        if sys.platform != "win32":
-            os.killpg(os.getpgid(pid), sig)
+        if sys.platform != "win32" and os.getpgid(pid) == pid and os.getsid(pid) == pid:
+            os.killpg(pid, sig)
         else:
             os.kill(pid, sig)
     except (ProcessLookupError, PermissionError):
@@ -285,8 +286,10 @@ def _pid_alive(pid: int) -> bool:
     try:
         os.kill(pid, 0)
         return True
-    except (ProcessLookupError, PermissionError):
+    except ProcessLookupError:
         return False
+    except PermissionError:
+        return True
 
 
 def _wait_for_exit(pid: int, timeout: float) -> bool:
@@ -299,45 +302,27 @@ def _wait_for_exit(pid: int, timeout: float) -> bool:
 
 
 def kill_owned_server(port=DEFAULT_PORT):
-    """Kill only a verified Open TTS server. Never touch foreign port owners."""
-    pid = get_pid_on_port()
+    """Verify PID identity, signal safely, retain the PID until confirmed exit."""
+    pid = get_pid_on_port() or _read_pid_file()
     if pid is None:
-        recorded_pid = _read_pid_file()
-        if recorded_pid and _is_open_tts_process(recorded_pid):
-            _kill_process_group(recorded_pid, signal.SIGTERM)
-            _wait_for_exit(recorded_pid, timeout=5)
-            if _pid_alive(recorded_pid):
-                _kill_process_group(recorded_pid, signal.SIGKILL)
-            _clear_pid_file()
-            return True, f"Stopped non-listening Open TTS process {recorded_pid}"
-        _clear_pid_file()
         return True, "No Open TTS process found"
-
     if not _is_open_tts_process(pid):
-        return False, f"Port {port} owned by foreign PID {pid}; refusing to kill"
-
-    if not _verify_open_tts_server(pid):
-        if not _is_open_tts_process(pid):
-            return False, f"PID {pid} is not an Open TTS server"
-        # Process looks like ours but health not ready — still only kill if command matches
-        pass
-
+        return False, f"PID {pid} is foreign or not a verified Open TTS process; refusing to kill"
     try:
         _kill_process_group(pid, signal.SIGTERM)
-        for _ in range(20):
-            time.sleep(0.25)
-            if not is_port_in_use(port):
-                _clear_pid_file()
-                return True, f"Stopped Open TTS server (PID {pid})"
-        _kill_process_group(pid, signal.SIGKILL)
-        time.sleep(0.5)
+        if not _wait_for_exit(pid, timeout=5):
+            if not _is_open_tts_process(pid):
+                return False, "Process identity changed during stop; PID retained"
+            _kill_process_group(pid, signal.SIGKILL)
+            if not _wait_for_exit(pid, timeout=2):
+                return False, f"PID {pid} has not exited; cleanup pending"
         _clear_pid_file()
-        return True, f"Force-stopped Open TTS server (PID {pid})"
+        return True, f"Stopped Open TTS server (PID {pid})"
     except ProcessLookupError:
         _clear_pid_file()
         return True, "Server already stopped"
     except PermissionError:
-        return False, f"Permission denied stopping PID {pid}"
+        return False, f"Permission denied stopping PID {pid}; PID retained"
 
 
 def _sign_native_dylibs_if_darwin():
@@ -360,7 +345,7 @@ def _sign_native_dylibs_if_darwin():
 
 
 def start_server():
-    _sign_native_dylibs_if_darwin()
+    RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
 
     if is_port_in_use():
         port_pid = get_pid_on_port()
@@ -387,6 +372,8 @@ def start_server():
                     if age <= STARTUP_GRACE_SECONDS:
                         return True, f"Server starting (PID: {pid})", _read_install_token()
                     _kill_process_group(pid, signal.SIGKILL)
+                    if not _wait_for_exit(pid, timeout=2):
+                        return False, "Previous process has not exited; startup refused", None
         except ProcessLookupError:
             pass
         _clear_pid_file()
@@ -397,6 +384,7 @@ def start_server():
     if not VENV_PYTHON.is_file():
         return False, "venv python missing; run setup.sh", None
 
+    _sign_native_dylibs_if_darwin()
     try:
         log_fh = open(LOG_FILE, "a")
     except OSError as exc:
@@ -405,6 +393,7 @@ def start_server():
     env = dict(os.environ)
     env.pop("PYTHONPATH", None)
     env.setdefault("OPEN_TTS_EAGER_LOAD", "0")
+    env["OPEN_TTS_RUNTIME_DIR"] = str(RUNTIME_DIR)
 
     try:
         process = subprocess.Popen(
@@ -425,14 +414,17 @@ def start_server():
     start_time = time.time()
     while time.time() - start_time < 20:
         time.sleep(0.3)
-        try:
-            os.kill(process.pid, 0)
-        except ProcessLookupError:
+        if process.poll() is not None:
             _clear_pid_file()
             return False, "Server failed to start. Check server.log", None
         if is_port_in_use() and _verify_open_tts_server(process.pid):
             return True, f"Server started (PID: {process.pid})", _read_install_token()
+    if process.poll() is not None:
+        _clear_pid_file()
+        return False, "Server exited before becoming ready", None
     if is_port_in_use():
+        if not _verify_open_tts_server(process.pid):
+            return False, "Listening process could not be verified as this Open TTS child", None
         return True, f"Server starting (PID: {process.pid})", _read_install_token()
     return True, f"Server process started (PID: {process.pid}); waiting for port", None
 

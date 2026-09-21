@@ -17,13 +17,13 @@ def test_native_message_size_limit():
     assert native_host.MAX_MESSAGE_BYTES == 1_048_576
 
 
-def test_bounded_get_message_rejects_large_length():
+def test_bounded_get_message_rejects_large_length(monkeypatch):
     import struct
     import io
 
     payload = struct.pack("@I", native_host.MAX_MESSAGE_BYTES + 1)
-    native_host.sys.stdin = io.BytesIO(payload)
-    native_host.sys.stdin.buffer = native_host.sys.stdin
+    from types import SimpleNamespace
+    monkeypatch.setattr(native_host.sys, "stdin", SimpleNamespace(buffer=io.BytesIO(payload)))
     try:
         native_host.get_message()
         assert False, "expected ValueError"
@@ -45,7 +45,8 @@ def test_native_message_reads_fragmented_pipe(monkeypatch):
             return super().read(min(requested, 2) if requested >= 0 else 2)
 
     stream = Fragmented(raw)
-    monkeypatch.setattr(native_host.sys.stdin, "buffer", stream)
+    from types import SimpleNamespace
+    monkeypatch.setattr(native_host.sys, "stdin", SimpleNamespace(buffer=stream))
     assert native_host.get_message() == {"action": "status"}
 
 

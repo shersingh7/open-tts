@@ -17,7 +17,7 @@ def validate_text(text: str, *, field: str = "text") -> str:
         raise http_exception(
             400,
             ErrorCode.VALIDATION,
-            f"{field} exceeds maximum length of {MAX_TEXT_LENGTH}",
+            f"{field} exceeds maximum length of {MAX_TEXT_LENGTH}; partition text and use /v1/synthesize-stream-batch",
         )
     cleaned = normalize_text(raw)
     if not cleaned:
@@ -26,7 +26,7 @@ def validate_text(text: str, *, field: str = "text") -> str:
         raise http_exception(
             400,
             ErrorCode.VALIDATION,
-            f"{field} exceeds maximum length of {MAX_TEXT_LENGTH}",
+            f"{field} exceeds maximum length of {MAX_TEXT_LENGTH}; partition text and use /v1/synthesize-stream-batch",
         )
     return cleaned
 
@@ -40,6 +40,8 @@ def validate_batch(texts: List[str]) -> List[str]:
             ErrorCode.BATCH_TOO_LARGE,
             f"Maximum {MAX_BATCH_TEXTS} texts per batch",
         )
+    if sum(len(t) for t in texts) > MAX_BATCH_TOTAL_CHARS:
+        raise http_exception(400, ErrorCode.BATCH_TOO_LARGE, "Raw batch text exceeds aggregate character limit")
     cleaned = [validate_text(t, field=f"texts[{i}]") for i, t in enumerate(texts)]
     total = sum(len(t) for t in cleaned)
     if total > MAX_BATCH_TOTAL_CHARS:
