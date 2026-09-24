@@ -116,23 +116,3 @@ describe("structure preserving partitioning", () => {
     expect(nonWhitespaceKey(null)).toBe("");
   });
 });
-
-describe("parity with the v3 UMD implementation", () => {
-  it("produces identical partitions for a mixed corpus", async () => {
-    const { readFileSync } = await import("node:fs");
-    const global = {};
-    new Function("globalThis", readFileSync(new URL("../shared/playback-umd.js", import.meta.url), "utf8"))(global);
-    const umd = global.OpenTTSPlayback;
-    const corpus = [
-      "Dr. Smith went to Washington. He said \"Hello!\" Then left.\n\nNew paragraph here.\n- item one\n- item two",
-      "Visit www.example.com. Or https://x.y/z.html now. Value is 3.14 today.",
-      "🌍".repeat(50) + " done. " + "word ".repeat(80),
-    ];
-    for (const text of corpus) {
-      for (const [max, first] of [[4000, 4000], [120, 40], [37, 13]]) {
-        expect(splitText(text, max, first)).toEqual(umd.splitText(text, max, first));
-      }
-      expect(sentenceUnits(text)).toEqual(umd.sentenceUnits(text));
-    }
-  });
-});

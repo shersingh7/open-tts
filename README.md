@@ -16,6 +16,8 @@ Multi-model, fully local text-to-speech on Apple Silicon. Switch between **Kokor
 - **Single speed owner** — Kokoro uses native synthesis speed; Qwen3/Fish use server-side pitch-preserving time stretch. The extension plays at 1x.
 - **Multilingual** — English, Chinese, Japanese, Korean, and auto-detect (Qwen3); Kokoro supports multiple languages via single-letter lang codes
 - **Chrome Extension** — Select text on any page and click to hear it
+- **Right-click & shortcuts** — "Read with Open TTS" on any selection (works in PDFs); Alt+Shift+R reads the selection, Alt+Shift+P pauses/resumes
+- **Per-site widget hiding** — hide the on-page button on a site from the popup
 - **Server Control** — Start/Stop server directly from the extension popup
 - **Bounded playback** — Adjacent Web Audio scheduling while buffered; controlled rebuffering after a stall instead of overlapping late audio.
 
@@ -39,9 +41,9 @@ Only one model is loaded at a time. A model change while work is active is rejec
 - The extension requires the matching backend stream contract: processed-speed metadata, ordered per-index finals and a terminal done frame. Truncation is an error.
 - Real-model listening and real Chrome lifecycle checks are separate release gates; the offline suite uses fake models and a simulated audio clock.
 
-## Progressive reading (3.5.0 candidate)
+## Progressive reading
 
-Chrome **116+** and the matching backend are required. Short Kokoro selections use the lightweight offscreen player. Selections over 4,000 characters, Qwen3, and Fish use a visible **Reader tab**. Keep that tab open while listening. Closing/discarding the owner is an interruption, not completion.
+Chrome **116+** and the matching backend are required. Short selections use the lightweight offscreen player. Selections over 4,000 characters, and Qwen3/Fish selections over 600 characters, use a visible **Reader tab** (only one Reader can host playback at a time; Chrome is asked not to discard it while reading). Short Qwen3/Fish previews stay offscreen and fail with a "slow to start" message if no audio arrives within 25 s. Keep that tab open while listening. Closing/discarding the owner is an interruption, not completion.
 
 The backend separates large HTTP text partitions from small generation passages and roughly two-second audio packets:
 
@@ -252,15 +254,21 @@ The extension bounds scheduled audio to 20 seconds plus 250 ms scheduling lead a
 ## Architecture
 
 ```text
-content.js / popup.js: text + UI + playback controls
-  → background.js: on-demand server lifecycle, routing, run ownership
-    → Reader tab or offscreen document: shared offscreen.js transport/decode/playback
-      → backend/open_tts/api.py: framed transport and disconnect handling
-        → coordinator.py: serialized model lifecycle / semantic generation units
-          → audio.py: sample-preserving native PCM / semantic time stretch
+content/content.js (closed-shadow widget) · ui/popup · host/reader UI · right-click menu · Alt+Shift+R / Alt+Shift+P
+  ⇄ long-lived named ports (ui:popup, ui:content, ui:reader)
+sw/ service worker — the single owner of playback state
+  router.js        ownership rules, SPEAK flow, command routing, SESSION snapshots to every UI
+  session-store.js authoritative run record in chrome.storage.session (survives SW restarts)
+  server-manager   one single-flight ensureServer / model load (progress survives popup close)
+  auth.js          API token in chrome.storage.session (extension pages only; never content scripts)
+  ⇄ host ports (host:offscreen, host:reader) — exactly one playback host per run
+host/engine.js — run-scoped transport/decode/playback (offscreen document or Reader tab)
+  → backend/open_tts/api.py: framed transport, Host-header check, disconnect handling
+    → coordinator.py: serialized model lifecycle / semantic generation units
+      → audio.py: sample-preserving native PCM / semantic time stretch
 ```
 
-Audio never travels through Chrome runtime messages. Each playback run owns its controller, AudioContext, sources, timers and completion state. A replacement tears down only its predecessor. The background worker can recover playback state from an existing Reader or offscreen document after restart without creating one for an idle status check.
+The service worker is the only place that knows which run is active. UIs render the latest `SESSION` snapshot and send commands; hosts report `STATUS`/`PROGRESS`/`DONE`/`ERROR` and a heartbeat. A web page's widget can only control the reading it started (same tab and frame). If the owning host's port disconnects and does not reconnect within 2 s, the run ends once as `owner_lost`. A second Reader tab is refused, so a restored/duplicated Reader can never synthesize the same reading twice. Audio never travels through Chrome runtime messages.
 
 There is **no automatic whole-document fallback**. Invalid, interrupted or failed audio stops with a visible error; a user-initiated retry is a new run. This avoids hidden replay and all-audio JSON accumulation.
 
@@ -274,7 +282,7 @@ git diff --check
 
 The offline suite loads the real extension scripts with controlled Chrome/Web Audio/fetch substitutes and the real Python coordinator with fake model adapters. It includes a 2,000-frame simulated playback soak, cancellation interleavings, strict framing, text preservation and synthetic DSP tests. It is not a real-model latency benchmark or a listening verdict.
 
-See [progressive implementation plan](docs/plans/2026-09-15-progressive-long-form-tts.md) and [verification report](docs/reports/progressive-long-form-verification.md). Version 3.5.0 is a source/package candidate, not an automatically installed release. Reload the unpacked extension and restart the matching backend **only when existing audio work is idle and after authorizing that operation**. No model or lifecycle tests should interrupt another audio job.
+See [progressive implementation plan](docs/plans/2026-09-15-progressive-long-form-tts.md) and [verification report](docs/reports/progressive-long-form-verification.md). Version 4.0.0 is a source/package candidate, not an automatically installed release. Reload the unpacked extension and restart the matching backend **only when existing audio work is idle and after authorizing that operation**. No model or lifecycle tests should interrupt another audio job.
 
 ## Project Structure
 
@@ -293,14 +301,12 @@ backend/
   uninstall_launch_agent.sh # Remove launch agent
   uninstall_native_host.sh # Remove native host
 extension/
-  manifest.json       # Chrome MV3 extension config
-  background.js       # Service worker: routing and server lifecycle
-  content.js          # Content script: selection and widget
-  offscreen.js        # Shared run-scoped audio transport/decode/playback
-  reader.html/js/css   # Visible long-reading owner, controls, progress and explicit retry
-  shared/             # Bounded playback sessions, text and framing helpers
-  popup.html/js/css   # Extension popup with model selector
-  content.css         # Widget styling
+  manifest.json       # Chrome MV3 extension config (module service worker, menus, commands)
+  sw/                 # Service worker: router, session store, server/host managers, auth, history, menus
+  host/               # Playback engine + offscreen document + Reader tab
+  ui/                 # Popup and its port client
+  content/content.js  # Content script: selection widget in a closed shadow root
+  shared/             # ESM: constants, messages, stream decoder, playback helpers, storage
   icon*.png           # Extension icons
 ```
 

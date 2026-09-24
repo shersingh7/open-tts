@@ -1,8 +1,8 @@
 // Test harness for host/engine.js: fake AudioContext, scripted fetch responses and v1/v2 stream frame builders.
 // Self-contained port of the v3 pipeline-harness.js (which targets the classic offscreen.js via node:vm).
 
-import { createEngine } from "../host/engine.js";
-import { MSG } from "../shared/messages.js";
+import { createEngine } from "../../host/engine.js";
+import { MSG } from "../../shared/messages.js";
 
 export const TERMINAL_TYPES = [MSG.DONE, MSG.ERROR];
 

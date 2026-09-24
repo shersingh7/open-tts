@@ -3,7 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { connectHost, RECONNECT_MAX_MS, RECONNECT_MIN_MS } from "../host/host-port.js";
 import { MSG, PORTS } from "../shared/messages.js";
 import { createFakeChrome, flush } from "./helpers/fake-chrome.js";
-import { engineHarness, v2Frames, v2Response } from "./host-harness.js";
+import { engineHarness, v2Frames, v2Response } from "./helpers/host-harness.js";
 
 function fakeEngine(active = null) {
   const calls = [];

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { bufferDecodedBytes, createPlaybackRun, readWithIdleTimeout } from "../shared/playback-session.js";
-import { flush } from "./pipeline-harness.js";
+import { flush } from "./helpers/host-harness.js";
 
 class FakeContext {
   constructor() {

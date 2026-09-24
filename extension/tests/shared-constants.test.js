@@ -50,15 +50,4 @@ describe("shared/constants.js (ESM)", () => {
     expect(C.HEARTBEAT_MS).toBe(20000);
     expect(C.HIDDEN_SITES_KEY).toBe("hiddenSites");
   });
-
-  it("matches every live value of the v3 UMD constants", async () => {
-    const { readFileSync } = await import("node:fs");
-    const code = readFileSync(new URL("../shared/constants-umd.js", import.meta.url), "utf8");
-    const global = {};
-    new Function("globalThis", code)(global);
-    for (const [key, value] of Object.entries(global.OpenTTSConstants)) {
-      if (typeof value === "function") continue;
-      expect(C[key], key).toEqual(value);
-    }
-  });
 });

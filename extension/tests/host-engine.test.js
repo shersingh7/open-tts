@@ -8,7 +8,7 @@ import { FrameDecoder, StreamCursor } from "../shared/stream-decoder.js";
 import { createPlaybackRun, readWithIdleTimeout } from "../shared/playback-session.js";
 import {
   audioFrame, deferred, ending, engineHarness, flush, frame, makeContextClass, response, v2Frames, v2Response, wav,
-} from "./host-harness.js";
+} from "./helpers/host-harness.js";
 
 const types = (events) => events.map((event) => event.type);
 

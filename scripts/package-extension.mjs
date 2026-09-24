@@ -19,9 +19,11 @@ function walk(dir) {
   });
 }
 
-const files = walk(join(root, "extension"))
-  .map((path) => path.slice(root.length + 1))
+const extensionDir = join(root, "extension");
+// Paths are relative to extension/ so manifest.json sits at the zip root (required by Chrome / the Web Store).
+const files = walk(extensionDir)
+  .map((path) => path.slice(extensionDir.length + 1))
   .sort();
-if (!files.length) throw new Error("No extension files found");
-execFileSync("zip", ["-X", "-q", output, ...files], { cwd: root, stdio: "inherit" });
+if (!files.includes("manifest.json")) throw new Error("manifest.json missing from extension files");
+execFileSync("zip", ["-X", "-q", output, ...files], { cwd: extensionDir, stdio: "inherit" });
 console.log(output);

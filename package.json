@@ -1,7 +1,7 @@
 {
   "name": "open-tts",
   "private": true,
-  "version": "3.5.0",
+  "version": "4.0.0",
   "type": "module",
   "scripts": {
     "lint": "eslint .",

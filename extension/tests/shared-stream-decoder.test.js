@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { FrameDecoder, MAX_AUDIO_BYTES, MAX_HEADER_BYTES, StreamCursor } from "../shared/stream-decoder.js";
-import { audioFrame, frame } from "./pipeline-harness.js";
+import { audioFrame, frame } from "./helpers/host-harness.js";
 
 function concat(parts) {
   const out = new Uint8Array(parts.reduce((sum, part) => sum + part.length, 0));

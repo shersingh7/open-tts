@@ -6,7 +6,7 @@ import { startOffscreenHost } from "../host/offscreen.js";
 import { startReader } from "../host/reader.js";
 import { MSG, PORTS, idleSession } from "../shared/messages.js";
 import { createFakeChrome, flush } from "./helpers/fake-chrome.js";
-import { makeContextClass, v2Frames, v2Response } from "./host-harness.js";
+import { makeContextClass, v2Frames, v2Response } from "./helpers/host-harness.js";
 
 const IDS = ["reader", "status", "model", "detail", "passage", "progress", "pause", "stop", "retry", "error",
   "metrics", "text"];

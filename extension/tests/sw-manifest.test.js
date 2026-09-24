@@ -5,13 +5,13 @@ const manifest = JSON.parse(readFileSync(new URL("../manifest.json", import.meta
 const ICONS = { 16: "icon16.png", 32: "icon32.png", 48: "icon48.png", 128: "icon128.png" };
 
 describe("manifest (v4 contract)", () => {
-  it("matches the contract shape (version is bumped to 4.0.0 at integration, see NOTES-A)", () => {
+  it("matches the contract shape", () => {
     const rest = { ...manifest };
-    delete rest.version;
     delete rest.description;
     expect(rest).toEqual({
       manifest_version: 3,
       name: "Open TTS",
+      version: "4.0.0",
       minimum_chrome_version: "116",
       permissions: ["storage", "nativeMessaging", "offscreen", "contextMenus"],
       host_permissions: ["http://127.0.0.1:8000/*"],
@@ -21,7 +21,7 @@ describe("manifest (v4 contract)", () => {
       background: { service_worker: "sw/main.js", type: "module" },
       action: { default_popup: "ui/popup.html", default_icon: ICONS },
       icons: ICONS,
-      content_scripts: [{ matches: ["<all_urls>"], js: ["content/content.js"], run_at: "document_idle" }],
+      content_scripts: [{ matches: ["<all_urls>"], js: ["content/content.js"], all_frames: true, run_at: "document_idle" }],
       commands: {
         "read-selection": { suggested_key: { default: "Alt+Shift+R" }, description: "Read selected text" },
         "toggle-pause": { suggested_key: { default: "Alt+Shift+P" }, description: "Pause or resume reading" },

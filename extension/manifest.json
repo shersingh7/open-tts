@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Open TTS",
-  "version": "3.5.0",
+  "version": "4.0.0",
   "minimum_chrome_version": "116",
   "description": "Local multi-model text-to-speech using MLX on Apple Silicon. Kokoro, Qwen3-TTS, and Fish Audio S2 Pro.",
   "permissions": ["storage", "nativeMessaging", "offscreen", "contextMenus"],
@@ -18,6 +18,7 @@
   "content_scripts": [{
     "matches": ["<all_urls>"],
     "js": ["content/content.js"],
+    "all_frames": true,
     "run_at": "document_idle"
   }],
   "commands": {
