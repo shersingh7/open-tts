@@ -120,3 +120,21 @@ def test_start_server_preserves_own_non_listening_process_during_startup_grace(m
     assert "starting" in msg.lower()
     assert token == "tok"
     assert killed == []
+
+def test_runtime_dir_matches_server_config(monkeypatch, tmp_path):
+    """native host and server must resolve OPEN_TTS_RUNTIME_DIR identically (token file location)."""
+    import importlib
+    import open_tts.config as config
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("OPEN_TTS_RUNTIME_DIR", "relative-runtime")
+    try:
+        nh = importlib.reload(native_host)
+        cfg = importlib.reload(config)
+        assert nh.RUNTIME_DIR == cfg.RUNTIME_DIR
+        assert nh.TOKEN_FILE == cfg.TOKEN_FILE
+        assert nh.RUNTIME_DIR.is_absolute()
+    finally:
+        monkeypatch.delenv("OPEN_TTS_RUNTIME_DIR")
+        importlib.reload(native_host)
+        importlib.reload(config)
