@@ -37,7 +37,7 @@ def client(fake_loader, monkeypatch, tmp_path):
     monkeypatch.setattr("open_tts.config.TOKEN_FILE", token_file)
     monkeypatch.setattr("open_tts.api.get_or_create_token", lambda: "test-token-123")
     _reset_coordinator()
-    app = create_app()
+    app = create_app(allowed_hosts_extra=["testserver"])
     app.state.install_token = "test-token-123"
     try:
         yield TestClient(app)
