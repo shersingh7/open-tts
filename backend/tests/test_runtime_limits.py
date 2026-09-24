@@ -70,7 +70,7 @@ def test_v2_audio_units_cover_normalized_unicode_source(fake_loader):
     coordinator.shutdown()
     text = 'Dr. Smith said “bonjour 😀”.\n\n' + 'Une phrase française. ' * 50
     from open_tts.text import normalize_text
-    with TestClient(create_app()) as client:
+    with TestClient(create_app(allowed_hosts_extra=['testserver'])) as client:
         result = client.post('/v1/synthesize-stream-batch', json={
             'texts':[text], 'model':'kokoro', 'voice':'af_bella', 'protocol_version':2})
         assert result.status_code == 200
@@ -113,7 +113,7 @@ def test_batch_response_memory_limit_is_explicit(fake_loader, monkeypatch):
 
 def test_capabilities_and_legacy_speech_contract(fake_loader):
     coordinator.shutdown()
-    with TestClient(create_app()) as client:
+    with TestClient(create_app(allowed_hosts_extra=['testserver'])) as client:
         caps = client.get('/v1/capabilities').json()
         assert caps['protocol_versions'] == [1,2]
         assert caps['limits']['frame_seconds'] <= 4
