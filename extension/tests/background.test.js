@@ -3,14 +3,14 @@ import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { it, expect } from 'vitest';
 import { deferred, flush } from './pipeline-harness.js';
-function background({health, existing=true, playback=null, createError=null, readerPlayback=null, nativeResponse=null}={}) {
+function background({health, existing=true, playback=null, createError=null, createGate=null, readerPlayback=null, nativeResponse=null}={}) {
   let listener,context,hasDoc=existing,creates=0;const forwarded=[],local={installToken:"fixture-token"};
   const chrome={runtime:{onMessage:{addListener(fn){listener=fn;}},getURL:p=>'chrome-extension://test/'+p,getContexts:async options=>options.documentUrls[0].endsWith('reader.html') && readerPlayback ? [{tabId:8}] : [],
     sendNativeMessage(name,request,callback){callback(nativeResponse || {success:false,message:'fixture native failure'});},
     sendMessage(req,cb){forwarded.push(req);const selected=req.hostKind==='reader'?readerPlayback:playback;const result=req.type==='GET_PLAYBACK_STATE'?(typeof selected === 'function' ? selected() : (selected||{active:false})):{success:true,ready:true};cb?.(result);return Promise.resolve(result);}},
     storage:{local:{get(_keys,cb){cb({...local});},set(value,cb){Object.assign(local,value);cb?.();}}},
     tabs:{sendMessage(){return Promise.resolve();},create:async()=>{readerPlayback={active:false};return {id:8};}},
-    offscreen:{hasDocument:async()=>hasDoc,createDocument:async()=>{creates++;if(createError)throw createError;hasDoc=true;}}};
+    offscreen:{hasDocument:async()=>hasDoc,createDocument:async()=>{creates++;if(createGate)await createGate;if(createError)throw createError;hasDoc=true;}}};
   context=vm.createContext({chrome,console,setTimeout,clearTimeout,AbortSignal,AbortController,
     fetch:async url=>({ok:true,json:async()=>url.endsWith('/health') ? {engine:'open-tts',version:'3.5.0',...(health?await health():{status:'ok'})} : {engine:'open-tts',protocol_versions:[1,2]}}),
     importScripts(...files){for(const f of files)vm.runInContext(readFileSync(resolve('extension',f),'utf8'),context);}});
@@ -51,11 +51,22 @@ it('status probe never creates an absent offscreen document',async()=>{
 });
 it('offscreen creation errors are not mistaken for success',async()=>{
   const h=background({existing:false,createError:new Error('offscreen permission denied')});
-  const r=await h.send({type:'ENSURE_OFFSCREEN'});expect(r.success).toBe(false);
+  const r=await h.speak('A');expect(r.success).toBe(false);expect(r.error).toContain('offscreen permission denied');
+  expect(h.forwarded.filter(e=>e.type==='SPEAK')).toHaveLength(0);
 });
 it('offscreen creation is single-flight',async()=>{
-  const h=background({existing:false});await Promise.all([h.send({type:'ENSURE_OFFSCREEN'}),h.send({type:'ENSURE_OFFSCREEN'})]);
+  const gate=deferred(),h=background({existing:false,createGate:gate.promise});
+  const a=h.speak('A');for(let i=0;i<20&&h.creates===0;i++)await flush();
   expect(h.creates).toBe(1);
+  const b=h.speak('B');await flush();await flush();await flush();
+  gate.resolve();await Promise.all([a,b]);
+  expect(h.creates).toBe(1);
+  expect(h.forwarded.filter(e=>e.type==='SPEAK').map(e=>e.runId)).toEqual(['B']);
+});
+it.each(['ENSURE_SERVER','ENSURE_OFFSCREEN','GET_VOICES'])('dead route %s is an unknown message type',async type=>{
+  const h=background({existing:false});const r=await h.send({type});
+  expect(r.success).toBe(false);expect(r.error).toBe(`Unknown message type: ${type}`);
+  expect(h.creates).toBe(0);
 });
 
 it('new Speak after worker restart stops an existing Reader before dispatch',async()=>{

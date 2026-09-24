@@ -22,7 +22,7 @@ function popupHarness() {
     vm.runInContext(readFileSync('extension/'+f,'utf8'),context);
   vm.runInContext('wireEvents()',context);
   return {nodes,pending,context,settings(v){settings=v;},invoke:name=>vm.runInContext(name+'()',context),
-    state:()=>vm.runInContext('({activeRun,playbackState,pendingHistory})',context),
+    state:()=>vm.runInContext('({activeRun,playbackState})',context),
     respond(type,value={success:true}){const i=pending.findIndex(p=>p.req.type===type);expect(i).toBeGreaterThanOrEqual(0);pending.splice(i,1)[0].cb(value);},
     deliver(msg){listener({_routedByBackground:true,...msg});}};
 }
@@ -85,4 +85,9 @@ it('Speak snapshots current controls rather than stale debounced preferences',as
   const request=h.pending.find(p=>p.req.type==='SPEAK').req;
   expect(request.settings.speed).toBe(2.5);expect(request.settings.instruct).toBe('');
   h.respond('SPEAK');await speaking;
+});
+it('popup has no dead local history writer',()=>{
+  const h=popupHarness();
+  expect(vm.runInContext('typeof addHistory',h.context)).toBe('undefined');
+  expect(vm.runInContext('typeof pendingHistory',h.context)).toBe('undefined');
 });

@@ -27,8 +27,9 @@ function contentHarness() {
   const invoke = name => vm.runInContext(`${name}({preventDefault(){},stopPropagation(){}})`, context);
   const state = () => vm.runInContext('({currentRunId,isSpeaking,isPaused})', context);
   const deliver = msg => listener({ _routedByBackground: true, ...msg }, {}, () => {});
+  const deliverWithReply = (msg, reply) => listener({ _routedByBackground: true, ...msg }, {}, reply);
   const respond = (type, value={success:true}) => { const i=pending.findIndex(p=>p.req.type===type); expect(i).toBeGreaterThanOrEqual(0); pending.splice(i,1)[0].cb(value); };
-  return {context,sent,pending,label,invoke,state,deliver,respond,settings:()=>settingsCallback({})};
+  return {context,sent,pending,label,invoke,state,deliver,deliverWithReply,respond,settings:()=>settingsCallback({})};
 }
 
 it('stop while settings load cannot dispatch a ghost SPEAK', async()=>{
@@ -61,4 +62,11 @@ it('failed pause does not claim audio is paused',async()=>{
   const pause=h.invoke('onClick');await flush();h.respond('PAUSE',{success:false,error:'Context unavailable'});await pause;
   expect(h.state().isPaused).toBe(false);
   expect(h.label.textContent).toBe('Context unavailable');
+});
+it('routed STOP_TTS is no longer a content route',async()=>{
+  const h=contentHarness();const start=h.invoke('onClick');h.settings();await flush();h.respond('SPEAK');await start;
+  const runId=h.state().currentRunId;let reply;
+  h.deliverWithReply({type:'STOP_TTS',runId},value=>{reply=value;});
+  expect(reply).toEqual({error:'unknown_message'});
+  expect(h.state().currentRunId).toBe(runId);expect(h.state().isSpeaking).toBe(true);
 });

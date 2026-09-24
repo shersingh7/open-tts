@@ -200,15 +200,6 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     return true;
   }
 
-  if (msg.type === "STOP_TTS") {
-    currentRunId = null;
-    isSpeaking = false;
-    isPaused = false;
-    widget?.classList.remove("paused");
-    setLabel("Speak");
-    sendResponse({ stopped: true });
-    return true;
-  }
   if (msg.type === "TTS_STATUS") {
     setBusy(true, msg.label);
     sendResponse({ ok: true });
