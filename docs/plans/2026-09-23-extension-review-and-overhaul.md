@@ -22,6 +22,11 @@ with **no build step**.
 (type-check only, no emitted files), and Puppeteer with Chrome for Testing for end-to-end (E2E) tests against a fake
 backend.
 
+> **Update 2026-09-24 (David):** "Skip the E2E test. Just code it and I will do the testing myself on real browser."
+> Phase 5.1–5.3 (fake backend, Puppeteer E2E) and the Task 2.0 side-panel spike are **dropped**. Per the D4 rule's
+> fallback, the **Reader tab stays** as the long-read host. The partial harness is preserved unmerged on branch `v4-e2e`.
+> Verification = unit tests (`npm test`) + David's manual real-browser testing (checklist delivered at hand-off).
+
 ---
 
 ## Decisions (resolved to the recommended option)
