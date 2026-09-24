@@ -12,58 +12,11 @@ function playbackApi() {
   return global.OpenTTSPlayback;
 }
 
-describe("playback consume loop", () => {
-  it("schedules the first audio frame before later frames are pulled", async () => {
-    const { consumePlaybackStream } = playbackApi();
-    let pulled = 0;
-    let laterPulledAtFirstSchedule = null;
-    async function* source() {
-      pulled += 1;
-      yield { audio: new Uint8Array([1, 2, 3]), sampleRate: 24000, index: 0 };
-      pulled += 1;
-      yield { audio: new Uint8Array([4, 5, 6]), sampleRate: 24000, index: 0 };
-    }
-    const scheduled = [];
-    const result = await consumePlaybackStream(source(), {
-      schedule: async (frame) => {
-        scheduled.push([...frame.audio]);
-        if (scheduled.length === 1) laterPulledAtFirstSchedule = pulled;
-      },
-    });
-    expect(laterPulledAtFirstSchedule).toBe(1);
-    expect(scheduled).toEqual([
-      [1, 2, 3],
-      [4, 5, 6],
-    ]);
-    expect(result.decoded).toBe(2);
-  });
-
-  it("surfaces errors after audio instead of silently skipping", async () => {
-    const { consumePlaybackStream } = playbackApi();
-    const scheduled=[];
-    await expect(consumePlaybackStream((async function* () {
-      yield {audio:new Uint8Array([1])};
-      yield {error:"later chunk failed",code:"generation_failed"};
-    })(), {schedule: async frame=>scheduled.push(frame)})).rejects.toMatchObject({code:"generation_failed",afterAudio:true});
-    expect(scheduled).toHaveLength(1);
-  });
-
-  it("schedules the first frame even when later frames are delayed", async () => {
-    const { consumePlaybackStream } = playbackApi();
-    let laterAvailable = false;
-    const scheduled = [];
-    async function* source() {
-      yield { audio: new Uint8Array([9]), sampleRate: 24000 };
-      laterAvailable = true;
-      yield { audio: new Uint8Array([8]), sampleRate: 24000 };
-    }
-    await consumePlaybackStream(source(), {
-      schedule: async (frame) => {
-        if (scheduled.length === 0) expect(laterAvailable).toBe(false);
-        scheduled.push([...frame.audio]);
-      },
-    });
-    expect(scheduled).toEqual([[9], [8]]);
+describe("dead playback helpers", () => {
+  it("no longer exports consumePlaybackStream or speakStatus", () => {
+    const api = playbackApi();
+    expect(api).not.toHaveProperty("consumePlaybackStream");
+    expect(api).not.toHaveProperty("speakStatus");
   });
 });
 
@@ -100,17 +53,6 @@ describe("playback clock", () => {
     expect(second).toBeCloseTo(9.05, 5);
     expect(third).toBeCloseTo(second + 0.3, 5);
     expect(second).toBeGreaterThan(9.0);
-  });
-});
-
-describe("speak status labels", () => {
-  it("never shows chunk counters", () => {
-    const { speakStatus } = playbackApi();
-    for (const phase of ["prepare", "generate", "read", "retry"]) {
-      expect(speakStatus(phase)).not.toMatch(/\d+\s*\/\s*\d+/);
-    }
-    expect(speakStatus("generate")).toBe("Generating...");
-    expect(speakStatus("read")).toBe("Reading...");
   });
 });
 

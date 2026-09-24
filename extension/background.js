@@ -6,7 +6,7 @@ importScripts(
 );
 
 const { SERVER_URL, NATIVE_HOST, LOAD_MODEL_TIMEOUT_MS } = OpenTTSConstants;
-const { unwrap, ok, fail, playbackContext, parseApiErrorBody, sendWithRetry, describeFetchError } = OpenTTSProtocol;
+const { ok, fail, playbackContext, parseApiErrorBody, sendWithRetry, describeFetchError } = OpenTTSProtocol;
 const { getAuthHeaders, storeInstallToken } = OpenTTSStorage;
 
 let activeSession = null;
@@ -323,11 +323,6 @@ chrome.runtime.onMessage.addListener((req, sender, sendResponse) => {
     return true;
   }
 
-  if (type === "ENSURE_OFFSCREEN") {
-    ensureOffscreen().then((v) => sendResponse(ok({ ready: v }))).catch(() => sendResponse(fail("Offscreen failed")));
-    return true;
-  }
-
   if (type === "GET_HEALTH") {
     fetchHealth(5000).then((data) => {
       if (data) sendResponse(ok(data));
@@ -356,12 +351,6 @@ chrome.runtime.onMessage.addListener((req, sender, sendResponse) => {
         }
         sendResponse(fail(message, e.code));
       });
-    return true;
-  }
-
-  if (type === "GET_VOICES") {
-    apiFetch("/v1/voices").then((r) => r.json()).then((data) => sendResponse(ok(data)))
-      .catch((e) => sendResponse(fail(e.message, e.code)));
     return true;
   }
 
@@ -407,24 +396,6 @@ chrome.runtime.onMessage.addListener((req, sender, sendResponse) => {
   if (type === "STOP_SERVER") {
     nativeMsg("stop").then((resp) => sendResponse(resp?.success === false ? fail(resp.message || "Stop failed") : ok({ message: resp?.message })))
       .catch((e) => sendResponse(fail(e.message)));
-    return true;
-  }
-
-  if (type === "ENSURE_SERVER") {
-    (async () => {
-      const h = await fetchHealth(2000);
-      if (h?.model_warm || h?.gpu_busy || h?.status === "ok") {
-        sendResponse(ok({ ready: true }));
-        return;
-      }
-      try {
-        const resp = await nativeMsg("start");
-        if (resp?.install_token) await storeInstallToken(resp.install_token);
-        sendResponse(ok({ ready: resp?.success !== false }));
-      } catch (e) {
-        sendResponse(fail(e.message));
-      }
-    })();
     return true;
   }
 

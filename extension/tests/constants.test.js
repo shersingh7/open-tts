@@ -49,3 +49,10 @@ describe("resolveVoice", () => {
     expect(resolveVoice("qwen3-tts", { voice: "ryan" })).toBe("ryan");
   });
 });
+
+describe("dead constants", () => {
+  it("drops unused chunking constants", () => {
+    const c = constantsApi();
+    for (const name of ["CHUNK_TARGET", "FIRST_CHUNK_TARGET", "FALLBACK_WINDOW"]) expect(c).not.toHaveProperty(name);
+  });
+});

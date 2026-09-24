@@ -211,37 +211,6 @@
     return pieces;
   }
 
-  /**
-   * Consume framed audio items and schedule each as soon as it is available.
-   * The first audio item is handed to `schedule` before later items are pulled.
-   * Any error frame terminates the loop; already-scheduled audio is left playing.
-   */
-  async function consumePlaybackStream(frameSource, { schedule, onStatus, isCancelled, onFrame } = {}) {
-    if (typeof schedule !== "function") throw new Error("schedule is required");
-    let decoded = 0;
-    let started = false;
-    for await (const frame of frameSource) {
-      if (isCancelled && isCancelled()) return { decoded, cancelled: true };
-      if (onFrame) onFrame(frame);
-      if (frame && frame.error) {
-        throw Object.assign(new Error(frame.error), {
-          code: frame.code,
-          decoded,
-          afterAudio: decoded > 0,
-        });
-      }
-      if (!frame || !frame.audio || !frame.audio.length) continue;
-      const work = schedule(frame);
-      decoded += 1;
-      if (!started) {
-        started = true;
-        if (onStatus) onStatus({ started: true, decoded });
-      }
-      await work;
-    }
-    return { decoded, cancelled: false };
-  }
-
   function createPlaybackGate() {
     let paused = false;
     const listeners = new Set();
@@ -304,21 +273,10 @@
     };
   }
 
-  function speakStatus(phase) {
-    if (phase === "prepare") return "Preparing...";
-    if (phase === "generate") return "Generating...";
-    if (phase === "buffer") return "Buffering...";
-    if (phase === "retry") return "Retrying...";
-    if (phase === "interrupt") return "Interrupted";
-    return "Reading...";
-  }
-
   root.OpenTTSPlayback = {
     splitText,
-    consumePlaybackStream,
     createPlaybackClock,
     createPlaybackGate,
-    speakStatus,
     norm: normalizeText,
     normalizeText,
     packGenerationUnits,

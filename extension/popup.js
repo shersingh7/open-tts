@@ -35,7 +35,7 @@ const errorText = $("errorText");
 const copyDiagnosticsBtn = $("copyDiagnostics");
 const versionEl = $("version");
 
-const { DEFAULTS, MAX_HISTORY } = OpenTTSConstants;
+const { DEFAULTS } = OpenTTSConstants;
 const { unwrap, makeClientId, makeRunId, interpretHealth } = OpenTTSProtocol;
 const { syncGet, syncSet, localGet, localSet, debouncedSyncSet, debouncedLocalSet } = OpenTTSStorage;
 
@@ -47,7 +47,6 @@ let genCount = 0;
 let cachedModels = null;
 let voicePrefs = {};
 let historyEnabled = true;
-let pendingHistory = null;
 
 function msg(payload) {
   return new Promise((resolve, reject) => {
@@ -108,12 +107,6 @@ function setPlaybackUI(state, label) {
   pauseBtn.disabled = !["playing", "paused", "generating"].includes(state);
   stopBtnPlayback.disabled = state === "idle";
   pauseBtn.textContent = state === "paused" ? "Resume" : "Pause";
-}
-
-function esc(s) {
-  const d = document.createElement("div");
-  d.textContent = s;
-  return d.innerHTML;
 }
 
 function truncate(s, n) {
@@ -188,15 +181,6 @@ function renderHistory(items) {
   historyList.querySelectorAll(".icon-btn.del").forEach((b) => {
     b.addEventListener("click", () => deleteHistory(b.dataset.id));
   });
-}
-
-async function addHistory(entry) {
-  if (!historyEnabled) return;
-  const { ttsHistory = [] } = await localGet(["ttsHistory"]);
-  ttsHistory.push(entry);
-  while (ttsHistory.length > MAX_HISTORY) ttsHistory.shift();
-  await localSet({ ttsHistory });
-  renderHistory(ttsHistory);
 }
 
 async function deleteHistory(id) {
@@ -394,7 +378,6 @@ function updateModelMeta(modelId) {
 }
 
 function updateModelSpecificUI(modelId) {
-  const m = cachedModels?.data?.models?.find((x) => x.id === modelId);
   const isFish = modelId === "fish-s2-pro";
   const isQwen = modelId === "qwen3-tts";
   fishStyleWrap.hidden = !isFish;
@@ -444,7 +427,6 @@ async function handleSpeak() {
   const previous = activeRun;
   const runId = makeRunId();
   activeRun = { clientId, runId, source: "popup" };
-  pendingHistory = null;
   setPlaybackUI("generating", "Generating...");
   const t0 = performance.now();
   const requested = {model:modelSelect.value || DEFAULTS.model, voice:voiceSelect.value,
@@ -464,11 +446,6 @@ async function handleSpeak() {
       voicePrefs, voice: settings.voice,
       fishStyle: settings.fishStyle,
     });
-    // Register before dispatch: a short run can complete before its ACK arrives.
-    pendingHistory = {
-      runId, id: crypto.randomUUID(), text, voice, model: modelId,
-      speed: OpenTTSConstants.resolveSpeed(settings.speed), timestamp: Date.now(),
-    };
     const speakResult = unwrap(await msg({
       type: "SPEAK", text,
       settings: {
@@ -485,7 +462,6 @@ async function handleSpeak() {
     genCountEl.textContent = `GEN: ${String(genCount).padStart(3, "0")}`;
   } catch (e) {
     if (activeRun?.runId !== runId) return;
-    pendingHistory = null;
     activeRun = null;
     setPlaybackUI("idle", "Failed");
     showError(e.message);
@@ -511,7 +487,6 @@ async function handleStopPlayback() {
   playbackRevision++;
   const target = activeRun;
   if (!target?.runId) return;
-  pendingHistory = null;
   activeRun = null;
   setPlaybackUI("idle", "Ready");
   try {
@@ -527,7 +502,7 @@ async function handleCopy() {
     await navigator.clipboard.writeText(previewText.value);
     copyBtn.classList.add("copied");
     setTimeout(() => copyBtn.classList.remove("copied"), 1200);
-  } catch (e) {
+  } catch {
     showError("Clipboard unavailable");
   }
 }
@@ -614,13 +589,11 @@ function wireEvents() {
       if (playbackState !== "paused") setPlaybackUI("playing", "Reading...");
     }
     if (msg.type === "TTS_DONE") {
-      pendingHistory = null;
       if (msg.outcome === "completed") loadHistory().catch(e=>showError(e.message));
       activeRun = null;
       setPlaybackUI("idle", "Ready");
     }
     if (msg.type === "TTS_ERROR") {
-      pendingHistory = null;
       activeRun = null;
       showError(msg.message || "Playback error");
       setPlaybackUI("idle", "Error");
