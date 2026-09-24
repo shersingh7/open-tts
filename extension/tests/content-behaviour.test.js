@@ -230,6 +230,14 @@ describe("content script behaviour", () => {
     expect(response).toEqual({ text: "Selected text" });
   });
 
+  it("stays silent on CONTENT_GET_SELECTION when this frame has no selection", async () => {
+    // The SW broadcasts to every frame with no frameId and uses whichever answers first; an empty frame
+    // must not race an answer ahead of the frame that actually holds the selection.
+    const h = contentHarness();
+    const { responded } = h.sendOneShot({ type: "CONTENT_GET_SELECTION" });
+    expect(responded).toBe(false);
+  });
+
   it("answers CONTENT_GET_HOST only in the top frame", async () => {
     const top = contentHarness({ topFrame: true });
     const topReply = top.sendOneShot({ type: "CONTENT_GET_HOST" });

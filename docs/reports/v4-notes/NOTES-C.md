@@ -2,9 +2,17 @@
 
 Branch `v4-c`, base includes P0 (`extension/shared/*.js` ESM + `tests/helpers/fake-chrome.js`) and BE.
 `npm test` (lint → typecheck → vitest → pytest) exits 0 at every commit.
-Final counts: **vitest 23 files / 247 tests** (was 21/220 after P0), **pytest 134 passed** (unchanged, BE's
+Final counts: **vitest 23 files / 248 tests** (was 21/220 after P0), **pytest 134 passed** (unchanged, BE's
 scope). New tests added by this stream: 9 (`ui-port`) + 16 (`ui-popup`) + 1 (`content-messages`) +
-10 (`content-behaviour`) = **36**.
+11 (`content-behaviour`) = **37**.
+
+`HERMES-TO-C.md` (left in this worktree by the orchestrator, from stream A) applied one fix after the initial
+three task commits: `CONTENT_GET_SELECTION` must not `sendResponse` when this frame's selection is empty,
+since the SW's `chrome.tabs.sendMessage(tabId, {type})` has no `frameId` and takes whichever frame answers
+first — an empty iframe answering ahead of the frame that actually holds the selection would hide it. Fixed in
+a follow-up commit with a regression test; everything else in that note (`CONTENT_GET_HOST` top-frame-only,
+port name/URL checks, `controllable` at idle, ended-session fields, SPEAK REPLY shape, progress/metrics shape)
+was already consistent with what I'd built.
 
 ## Commits
 

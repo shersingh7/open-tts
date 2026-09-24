@@ -435,6 +435,10 @@
   chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     if (message && message.type === MSG.CONTENT_GET_SELECTION) {
       const text = savedSelectionText || (window.getSelection() ? window.getSelection().toString().trim() : "");
+      // The SW broadcasts this to every frame in the tab with no frameId and takes whichever frame answers
+      // first. An empty-selection frame must stay silent, or it can win the race against the frame that
+      // actually holds the selection.
+      if (!text) return false;
       sendResponse({ text });
       return false;
     }
