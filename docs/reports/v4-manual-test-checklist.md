@@ -1,7 +1,7 @@
 # Open TTS 4.0.0 — manual real-browser test checklist
 
 Branch `extension-v4`. Automated gates already green: `npm test` = lint (0 warnings) + typecheck + 384 JS tests +
-135 backend tests. Everything below is real-Chrome behaviour that unit tests can't prove.
+134 backend tests. Everything below is real-Chrome behaviour that unit tests can't prove.
 
 ## Setup
 1. Pick a quiet moment (no audio job running). `cd ~/github/open-tts && git switch extension-v4`
