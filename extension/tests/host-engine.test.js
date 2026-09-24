@@ -227,7 +227,9 @@ describe("engine pipeline (ported from v3 offscreen.test.js)", () => {
 
 describe("shared run queue (ported from v3 offscreen.test.js)", () => {
   it("run queue enforces exact byte and duration budgets and abort releases waits", async () => {
-    const run = createPlaybackRun({ highWaterSeconds: 2, lowWaterSeconds: 1, maxDecodedBytes: 192000, startupLead: 0.25 });
+    const run = createPlaybackRun({
+      highWaterSeconds: 2, lowWaterSeconds: 1, maxDecodedBytes: 192000, startupLead: 0.25,
+    });
     const Context = makeContextClass();
     const ctx = new Context();
     run.setContext(ctx);
