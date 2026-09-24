@@ -119,6 +119,15 @@ export function wavInfo(bytes, advertisedRate) {
   return { duration };
 }
 
+/**
+ * Split and normalize text into the transport partitions the engine requests (PROGRESS `index` refers to these).
+ * @param {unknown} text
+ * @returns {string[]}
+ */
+export function partitionText(text) {
+  return splitText(text, TRANSPORT_PARTITION_CHARS, TRANSPORT_PARTITION_CHARS).map(normalizeText);
+}
+
 /** @returns {any} */
 function defaultAudioContext() {
   return new AudioContext();
@@ -464,7 +473,7 @@ export function createEngine({
     const protocolVersion = cmd.protocolVersion || 1;
     try {
       sendStatus(run, LABELS.preparing);
-      const texts = splitText(cmd.text, TRANSPORT_PARTITION_CHARS, TRANSPORT_PARTITION_CHARS).map(normalizeText);
+      const texts = partitionText(cmd.text);
       if (!texts.length) throw new Error("Nothing to read");
       if (texts.join("").length > READING_LIMIT_CHARS || texts.length > READING_LIMIT_PARTITIONS) {
         throw new Error("Text exceeds the 200,000-character reading limit");
