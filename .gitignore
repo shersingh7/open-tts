@@ -73,3 +73,5 @@ graphify-out/
 run-graphify.py
 artifacts/
 .artifacts/
+backend/venv
+backend/models
