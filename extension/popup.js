@@ -109,12 +109,6 @@ function setPlaybackUI(state, label) {
   pauseBtn.textContent = state === "paused" ? "Resume" : "Pause";
 }
 
-function esc(s) {
-  const d = document.createElement("div");
-  d.textContent = s;
-  return d.innerHTML;
-}
-
 function truncate(s, n) {
   return s.length > n ? `${s.slice(0, n - 1)}…` : s;
 }
@@ -384,7 +378,6 @@ function updateModelMeta(modelId) {
 }
 
 function updateModelSpecificUI(modelId) {
-  const m = cachedModels?.data?.models?.find((x) => x.id === modelId);
   const isFish = modelId === "fish-s2-pro";
   const isQwen = modelId === "qwen3-tts";
   fishStyleWrap.hidden = !isFish;
@@ -509,7 +502,7 @@ async function handleCopy() {
     await navigator.clipboard.writeText(previewText.value);
     copyBtn.classList.add("copied");
     setTimeout(() => copyBtn.classList.remove("copied"), 1200);
-  } catch (e) {
+  } catch {
     showError("Clipboard unavailable");
   }
 }

@@ -1,7 +1,7 @@
 import vm from 'node:vm';
 import { readFileSync } from 'node:fs';
 import { it, expect } from 'vitest';
-import { deferred, flush } from './pipeline-harness.js';
+import { flush } from './pipeline-harness.js';
 
 function contentHarness() {
   let listener, settingsCallback;

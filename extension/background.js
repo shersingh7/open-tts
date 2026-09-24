@@ -6,7 +6,7 @@ importScripts(
 );
 
 const { SERVER_URL, NATIVE_HOST, LOAD_MODEL_TIMEOUT_MS } = OpenTTSConstants;
-const { unwrap, ok, fail, playbackContext, parseApiErrorBody, sendWithRetry, describeFetchError } = OpenTTSProtocol;
+const { ok, fail, playbackContext, parseApiErrorBody, sendWithRetry, describeFetchError } = OpenTTSProtocol;
 const { getAuthHeaders, storeInstallToken } = OpenTTSStorage;
 
 let activeSession = null;

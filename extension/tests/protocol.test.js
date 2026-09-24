@@ -6,13 +6,6 @@ import { describe, expect, it, beforeAll } from "vitest";
 const root = dirname(fileURLToPath(import.meta.url));
 const sharedDir = join(root, "..", "shared");
 
-function loadUmd(file) {
-  const code = readFileSync(join(sharedDir, file), "utf8");
-  const fn = new Function("globalThis", `${code}; return globalThis.OpenTTSProtocol || globalThis.OpenTTSStorage || globalThis.OpenTTSConstants;`);
-  const g = {};
-  return fn(g);
-}
-
 describe("protocol envelope", () => {
   let protocol;
   beforeAll(() => {
