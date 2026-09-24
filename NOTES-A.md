@@ -3,7 +3,7 @@
 Branch `v4-a`, based on `fae24bb`. `npm test` (lint → typecheck → vitest → pytest) exits 0 at every commit.
 The v3 files are untouched. `eslint --max-warnings=0` is clean on `extension/sw` and `extension/tests/sw-*`.
 
-**Test counts:** vitest went from 19 files / 211 tests to **29 files / 354 tests**. The 143 new tests are in 10 `sw-*`
+**Test counts:** vitest went from 19 files / 211 tests to **29 files / 356 tests**. The 145 new tests are in 10 `sw-*`
 files. pytest: **134 passed**.
 
 ## Commits
@@ -19,7 +19,8 @@ files. pytest: **134 passed**.
 | `bf778a4` | v4(A): context menu + keyboard commands with badge hint |
 | `ba0d554` | v4(A): service-worker composition root |
 | `7b61c75` | v4(A): manifest points at v4 SW/popup/content, adds menus + commands |
-| (this)    | v4(A): NOTES-A |
+| `5feef4c` | v4(A): NOTES-A |
+| (this)    | v4(A): apply stream B host notes (queued terminal after HELLO, bufferedSeconds) |
 
 ## What was built (`extension/sw/`)
 
@@ -47,8 +48,10 @@ files. pytest: **134 passed**.
   `HOST_REJECT{reason:"Reader already open in another tab"}`, and everything it sends afterwards is ignored.
 - **Rule 5:** when the owning host disconnects, a 2 s grace starts. A `HOST_HELLO` from the same kind with
   `activeRun.runId === runId` adopts the run again (state is taken from `activeRun.paused/state`). A HELLO with
-  `activeRun:null` means `owner_lost` immediately. Otherwise `owner_lost` fires once when the timer runs out, with
-  message "Playback page closed or was discarded. Start a new reading." and code `owner_lost`.
+  `activeRun:null` does **not** end the run straight away (stream B's A1): the host may flush a queued `DONE`/`ERROR`
+  for that run right after the HELLO, and that terminal is applied normally (history included). If no terminal
+  arrives, `owner_lost` fires once when the grace runs out, with message "Playback page closed or was discarded.
+  Start a new reading." and code `owner_lost`.
 - **Rule 6:** `STATUS`, `PROGRESS`, `DONE` and `ERROR` are applied only if they come from the accepted port of the run's
   host kind and match the current active runId. `store.end()` de-duplicates terminals.
 - **SW restart:** the new router loads the store. If a run is active, a **5 s** restart grace starts. A HELLO with the
@@ -104,6 +107,17 @@ files. pytest: **134 passed**.
 7. **Two things are not implemented:** the optional close of the offscreen document after 60 s idle, and any router
    action on `tabs.onRemoved`. That listener only clears badge-hint timers. A run keeps playing when its source tab
    closes (v3 behaviour), and a Reader closing is handled by its port disconnect.
+
+## Stream B's host notes (`HERMES-TO-A.md`, untracked in this worktree)
+
+| Item | How it was handled |
+|---|---|
+| A1: queued `DONE`/`ERROR` after `HOST_HELLO{activeRun:null}` | Applied (see rule 5). Tests: queued DONE → completed + history, no `owner_lost`; queued ERROR → failed with the host message; no terminal → `owner_lost` once, when the grace ends. |
+| URLs `host/offscreen.html`, `host/reader.html` | Already matched. |
+| Copy `PROGRESS` fields into `session.progress` | Applied: `played`, `scheduled`, `index`, `end`, `unitId`, and now `bufferedSeconds` (numbers only). `STATUS.label` becomes `session.label`; `STATUS`/`DONE`/`ERROR` `metrics` become `session.metrics`. |
+| `HOST_STOP` for an unknown run produces no DONE | Already covered: the SW ends the run itself on STOP and supersede. |
+| Generating phase reported as `buffering` | Nothing to change; any of `preparing|buffering|playing|paused` is accepted. |
+| `ERROR.retryText` | **Not** copied into `session.error`. It can be up to 200k chars and would travel in every `SESSION` fan-out and in `storage.session`. The Reader keeps its own copy, as B says. |
 
 ## For Hermes to apply elsewhere
 

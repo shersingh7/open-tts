@@ -22,7 +22,8 @@ export const TEXT_PREVIEW_CHARS = 200;
  * @property {number|null} sourceTabId
  * @property {number|null} sourceFrameId
  * @property {"offscreen"|"reader"|null} hostKind
- * @property {{played: number, scheduled: number, index?: number, end?: number, unitId?: number}|null} progress
+ * @property {{played: number, scheduled: number, index?: number, end?: number, unitId?: number,
+ *   bufferedSeconds?: number}|null} progress
  * @property {Outcome} [outcome]
  * @property {{message: string, code?: string}} [error]
  * @property {object} [metrics]

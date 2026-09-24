@@ -440,7 +440,11 @@ export function createRouter(deps) {
       safePost(port, { type: MSG.HOST_STOP, runId: hostRun.runId, outcome });
       return;
     }
-    if (ours && session.runId && !launching.has(session.runId)) ownerLost(session.runId);
+    // The host no longer has our run. It may still flush a queued DONE/ERROR for it right after this HELLO
+    // (terminal produced while disconnected), so wait out the grace instead of declaring loss immediately.
+    if (ours && session.runId && !launching.has(session.runId) && ownerGrace?.runId !== session.runId) {
+      startOwnerGrace(session.runId, ownerGraceMs);
+    }
   }
 
   /**
@@ -481,7 +485,7 @@ export function createRouter(deps) {
           played: isNumber(message.played) ? message.played : 0,
           scheduled: isNumber(message.scheduled) ? message.scheduled : 0,
         };
-        for (const key of /** @type {const} */ (["index", "end", "unitId"])) {
+        for (const key of /** @type {const} */ (["index", "end", "unitId", "bufferedSeconds"])) {
           if (isNumber(message[key])) progress[key] = message[key];
         }
         store.update(message.runId, { progress });

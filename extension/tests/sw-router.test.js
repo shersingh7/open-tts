@@ -291,11 +291,12 @@ describe("sw/router — host events", () => {
     const page = env.content();
     await settle();
     host.postMessage({ type: MSG.STATUS, runId: "r1", state: "playing", label: "Reading...", metrics: { a: 1 } });
-    host.postMessage({ type: MSG.PROGRESS, runId: "r1", played: 2, scheduled: 5, index: 1, end: 3, junk: "x" });
+    host.postMessage({ type: MSG.PROGRESS, runId: "r1", played: 2, scheduled: 5, index: 1, end: 3, junk: "x",
+      bufferedSeconds: 4.5 });
     await settle();
     for (const port of [ui, page]) {
       expect(lastSession(port).session).toMatchObject({ state: "playing", label: "Reading...", metrics: { a: 1 },
-        progress: { played: 2, scheduled: 5, index: 1, end: 3 } });
+        progress: { played: 2, scheduled: 5, index: 1, end: 3, bufferedSeconds: 4.5 } });
     }
     expect(lastSession(page).controllable).toBe(false);
     expect(lastSession(ui).controllable).toBe(true);
@@ -523,14 +524,45 @@ describe("sw/router — owner loss (rule 5)", () => {
     expect(ofType(back, MSG.HOST_RESUME)).toEqual([{ type: MSG.HOST_RESUME, runId: "r1" }]);
   });
 
-  it("a host that reconnects without the run → owner_lost immediately", async () => {
+  it("a host that reconnects without the run and sends no terminal → owner_lost when the grace ends", async () => {
     const env = setup();
     const ui = await startRun(env);
     env.hostPorts.offscreen[0].disconnect();
     await settle();
+    await vi.advanceTimersByTimeAsync(500);
     connectHost(env.chrome, "offscreen", { activeRun: null });
     await settle();
-    expect(lastSession(ui).session.outcome).toBe("owner_lost");
+    expect(env.store.current().state).toBe("preparing");
+    await vi.advanceTimersByTimeAsync(1600);
+    await settle();
+    expect(ofType(ui, MSG.SESSION).filter((m) => m.session.outcome === "owner_lost")).toHaveLength(1);
+  });
+
+  it("a queued DONE flushed right after HOST_HELLO{activeRun:null} completes the run (no owner_lost)", async () => {
+    const env = setup();
+    const ui = await startRun(env);
+    env.hostPorts.offscreen[0].disconnect();
+    await settle();
+    const back = connectHost(env.chrome, "offscreen", { activeRun: null });
+    back.postMessage({ type: MSG.DONE, runId: "r1", outcome: "completed", metrics: { total: 2 } });
+    await settle();
+    await vi.advanceTimersByTimeAsync(5000);
+    await settle();
+    expect(lastSession(ui).session).toMatchObject({ outcome: "completed", metrics: { total: 2 } });
+    expect(ofType(ui, MSG.SESSION).some((m) => m.session.outcome === "owner_lost")).toBe(false);
+    expect(env.history.persistCompletion).toHaveBeenCalledTimes(1);
+  });
+
+  it("a queued ERROR flushed after HOST_HELLO{activeRun:null} fails the run with the host's message", async () => {
+    const env = setup();
+    const ui = await startRun(env);
+    env.hostPorts.offscreen[0].disconnect();
+    await settle();
+    const back = connectHost(env.chrome, "offscreen", { activeRun: null });
+    back.postMessage({ type: MSG.ERROR, runId: "r1", outcome: "failed", message: "Stream cut", code: "stream" });
+    await settle();
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(lastSession(ui).session).toMatchObject({ outcome: "failed", error: { message: "Stream cut", code: "stream" } });
   });
 
   it("closing the Reader tab loses the Reader run", async () => {
@@ -628,9 +660,11 @@ describe("sw/router — service-worker restart", () => {
     expect(lastSession(ui).session.revision).toBeGreaterThan(12);
   });
 
-  it("the host comes back without the run → owner_lost", async () => {
+  it("the host comes back without the run → owner_lost (unless it flushes a terminal)", async () => {
     const env = setup({ session: persisted("preparing") });
     connectHost(env.chrome, "offscreen", { activeRun: null });
+    await settle();
+    await vi.advanceTimersByTimeAsync(5100);
     await settle();
     expect(env.store.current().outcome).toBe("owner_lost");
   });
