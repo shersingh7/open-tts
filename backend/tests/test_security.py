@@ -2,8 +2,13 @@ from __future__ import annotations
 
 import ast
 import inspect
+import io
+import json
+import struct
 from pathlib import Path
+from types import SimpleNamespace
 
+import native_host
 import pytest
 from fastapi.testclient import TestClient
 
@@ -92,3 +97,50 @@ def test_testserver_host_is_rejected_unless_explicitly_allowed(production_app):
         assert TestClient(app).get("/health").status_code == 200
     finally:
         assert app.state.runtime.shutdown(timeout=5)
+
+
+# --- Native host `status` → install_token (consumed by extension sw/auth.js) --
+
+STATUS_FIELDS = {"success", "message", "running", "port_active", "pid", "install_token", "engine"}
+
+
+def _native_status_response(monkeypatch, *, running: bool) -> dict:
+    body = json.dumps({"command": "status"}).encode()
+    stdin = io.BytesIO(struct.pack("@I", len(body)) + body)
+    stdout = io.BytesIO()
+    monkeypatch.setattr(native_host.sys, "stdin", SimpleNamespace(buffer=stdin))
+    monkeypatch.setattr(native_host.sys, "stdout", SimpleNamespace(buffer=stdout))
+    monkeypatch.setattr(native_host, "is_server_running", lambda: running)
+    monkeypatch.setattr(native_host, "get_server_pid", lambda: 4242 if running else None)
+    monkeypatch.setattr(native_host, "is_port_in_use", lambda port=8000: running)
+    monkeypatch.setattr(native_host, "_fetch_health", lambda: {"engine": "open-tts"})
+    native_host.main()
+    raw = stdout.getvalue()
+    (length,) = struct.unpack("@I", raw[:4])
+    assert len(raw) == 4 + length
+    return json.loads(raw[4:])
+
+
+def test_native_status_returns_install_token_when_server_running(monkeypatch):
+    # conftest points native_host.TOKEN_FILE at a tmp path; this is a dummy value, never the real token.
+    native_host.TOKEN_FILE.write_text("  dummy-install-token  \n", encoding="utf-8")
+    response = _native_status_response(monkeypatch, running=True)
+    assert set(response) == STATUS_FIELDS
+    assert response["success"] is True
+    assert response["running"] is True
+    assert response["install_token"] == "dummy-install-token"
+
+
+def test_native_status_withholds_install_token_when_server_not_running(monkeypatch):
+    native_host.TOKEN_FILE.write_text("dummy-install-token", encoding="utf-8")
+    response = _native_status_response(monkeypatch, running=False)
+    assert set(response) == STATUS_FIELDS
+    assert response["success"] is True
+    assert response["running"] is False
+    assert response["install_token"] is None
+
+
+def test_native_status_install_token_is_null_when_token_file_missing(monkeypatch):
+    assert not native_host.TOKEN_FILE.exists()
+    response = _native_status_response(monkeypatch, running=True)
+    assert response["install_token"] is None
