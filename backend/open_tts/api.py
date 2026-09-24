@@ -7,10 +7,11 @@ import queue
 import threading
 import time
 from contextlib import asynccontextmanager
-from typing import AsyncGenerator, List, Optional
+from typing import AsyncGenerator, List, Optional, Sequence
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response, StreamingResponse
+from starlette.middleware.trustedhost import TrustedHostMiddleware
 from pydantic import BaseModel, Field
 
 from .adapters import model_capabilities
@@ -59,7 +60,11 @@ async def lifespan(app: FastAPI):
         await asyncio.to_thread(app.state.runtime.shutdown)
 
 
-def create_app() -> FastAPI:
+LOOPBACK_HOSTS = ("127.0.0.1", "localhost")
+
+
+def create_app(*, allowed_hosts_extra: Sequence[str] = ()) -> FastAPI:
+    """Build the app. ``allowed_hosts_extra`` exists for tests (TestClient's "testserver"); production passes none."""
     app = FastAPI(title="Open TTS Server", version=VERSION, lifespan=lifespan)
     app.state.runtime = ModelRuntime(cleanup=coordinator.shutdown)
     origins = build_cors_origins()
@@ -87,6 +92,10 @@ def create_app() -> FastAPI:
             print(f"[HTTP] {request.method} {request.url.path} {resp.status_code} {time.perf_counter() - start:.3f}s")
             return resp
         return await call_next(request)
+
+    # DNS-rebinding defence: a page on attacker.example rebound to 127.0.0.1 still sends
+    # Host: attacker.example. Added last so it is outermost and rejects before auth/body work.
+    app.add_middleware(TrustedHostMiddleware, allowed_hosts=[*LOOPBACK_HOSTS, *allowed_hosts_extra])
 
     register_routes(app)
     return app

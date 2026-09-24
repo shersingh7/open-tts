@@ -20,7 +20,7 @@ cd backend && ./setup.sh
 # Optional models: ./setup.sh --with-qwen | --with-fish | --all-models
 
 # Unit tests (preferred gate for ordinary code changes)
-npm test                    # JS (vitest) + backend (pytest)
+npm test                    # lint + typecheck + JS (vitest) + backend (pytest)
 npm run test:js             # vitest run
 npm run test:backend        # backend/venv pytest -q
 npm run test:extension      # extension/tests only
@@ -69,7 +69,7 @@ Prefer unit tests (`npm test`) over live synthesis. Treat `backend/venv/` and la
 
 | Path | Role |
 |------|------|
-| `extension/` | MV3 extension UI + messaging |
+| `extension/` | MV3 extension: `sw/` (state owner/router), `host/` (playback), `ui/`, `content/`, `shared/`; message contract in `docs/plans/v4-contract.md` |
 | `backend/open_tts/` | Core library (adapters, API, protocol, security) |
 | `backend/server.py` | Server entry |
 | `backend/tests/`, `extension/tests/` | Unit coverage |
@@ -87,4 +87,4 @@ Do not edit `backend/server.log`, `stdout.log`, `stderr.log`, or packaged `dist/
 
 ## Preferred implementation path
 
-Grok Build may implement substantive coding. Hermes independently reviews and verifies with the commands above.
+David's instruction (2026-09-23): Hermes implements this project directly (no agy / Grok Build delegation). Hermes reviews and verifies with the commands above.

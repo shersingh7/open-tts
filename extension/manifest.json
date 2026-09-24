@@ -1,23 +1,28 @@
 {
   "manifest_version": 3,
   "name": "Open TTS",
-  "version": "3.5.0",
+  "version": "4.0.0",
   "minimum_chrome_version": "116",
   "description": "Local multi-model text-to-speech using MLX on Apple Silicon. Kokoro, Qwen3-TTS, and Fish Audio S2 Pro.",
-  "permissions": ["storage", "nativeMessaging", "offscreen"],
+  "permissions": ["storage", "nativeMessaging", "offscreen", "contextMenus"],
   "host_permissions": ["http://127.0.0.1:8000/*"],
   "content_security_policy": {
     "extension_pages": "script-src 'self'; object-src 'self'; style-src 'self'; connect-src 'self' http://127.0.0.1:8000;"
   },
-  "background": { "service_worker": "background.js" },
+  "background": { "service_worker": "sw/main.js", "type": "module" },
   "action": {
-    "default_popup": "popup.html",
+    "default_popup": "ui/popup.html",
     "default_icon": { "16": "icon16.png", "32": "icon32.png", "48": "icon48.png", "128": "icon128.png" }
   },
   "icons": { "16": "icon16.png", "32": "icon32.png", "48": "icon48.png", "128": "icon128.png" },
   "content_scripts": [{
     "matches": ["<all_urls>"],
-    "js": ["shared/constants-umd.js", "shared/storage-umd.js", "content.js"],
-    "css": ["content.css"]
-  }]
+    "js": ["content/content.js"],
+    "all_frames": true,
+    "run_at": "document_idle"
+  }],
+  "commands": {
+    "read-selection": { "suggested_key": { "default": "Alt+Shift+R" }, "description": "Read selected text" },
+    "toggle-pause": { "suggested_key": { "default": "Alt+Shift+P" }, "description": "Pause or resume reading" }
+  }
 }

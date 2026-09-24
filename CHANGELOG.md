@@ -1,5 +1,31 @@
 # Changelog
 
+## 4.0.0 — 2026-09-24 (source/package candidate)
+
+### Architecture
+- The service worker is now the single owner of playback state. Popup, on-page widget, Reader and playback hosts talk to it over long-lived named ports instead of broadcast messages; UIs render idempotent `SESSION` snapshots. The v3 snapshot/revision/dedupe guard code is gone.
+- Standard ES modules throughout (`sw/`, `host/`, `ui/`, `shared/`), type-checked with `tsc --checkJs` per file and linted with ESLint; UMD duplicates removed.
+
+### Fixed
+- A restored or duplicated Reader tab can no longer synthesize the same reading a second time (only one Reader host is accepted).
+- The API token moved from `chrome.storage.local` (readable by content scripts) to extension-page-only `chrome.storage.session`; the old copy is deleted on upgrade.
+- Opening the popup no longer loads the saved model (Fish is 6.3 GB); models load on first Speak or an explicit model change.
+- Server start and model load progress survive closing and reopening the popup.
+- Speed/settings changes are saved even if the popup closes immediately.
+- The Reader tab is protected from Memory Saver discards while reading.
+- Short Qwen3/Fish previews play offscreen instead of opening a Reader tab; they fail clearly if no audio arrives within 25 s.
+- The on-page widget lives in a closed shadow root (page CSS/scripts can't interfere), no longer watches the whole page, stays available as a collapsed control during a reading, offers "Read selection" for a new selection, and shows "Open TTS was updated — reload this page" instead of raw extension-context errors.
+- Backend rejects foreign `Host` headers (DNS-rebinding defence); native host resolves `OPEN_TTS_RUNTIME_DIR` like the server so the token path always matches.
+- Packaged zip now has `manifest.json` at its root.
+
+### Added
+- Right-click "Read with Open TTS" (works in Chrome's PDF viewer), keyboard shortcuts Alt+Shift+R (read selection) and Alt+Shift+P (pause/resume), per-site widget hiding, Reader progress bar and passage counter, "First audio" timing in the popup.
+
+### Changed
+- Reading history is **off by default**; when enabled it keeps only the first 2,000 characters of each of the last 20 readings (256 KB cap).
+- Tool scratch (`.hermes/plans`, `graphify-out`, `run-graphify.py`, `artifacts/`) is no longer tracked.
+- Real-browser behaviour, real-model listening and sleep/wake are separate release gates (manual testing).
+
 ## 3.5.0 — 2026-09-21 (source/package candidate)
 
 - Model-aware short opening/later generation units; two-second default packets, capped at four seconds.
