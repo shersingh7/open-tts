@@ -3,160 +3,246 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="color-scheme" content="light dark" />
   <title>Open TTS</title>
   <link rel="stylesheet" href="popup.css" />
 </head>
 <body>
-  <div class="chassis" id="app" data-state="loading">
-    <div class="chassis-texture" aria-hidden="true"></div>
+  <div class="app" id="app" data-server="unknown" data-playback="idle">
 
-    <header class="rack-header">
-      <div class="brand-block">
-        <span class="brand-mark" aria-hidden="true">TTS</span>
-        <div class="brand-lines">
-          <span class="brand-name">OPEN TTS</span>
-          <span class="brand-sub">LOCAL · MLX</span>
-        </div>
+    <!-- Header: brand + engine status -->
+    <header class="top">
+      <div class="brand">
+        <img class="brand-icon" src="../icon48.png" alt="" width="22" height="22" />
+        <span class="brand-name">Open TTS</span>
       </div>
-      <div class="led-status" role="status" aria-live="polite">
-        <span class="led-cluster" aria-hidden="true">
-          <span class="dot offline" id="statusDot" aria-label="Server offline"></span>
-        </span>
-        <span class="led-label" id="statusText">Checking server...</span>
-      </div>
+      <button class="engine-pill" id="enginePill" type="button" title="Engine status — open engine controls">
+        <span class="engine-dot" id="statusDot" aria-hidden="true"></span>
+        <span class="engine-text" id="statusText" role="status" aria-live="polite">Checking…</span>
+      </button>
     </header>
 
-    <div class="error-banner" id="errorBanner" hidden role="alert">
-      <span id="errorText"></span>
-      <button type="button" class="icon-btn" id="copyDiagnostics" aria-label="Copy diagnostics">Copy</button>
+    <!-- Error / help banner -->
+    <div class="banner" id="errorBanner" role="alert" hidden>
+      <svg class="banner-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 9v4m0 4h.01M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0Z"/></svg>
+      <div class="banner-body">
+        <p class="banner-text" id="errorText"></p>
+        <div class="banner-help" id="errorHelp" hidden>
+          <p>Let the extension start the local engine — run this once in Terminal from the Open TTS folder:</p>
+          <code class="banner-code" id="installCmd"></code>
+        </div>
+        <div class="banner-actions">
+          <button class="link-btn" id="copyInstall" type="button" hidden>Copy command</button>
+          <button class="link-btn" id="copyDiagnostics" type="button">Copy details</button>
+        </div>
+      </div>
+      <button class="icon-btn banner-close" id="dismissError" type="button" aria-label="Dismiss message">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M18 6 6 18M6 6l12 12"/></svg>
+      </button>
     </div>
 
-    <main class="rack-main">
-      <section class="module" aria-label="Server connection">
-        <div class="module-label-row">
-          <h2 class="module-label">ENGINE</h2>
-          <span class="module-label-aux" aria-hidden="true">HOST</span>
+    <!-- Tabs -->
+    <nav class="tabs" role="tablist" aria-label="Sections">
+      <button class="tab" id="tab-listen" role="tab" type="button" aria-selected="true" aria-controls="view-listen" data-view="listen">Listen</button>
+      <button class="tab" id="tab-voice" role="tab" type="button" aria-selected="false" aria-controls="view-voice" data-view="voice" tabindex="-1">Voice</button>
+      <button class="tab" id="tab-history" role="tab" type="button" aria-selected="false" aria-controls="view-history" data-view="history" tabindex="-1">History<span class="tab-badge" id="historyCount" hidden>0</span></button>
+      <button class="tab tab-icon" id="tab-settings" role="tab" type="button" aria-selected="false" aria-controls="view-settings" data-view="settings" tabindex="-1" aria-label="Settings" title="Settings">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1Z"/></svg>
+      </button>
+    </nav>
+
+    <main class="views">
+
+      <!-- ═════════ LISTEN ═════════ -->
+      <section class="view" id="view-listen" role="tabpanel" aria-labelledby="tab-listen">
+
+        <div class="player" id="player">
+          <div class="player-row">
+            <button class="play-btn" id="speakBtn" type="button" aria-label="Read aloud">
+              <svg class="i-play" viewBox="0 0 24 24" aria-hidden="true"><path d="M8 5.1v13.8a1 1 0 0 0 1.5.86l11-6.9a1 1 0 0 0 0-1.72l-11-6.9A1 1 0 0 0 8 5.1Z"/></svg>
+              <svg class="i-pause" viewBox="0 0 24 24" aria-hidden="true"><rect x="6.5" y="5" width="4" height="14" rx="1.2"/><rect x="13.5" y="5" width="4" height="14" rx="1.2"/></svg>
+              <span class="spinner" aria-hidden="true"></span>
+            </button>
+            <div class="player-info">
+              <div class="player-state">
+                <span class="eq" aria-hidden="true"><i></i><i></i><i></i><i></i></span>
+                <span class="progress-label" id="progress" aria-live="polite">Ready</span>
+                <span class="metric" id="firstAudioMetric"></span>
+              </div>
+              <p class="player-now" id="nowPlaying">Type or paste text below, then press play.</p>
+            </div>
+            <button class="icon-btn stop-btn" id="stopPlaybackBtn" type="button" aria-label="Stop reading" title="Stop" disabled>
+              <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="6.5" y="6.5" width="11" height="11" rx="2"/></svg>
+            </button>
+          </div>
+          <div class="player-bar" id="playerBar" aria-hidden="true"><span id="playerBarFill"></span></div>
         </div>
-        <div class="status-actions">
-          <button class="server-btn" id="startBtn" type="button">Start</button>
-          <button class="server-btn danger" id="stopBtn" type="button" disabled>Stop</button>
+
+        <div class="composer">
+          <textarea id="previewText" rows="6" spellcheck="true"
+            placeholder="Type or paste anything to hear it…" aria-label="Text to read"></textarea>
+          <div class="composer-bar">
+            <div class="composer-tools">
+              <button class="chip-btn" id="grabSelection" type="button" title="Use the text selected on the current page">
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7V5a1 1 0 0 1 1-1h2m10 0h2a1 1 0 0 1 1 1v2m0 10v2a1 1 0 0 1-1 1h-2M7 20H5a1 1 0 0 1-1-1v-2M8 9h8m-8 3h8m-8 3h5"/></svg>
+                <span id="grabLabel">Use selection</span>
+              </button>
+              <button class="icon-btn small" id="copyBtn" type="button" title="Copy text" aria-label="Copy text">
+                <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15H4a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1h10a1 1 0 0 1 1 1v1"/></svg>
+              </button>
+              <button class="icon-btn small" id="clearText" type="button" title="Clear text" aria-label="Clear text">
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 6h18M8 6V4h8v2m-9 0 1 14h8l1-14"/></svg>
+              </button>
+            </div>
+            <span class="char-count" id="charCount">0 chars</span>
+          </div>
         </div>
-        <p class="hint">Install native host if Start fails. Run <code>backend/install_native_host.sh --extension-id YOUR_ID</code></p>
-        <label class="hide-site-row" id="hideSiteRow" hidden>
-          <input id="hideSiteToggle" type="checkbox" />
-          Hide widget on <span id="hideSiteHost"></span>
-        </label>
+
+        <button class="voice-summary" id="voiceSummary" type="button" title="Change voice, model and speed">
+          <span class="avatar" id="voiceAvatar" aria-hidden="true">B</span>
+          <span class="voice-summary-text">
+            <span class="voice-summary-name" id="voiceSummaryName">Bella</span>
+            <span class="voice-summary-meta" id="voiceSummaryMeta">Kokoro · 1.5×</span>
+          </span>
+          <span class="voice-summary-cta">Change<svg viewBox="0 0 24 24" aria-hidden="true"><path d="m9 6 6 6-6 6"/></svg></span>
+        </button>
+
+        <p class="hint"><kbd id="modKey">⌘</kbd><kbd>↵</kbd> to read · on any site, select text and tap ▶</p>
       </section>
 
-      <section class="module" aria-label="Configuration">
-        <div class="module-label-row">
-          <h2 class="module-label">CONFIGURATION</h2>
-          <span class="module-label-aux" aria-hidden="true">VOICE</span>
+      <!-- ═════════ VOICE ═════════ -->
+      <section class="view" id="view-voice" role="tabpanel" aria-labelledby="tab-voice" hidden>
+
+        <div class="group">
+          <div class="group-head">
+            <h2 class="group-title" id="modelLabel">Model</h2>
+            <span class="group-aux" id="modelMeta">Local MLX model</span>
+          </div>
+          <div class="model-cards" id="modelCards" role="radiogroup" aria-labelledby="modelLabel">
+            <p class="empty-note">Models appear once the engine is running.</p>
+          </div>
         </div>
 
-        <div class="field">
-          <label class="field-label" for="model">Model</label>
-          <select id="model" class="select" disabled>
-            <option disabled selected>Loading...</option>
-          </select>
-          <div class="model-meta" id="modelMeta">—</div>
+        <div class="group" id="voiceGroup">
+          <div class="group-head">
+            <label class="group-title" for="voice">Voice</label>
+            <button class="link-btn" id="previewVoice" type="button" title="Play a short sample with this voice">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M11 5 6 9H2v6h4l5 4V5Zm4.5 3.5a5 5 0 0 1 0 7m3-10a9 9 0 0 1 0 13"/></svg>
+              Hear sample
+            </button>
+          </div>
+          <div class="select-wrap">
+            <select id="voice" class="select" disabled>
+              <option disabled selected>Start the engine to choose</option>
+            </select>
+          </div>
         </div>
 
-        <div class="field">
-          <label class="field-label" for="voice">Voice</label>
-          <select id="voice" class="select" disabled>
-            <option disabled selected>Select model first</option>
-          </select>
+        <div class="group" id="fishStyleWrap" hidden>
+          <label class="group-title" for="fishStyle">Style</label>
+          <div class="select-wrap">
+            <select id="fishStyle" class="select">
+              <option value="whisper">Whisper</option>
+              <option value="excited">Excited</option>
+              <option value="sad">Sad</option>
+              <option value="angry">Angry</option>
+              <option value="professional broadcast tone">Professional broadcast</option>
+            </select>
+          </div>
         </div>
 
-        <div class="field" id="fishStyleWrap" hidden>
-          <label class="field-label" for="fishStyle">Fish style tag</label>
-          <select id="fishStyle" class="select">
-            <option value="whisper">Whisper</option>
-            <option value="excited">Excited</option>
-            <option value="sad">Sad</option>
-            <option value="angry">Angry</option>
-            <option value="professional broadcast tone">Professional broadcast</option>
-          </select>
+        <div class="group">
+          <div class="group-head">
+            <label class="group-title" for="speed">Speed</label>
+            <output class="speed-value" id="speedValue" for="speed">1.5×</output>
+          </div>
+          <input type="range" id="speed" class="slider" min="0.5" max="3" step="0.05" value="1.5" />
+          <div class="presets" id="speedPresets" role="group" aria-label="Speed presets">
+            <button class="preset" type="button" data-speed="1">1×</button>
+            <button class="preset" type="button" data-speed="1.25">1.25×</button>
+            <button class="preset" type="button" data-speed="1.5">1.5×</button>
+            <button class="preset" type="button" data-speed="1.75">1.75×</button>
+            <button class="preset" type="button" data-speed="2">2×</button>
+          </div>
         </div>
 
-        <div class="field" id="instructWrap" hidden>
-          <label class="field-label" for="instruct">Instruction</label>
-          <input id="instruct" class="input" type="text" placeholder="Optional style instruction" />
-        </div>
-
-        <div class="field-row">
-          <div class="field">
-            <label class="field-label" for="language">Language</label>
+        <div class="group" id="languageGroup" hidden>
+          <label class="group-title" for="language">Language</label>
+          <div class="select-wrap">
             <select id="language" class="select">
               <option value="Auto">Auto-detect</option>
               <option value="en">English</option>
               <option value="zh">Chinese</option>
               <option value="ja">Japanese</option>
               <option value="ko">Korean</option>
+              <option value="es">Spanish</option>
+              <option value="fr">French</option>
+              <option value="de">German</option>
             </select>
           </div>
-          <div class="field">
-            <label class="field-label" for="speed">Speed</label>
-            <div class="slider-wrap">
-              <input type="range" id="speed" class="slider" min="0.5" max="3" step="0.1" value="1.5" aria-valuemin="0.5" aria-valuemax="3" />
-              <span class="slider-value" id="speedValue">1.5x</span>
-            </div>
-          </div>
+        </div>
+
+        <div class="group" id="instructWrap" hidden>
+          <label class="group-title" for="instruct">Delivery <span class="optional">optional</span></label>
+          <input id="instruct" class="input" type="text" placeholder="e.g. calm and warm, like a narrator" />
         </div>
       </section>
 
-      <section class="module" aria-label="Synthesis">
-        <div class="module-label-row">
-          <h2 class="module-label">SYNTHESIS</h2>
-          <span class="char-count" id="charCount">0 chars</span>
+      <!-- ═════════ HISTORY ═════════ -->
+      <section class="view" id="view-history" role="tabpanel" aria-labelledby="tab-history" hidden>
+        <div class="history-head">
+          <label class="switch">
+            <input id="historyEnabled" type="checkbox" role="switch" />
+            <span class="switch-track" aria-hidden="true"></span>
+            <span class="switch-label">Remember what I listen to</span>
+          </label>
+          <button class="link-btn danger" id="clearHistory" type="button">Clear all</button>
         </div>
-
-        <div class="textarea-wrap">
-          <textarea id="previewText" rows="3" placeholder="Enter text to synthesize..." aria-label="Preview text"></textarea>
-          <button class="copy-btn" id="copyBtn" type="button" title="Copy" aria-label="Copy text">
-            <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
-          </button>
-        </div>
-
-        <div class="playback-controls">
-          <button id="speakBtn" class="btn btn-primary" type="button">Speak</button>
-          <button id="pauseBtn" class="btn btn-secondary" type="button" disabled>Pause</button>
-          <button id="stopPlaybackBtn" class="btn btn-secondary" type="button" disabled>Stop</button>
-        </div>
-
-        <div class="lcd-bezel">
-          <div class="lcd-screen">
-            <div class="lcd-toprow">
-              <span class="lcd-tag">PLAYBACK</span>
-              <span class="lcd-band" id="version"></span>
-            </div>
-            <div class="progress" id="progress" aria-live="polite">Ready</div>
-          </div>
-        </div>
+        <p class="group-note">Saved only on this device — the last 20 finished readings.</p>
+        <ul class="history-list" id="historyList"></ul>
       </section>
 
-      <section class="module history-panel collapsed" id="historyPanel" aria-label="Local history">
-        <div class="module-label-row history-toggle" id="historyToggle" role="button" tabindex="0" aria-expanded="false">
-          <h2 class="module-label">HISTORY <span class="privacy-label">(local only)</span></h2>
-          <span class="history-meta">
-            <span class="mono" id="historyCount">0</span>
-            <span class="chevron">▼</span>
-          </span>
+      <!-- ═════════ SETTINGS ═════════ -->
+      <section class="view" id="view-settings" role="tabpanel" aria-labelledby="tab-settings" hidden>
+
+        <div class="group">
+          <h2 class="group-title">Engine</h2>
+          <div class="engine-card">
+            <div class="engine-card-text">
+              <span class="engine-card-state" id="engineState">Checking…</span>
+              <span class="group-note" id="engineNote">Runs on this Mac. Starts by itself when you press play.</span>
+            </div>
+            <div class="engine-card-actions">
+              <button class="btn" id="startBtn" type="button">Start</button>
+              <button class="btn ghost" id="stopBtn" type="button" disabled>Stop</button>
+            </div>
+          </div>
         </div>
-        <div class="history-list" id="historyList" role="list">
-          <div class="history-empty">No history yet</div>
+
+        <div class="group" id="hideSiteRow" hidden>
+          <h2 class="group-title">This site</h2>
+          <label class="switch">
+            <input id="hideSiteToggle" type="checkbox" role="switch" />
+            <span class="switch-track" aria-hidden="true"></span>
+            <span class="switch-label">Hide the ▶ bubble on <strong id="hideSiteHost"></strong></span>
+          </label>
         </div>
-        <div class="history-footer">
-          <label class="history-enable"><input id="historyEnabled" type="checkbox" /> Save history</label>
-          <button class="icon-btn" id="clearHistory" type="button">Clear all</button>
+
+        <div class="group">
+          <div class="group-head">
+            <h2 class="group-title">Shortcuts</h2>
+            <button class="link-btn" id="editShortcuts" type="button">Customize</button>
+          </div>
+          <ul class="shortcuts" id="shortcutList">
+            <li><span>Read selected text</span><kbd data-command="read-selection">⌥⇧R</kbd></li>
+            <li><span>Pause / resume</span><kbd data-command="toggle-pause">⌥⇧P</kbd></li>
+          </ul>
+          <p class="group-note">Or right-click a selection → “Read with Open TTS”.</p>
         </div>
+
+        <p class="about"><span id="version"></span> · 100% local — text and audio never leave your Mac</p>
       </section>
     </main>
-
-    <footer class="rack-footer">
-      <span id="firstAudioMetric"></span>
-    </footer>
   </div>
 
   <script type="module" src="popup.js"></script>

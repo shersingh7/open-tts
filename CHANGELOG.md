@@ -1,5 +1,28 @@
 # Changelog
 
+## 4.1.0 — 2026-09-25 (UI redesign)
+
+### Popup — rebuilt from scratch
+- Four tabs replace the single long settings panel: **Listen** (main screen), **Voice**, **History**, **Settings**.
+- Listen tab: one large play button that also pauses and resumes, a now-playing line showing the text being read, a progress bar for readings started in the popup, and a separate stop button.
+- **Use selection (N)** fills the text box with the text you selected on the current page. The box shows an estimated listening time. ⌘/Ctrl+Enter starts reading.
+- A voice card shows the current voice, model and speed. Clicking it opens the Voice tab.
+- Voice tab: models are shown as cards with short badges (Fastest, Multilingual, Expressive) instead of a dropdown. Kokoro voices are grouped by accent and gender. Added a **Hear sample** button and speed presets (1× to 2×) next to the slider. Language and delivery fields appear only for models that support them.
+- History tab: one on/off switch, relative timestamps and the voice used, and a replay button on each row.
+- Settings tab: engine start/stop with a plain-language status, the "hide on this site" switch, your actual shortcut keys (read from `chrome.commands`), and a link to change them.
+- The status pill in the header shows a short state (Ready, Starting…, Engine off). Clicking it opens Settings.
+- If the native messaging host is missing, the error banner shows the exact `install_native_host.sh --extension-id <id>` command with a Copy button.
+- Follows the macOS light/dark setting.
+
+### On-page widget
+- New pill design that matches the popup and supports light and dark mode. The play button changes to pause or a spinner depending on the playback state. Labels: "Listen", "Pause", "Resume", "Starting…". "NEW" is renamed "Read this".
+
+### Reader tab
+- The player controls stay pinned at the top while you scroll. The progress bar is slimmer and the reading text uses a serif font. **Space** pauses or resumes and **Esc** stops. Follows light/dark mode.
+
+### Unchanged
+- No changes to the message contract, service worker or backend. All element IDs used by the Reader view and the tests are the same.
+
 ## 4.0.0 — 2026-09-24 (source/package candidate)
 
 ### Architecture

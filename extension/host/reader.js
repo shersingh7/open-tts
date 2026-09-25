@@ -205,6 +205,20 @@ export function startReader(options = {}) {
   doc.getElementById("stop")?.addEventListener("click", onStopClick);
   doc.getElementById("retry")?.addEventListener("click", onRetryClick);
 
+  // Keyboard: Space pauses/resumes, Escape stops (ignored while a button has focus so Space still clicks it).
+  /** @type {any} */ (doc).addEventListener?.("keydown", (/** @type {KeyboardEvent} */ event) => {
+    if (event.metaKey || event.ctrlKey || event.altKey) return;
+    const tag = String(/** @type {any} */ (doc).activeElement?.tagName || "").toUpperCase();
+    if (tag === "BUTTON" || tag === "SUMMARY" || tag === "INPUT") return;
+    if (event.key === " " || event.code === "Space") {
+      if (!state.session?.runId || state.session.state === "idle") return;
+      event.preventDefault();
+      onPauseClick();
+    } else if (event.key === "Escape") {
+      onStopClick();
+    }
+  });
+
   render();
   hostPort = connectHost({
     kind: "reader",

@@ -3,41 +3,58 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
   <title>Open TTS Reader</title>
+  <link rel="icon" href="../icon32.png">
   <link rel="stylesheet" href="reader.css">
   <script type="module" src="reader.js"></script>
 </head>
 <body>
   <main id="reader" aria-busy="false">
-    <header>
-      <span class="eyebrow">LOCAL · PRIVATE · PROGRESSIVE</span>
-      <h1>Open TTS Reader</h1>
-      <p id="model">Waiting for a reading from the extension.</p>
-    </header>
-    <section aria-label="Playback">
-      <p id="status" role="status" aria-live="polite">Ready</p>
-      <progress id="progress" value="0" max="100" aria-label="Fully played text"></progress>
-      <div class="progress-meta">
-        <p id="passage" aria-live="polite"></p>
-        <p id="detail">Audio starts with a small opening passage, then generates ahead.</p>
+
+    <!-- Sticky player -->
+    <section class="player" aria-label="Playback">
+      <div class="player-top">
+        <div class="brand">
+          <img src="../icon48.png" alt="" width="28" height="28">
+          <div class="brand-text">
+            <h1>Open TTS Reader</h1>
+            <p id="model">Waiting for a reading from the extension.</p>
+          </div>
+        </div>
+        <div class="controls">
+          <button id="retry" class="btn secondary" type="button" hidden>Retry from interrupted passage</button>
+          <button id="stop" class="btn secondary" type="button" disabled>Stop</button>
+          <button id="pause" class="btn primary" type="button" disabled>Pause</button>
+        </div>
       </div>
-      <div class="controls">
-        <button id="pause" type="button" disabled>Pause</button>
-        <button id="stop" type="button" disabled>Stop</button>
-        <button id="retry" type="button" hidden>Retry from interrupted passage</button>
+
+      <div class="status-row">
+        <p id="status" role="status" aria-live="polite">Ready</p>
+        <p id="passage" aria-live="polite"></p>
+      </div>
+      <progress id="progress" value="0" max="100" aria-label="Fully played text"></progress>
+      <div class="status-row sub">
+        <p id="detail">Audio starts with a small opening passage, then generates ahead.</p>
+        <p class="kbd-hint"><kbd>Space</kbd> pause / resume · <kbd>Esc</kbd> stop</p>
       </div>
       <p id="error" role="alert"></p>
-      <p class="muted">Keep this tab open while listening. Closing it stops playback. Retry may repeat the beginning
-        of the interrupted passage.</p>
     </section>
-    <section>
-      <h2>Reading text</h2>
+
+    <!-- Reading surface -->
+    <section class="page" aria-label="Reading text">
+      <h2 class="visually-hidden">Reading text</h2>
       <textarea id="text" readonly aria-label="Reading text" placeholder="Your selected text appears here."></textarea>
     </section>
-    <details>
-      <summary>Local timing diagnostics</summary>
-      <pre id="metrics">No run yet.</pre>
-    </details>
+
+    <footer>
+      <p class="muted">Keep this tab open while listening. Closing it stops playback. Retry may repeat the beginning
+        of the interrupted passage.</p>
+      <details>
+        <summary>Local timing diagnostics</summary>
+        <pre id="metrics">No run yet.</pre>
+      </details>
+    </footer>
   </main>
 </body>
 </html>

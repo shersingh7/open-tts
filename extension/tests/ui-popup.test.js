@@ -67,6 +67,9 @@ function makeElement(id) {
     getAttribute(name) {
       return this.dataset[`attr:${name}`] ?? null;
     },
+    style: { setProperty() {} },
+    focus() {},
+    querySelector: () => null,
     querySelectorAll: () => [],
   };
   return el;
@@ -75,16 +78,20 @@ function makeElement(id) {
 /** Builds a fake `document` with every element popup.js's `init()` looks up by id. */
 function makeFakeDoc() {
   const ids = [
-    "model", "voice", "language", "instruct", "instructWrap", "fishStyleWrap", "fishStyle",
-    "speed", "speedValue", "previewText", "charCount", "speakBtn", "pauseBtn", "stopPlaybackBtn",
-    "copyBtn", "startBtn", "stopBtn", "statusDot", "statusText", "modelMeta", "progress",
-    "historyToggle", "historyPanel", "historyList", "historyCount", "clearHistory", "historyEnabled",
-    "errorBanner", "errorText", "copyDiagnostics", "version", "app", "firstAudioMetric",
-    "hideSiteRow", "hideSiteToggle", "hideSiteHost",
+    "app", "statusDot", "statusText", "enginePill", "errorBanner", "errorText", "errorHelp", "installCmd",
+    "copyInstall", "copyDiagnostics", "dismissError", "speakBtn", "stopPlaybackBtn", "progress", "nowPlaying",
+    "firstAudioMetric", "playerBarFill", "previewText", "charCount", "grabSelection", "grabLabel", "copyBtn",
+    "clearText", "voiceSummary", "voiceAvatar", "voiceSummaryName", "voiceSummaryMeta", "modKey", "modelCards",
+    "modelMeta", "voiceGroup", "voice", "previewVoice", "fishStyleWrap", "fishStyle", "speed", "speedValue",
+    "speedPresets", "languageGroup", "language", "instructWrap", "instruct", "historyEnabled", "clearHistory",
+    "historyList", "historyCount", "engineState", "engineNote", "startBtn", "stopBtn", "hideSiteRow",
+    "hideSiteToggle", "hideSiteHost", "editShortcuts", "shortcutList", "version",
+    "tab-listen", "tab-voice", "tab-history", "tab-settings",
+    "view-listen", "view-voice", "view-history", "view-settings",
   ];
   const nodes = new Map(ids.map((id) => [id, makeElement(id)]));
   // Mirror popup.html's `hidden` starting attribute for these elements.
-  for (const id of ["errorBanner", "fishStyleWrap", "instructWrap", "hideSiteRow"]) {
+  for (const id of ["errorBanner", "fishStyleWrap", "instructWrap", "hideSiteRow", "languageGroup"]) {
     nodes.get(id).hidden = true;
   }
   const listeners = {};
@@ -93,6 +100,8 @@ function makeFakeDoc() {
     visibilityState: "visible",
     getElementById: (id) => nodes.get(id),
     createElement: (tag) => makeElement(`created-${tag}`),
+    createElementNS: (_ns, tag) => makeElement(`created-${tag}`),
+    activeElement: null,
     addEventListener(type, fn) {
       (listeners[type] ||= []).push(fn);
     },
@@ -176,8 +185,8 @@ describe("popup init", () => {
     const before = chrome.fake.serverPorts[0].received.filter((m) => m.type === MSG.LOAD_MODEL);
     expect(before).toHaveLength(0);
 
-    doc.nodes.get("model").value = "kokoro";
-    doc.nodes.get("model").dispatch("change");
+    const card = doc.nodes.get("modelCards").children.find((c) => c.dataset.model === "kokoro");
+    card.dispatch("click");
     await flush();
 
     const after = chrome.fake.serverPorts[0].received.filter((m) => m.type === MSG.LOAD_MODEL);
@@ -199,7 +208,9 @@ describe("popup init", () => {
     const history = [{ id: "1", text: "a".repeat(2000), chars: 5000, truncated: true, timestamp: Date.now() }];
     const { doc } = await bootPopup({ storage: { local: { ttsHistory: history } } });
     const item = doc.nodes.get("historyList").children[0];
-    const truncatedNode = item.children.find((c) => c.className === "history-truncated");
+    const main = item.children.find((c) => c.className === "history-main");
+    const sub = main.children.find((c) => c.className === "history-sub");
+    const truncatedNode = sub.children.find((c) => c.className === "history-truncated");
     expect(truncatedNode.textContent).toBe("(first 2,000 chars)");
   });
 
@@ -231,7 +242,7 @@ describe("popup init", () => {
       });
     });
     const { doc } = await bootPopup({ chrome });
-    expect(doc.nodes.get("pauseBtn").disabled).toBe(true);
+    expect(doc.nodes.get("speakBtn").disabled).toBe(true);
     expect(doc.nodes.get("stopPlaybackBtn").disabled).toBe(true);
   });
 
@@ -251,7 +262,7 @@ describe("popup init", () => {
       });
     });
     const { doc } = await bootPopup({ chrome });
-    expect(doc.nodes.get("pauseBtn").disabled).toBe(false);
+    expect(doc.nodes.get("speakBtn").disabled).toBe(false);
     expect(doc.nodes.get("stopPlaybackBtn").disabled).toBe(false);
   });
 
@@ -301,13 +312,14 @@ describe("popup init", () => {
     });
     const { doc } = await bootPopup({ chrome });
     expect(doc.nodes.get("progress").textContent).toBe("Ready #1");
-    expect(doc.nodes.get("statusText").textContent).toBe("Connected #1");
+    expect(doc.nodes.get("engineState").textContent).toBe("Connected #1");
+    expect(doc.nodes.get("statusText").textContent).toBe("Ready");
 
     chrome.fake.serverPorts[0].disconnect();
     await flush();
 
     expect(doc.nodes.get("progress").textContent).toBe("Ready #2");
-    expect(doc.nodes.get("statusText").textContent).toBe("Connected #2");
+    expect(doc.nodes.get("engineState").textContent).toBe("Connected #2");
   });
 });
 
@@ -351,5 +363,113 @@ describe("popup hide-per-site toggle", () => {
     await flush();
     expect(doc.nodes.get("hideSiteRow").hidden).toBe(false);
     expect(doc.nodes.get("hideSiteHost").textContent).toBe("example.com");
+  });
+});
+
+function playingChrome({ state = "playing", onCommand } = {}) {
+  const chrome = createFakeChrome();
+  chrome.runtime.onConnect.addListener((port) => {
+    port.postMessage({
+      type: MSG.SESSION,
+      session: { runId: "r1", state, label: "Reading...", textPreview: "Hello world" },
+      controllable: true,
+    });
+    port.postMessage({ type: MSG.SERVER_STATE, state: "ready", message: "Connected" });
+    port.onMessage.addListener((msg) => {
+      if (msg.type === MSG.GET_MODELS) {
+        port.postMessage({ type: MSG.REPLY, requestId: msg.requestId, ok: true, data: { models: [KOKORO] } });
+        return;
+      }
+      onCommand?.(msg, port);
+    });
+  });
+  return chrome;
+}
+
+describe("popup redesign interactions", () => {
+  it("the play button starts a reading when idle", async () => {
+    const { chrome, doc } = await bootPopup();
+    doc.nodes.get("previewText").value = "Read me";
+    doc.nodes.get("speakBtn").dispatch("click");
+    await flush();
+    const speak = chrome.fake.serverPorts[0].received.find((m) => m.type === MSG.SPEAK);
+    expect(speak.text).toBe("Read me");
+    expect(speak.settings.model).toBe("kokoro");
+    expect(speak.settings.voice).toBe("af_bella");
+  });
+
+  it("the play button pauses while playing and resumes while paused", async () => {
+    const playing = await bootPopup({ chrome: playingChrome({ state: "playing" }) });
+    expect(playing.doc.nodes.get("app").dataset.playback).toBe("playing");
+    playing.doc.nodes.get("speakBtn").dispatch("click");
+    await flush();
+    const sent = playing.chrome.fake.serverPorts[0].received;
+    expect(sent.some((m) => m.type === MSG.PAUSE && m.runId === "r1")).toBe(true);
+    expect(sent.some((m) => m.type === MSG.SPEAK)).toBe(false);
+
+    const paused = await bootPopup({ chrome: playingChrome({ state: "paused" }) });
+    paused.doc.nodes.get("speakBtn").dispatch("click");
+    await flush();
+    expect(paused.chrome.fake.serverPorts[0].received.some((m) => m.type === MSG.RESUME)).toBe(true);
+  });
+
+  it("shows what is being read in the player", async () => {
+    const { doc } = await bootPopup({ chrome: playingChrome() });
+    expect(doc.nodes.get("nowPlaying").textContent).toBe("Hello world");
+  });
+
+  it("Cmd/Ctrl+Enter in the text box starts a reading", async () => {
+    const { chrome, doc } = await bootPopup();
+    doc.nodes.get("previewText").value = "Shortcut text";
+    doc.nodes.get("previewText").dispatch("keydown", { key: "Enter", metaKey: true, preventDefault() {} });
+    await flush();
+    const speak = chrome.fake.serverPorts[0].received.find((m) => m.type === MSG.SPEAK);
+    expect(speak.text).toBe("Shortcut text");
+  });
+
+  it("switching tabs shows exactly one panel", async () => {
+    const { doc } = await bootPopup();
+    doc.nodes.get("tab-voice").dispatch("click");
+    expect(doc.nodes.get("view-voice").hidden).toBe(false);
+    expect(doc.nodes.get("view-listen").hidden).toBe(true);
+    expect(doc.nodes.get("tab-voice").getAttribute("aria-selected")).toBe("true");
+    doc.nodes.get("voiceSummary").dispatch("click");
+    expect(doc.nodes.get("view-voice").hidden).toBe(false);
+    doc.nodes.get("enginePill").dispatch("click");
+    expect(doc.nodes.get("view-settings").hidden).toBe(false);
+    expect(doc.nodes.get("view-voice").hidden).toBe(true);
+  });
+
+  it("renders one model card per model and marks the saved model checked", async () => {
+    const QWEN = { ...KOKORO, id: "qwen3-tts", name: "Qwen3-TTS", voices: [{ id: "ryan", name: "Ryan" }] };
+    const { doc } = await bootPopup({ models: [KOKORO, QWEN] });
+    const cards = doc.nodes.get("modelCards").children;
+    expect(cards).toHaveLength(2);
+    expect(cards[0].getAttribute("aria-checked")).toBe("true");
+    expect(cards[1].getAttribute("aria-checked")).toBe("false");
+  });
+
+  it("offers the native-host install command when Start fails for that reason", async () => {
+    const { doc } = await bootPopup({
+      onCommand: (msg, port) => {
+        if (msg.type === MSG.START_SERVER) {
+          port.postMessage({
+            type: MSG.REPLY, requestId: msg.requestId, ok: false,
+            error: "Could not start the server: Specified native messaging host not found.",
+          });
+        }
+      },
+    });
+    doc.nodes.get("startBtn").dispatch("click");
+    await flush();
+    expect(doc.nodes.get("errorBanner").hidden).toBe(false);
+    expect(doc.nodes.get("errorHelp").hidden).toBe(false);
+    expect(doc.nodes.get("installCmd").textContent).toContain("install_native_host.sh --extension-id");
+  });
+
+  it("summarises the chosen voice and speed on the Listen tab", async () => {
+    const { doc } = await bootPopup({ storage: { sync: { speed: 2 } } });
+    expect(doc.nodes.get("voiceSummaryName").textContent).toBe("Bella");
+    expect(doc.nodes.get("voiceSummaryMeta").textContent).toBe("Kokoro · 2×");
   });
 });

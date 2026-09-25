@@ -42,24 +42,33 @@
 
   const WIDGET_CSS = `
     :host {
+      all: initial;
       position: absolute;
       z-index: 2147483646;
       display: flex;
       align-items: center;
-      gap: 8px;
-      padding: 6px 14px 6px 8px;
-      border-radius: 12px;
-      background: #121410;
-      border: 1px solid #2a2c26;
-      box-shadow: 0 4px 20px rgba(0, 0, 0, 0.4), 0 0 0 1px rgba(255, 92, 20, 0.12);
-      color: #e8e2d4;
-      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Inter", sans-serif;
-      font-size: 13px;
-      font-weight: 600;
+      gap: 6px;
+      padding: 5px 12px 5px 5px;
+      border-radius: 999px;
+      background: rgba(255, 255, 255, 0.96);
+      border: 1px solid rgba(20, 24, 40, 0.1);
+      box-shadow: 0 8px 28px rgba(20, 24, 40, 0.18), 0 1px 3px rgba(20, 24, 40, 0.1);
+      color: #151826;
+      font: 600 13px/1 -apple-system, BlinkMacSystemFont, "SF Pro Text", "Inter", "Segoe UI", sans-serif;
+      -webkit-font-smoothing: antialiased;
+      backdrop-filter: blur(12px);
       opacity: 0;
-      transform: translateY(4px) scale(0.96);
+      transform: translateY(6px) scale(0.94);
       pointer-events: none;
-      transition: opacity 150ms ease, transform 150ms ease;
+      transition: opacity 140ms ease, transform 160ms cubic-bezier(0.2, 0.8, 0.3, 1.2);
+    }
+    @media (prefers-color-scheme: dark) {
+      :host {
+        background: rgba(30, 33, 43, 0.96);
+        border-color: rgba(255, 255, 255, 0.1);
+        color: #eceef5;
+        box-shadow: 0 8px 28px rgba(0, 0, 0, 0.45);
+      }
     }
     :host([data-state="expanded"]) {
       opacity: 1;
@@ -73,54 +82,75 @@
       position: fixed;
       top: auto;
       left: auto;
-      bottom: 16px;
-      right: 16px;
-      padding: 6px 10px;
+      bottom: 20px;
+      right: 20px;
     }
     button {
-      border: none;
-      background: transparent;
-      color: inherit;
-      font: inherit;
+      all: unset;
+      box-sizing: border-box;
       cursor: pointer;
-      padding: 0;
-    }
-    #primary {
-      background: rgba(255, 92, 20, 0.14);
-      width: 40px;
-      height: 40px;
-      min-width: 40px;
-      min-height: 40px;
-      border-radius: 50%;
-      display: grid;
+      display: inline-grid;
       place-items: center;
+      font: inherit;
+      color: inherit;
     }
-    #primary:hover { background: rgba(255, 92, 20, 0.28); }
-    #primary svg { width: 14px; height: 14px; color: #ff5c14; }
-    #label { font-size: 12px; font-weight: 600; white-space: nowrap; letter-spacing: 0.01em; }
-    #read {
+    [hidden] { display: none !important; }
+    button:focus-visible { outline: 2px solid #2f6bff; outline-offset: 2px; }
+    #primary {
       width: 32px;
       height: 32px;
-      border-radius: 8px;
-      background: rgba(160, 240, 255, 0.14);
-      color: #a0f0ff;
-      font-size: 11px;
+      border-radius: 50%;
+      color: #fff;
+      background: linear-gradient(135deg, #2f6bff, #5b4dff);
+      box-shadow: 0 3px 10px rgba(47, 107, 255, 0.4);
+      transition: transform 120ms ease;
     }
+    #primary:hover { transform: scale(1.07); }
+    #primary:active { transform: scale(0.95); }
+    #primary svg { width: 14px; height: 14px; fill: currentColor; }
+    #primary svg.play { margin-left: 2px; }
+    #primary .spin {
+      width: 14px;
+      height: 14px;
+      border-radius: 50%;
+      border: 2px solid rgba(255, 255, 255, 0.4);
+      border-top-color: #fff;
+      animation: spin 0.8s linear infinite;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    #label { font-size: 12.5px; white-space: nowrap; letter-spacing: -0.005em; padding-right: 2px; }
+    #read {
+      height: 24px;
+      padding: 0 9px;
+      border-radius: 999px;
+      font-size: 11.5px;
+      color: #2f6bff;
+      background: rgba(47, 107, 255, 0.12);
+    }
+    #read:hover { background: rgba(47, 107, 255, 0.2); }
     #stop {
-      width: 40px;
-      height: 40px;
-      border-radius: 10px;
-      background: rgba(255, 71, 87, 0.14);
-      color: #ff8a8a;
-      font-size: 13px;
+      width: 26px;
+      height: 26px;
+      margin-right: -6px;
+      border-radius: 50%;
+      color: #868ca3;
     }
-    #stop:hover, #stop:focus-visible { background: rgba(255, 71, 87, 0.28); outline: 2px solid #ff8a8a; outline-offset: 2px; }
-    :host([data-error="true"]) { border-color: rgba(255, 71, 87, 0.4); background: #1a1014; }
-    :host([data-error="true"]) #label { color: #ff8a8a; }
+    #stop svg { width: 11px; height: 11px; fill: currentColor; }
+    #stop:hover { color: #e0433a; background: rgba(224, 67, 58, 0.12); }
+    :host([data-error="true"]) { border-color: rgba(224, 67, 58, 0.5); }
+    :host([data-error="true"]) #label { color: #e0433a; white-space: normal; max-width: 260px; line-height: 1.3; }
     @media (prefers-reduced-motion: reduce) {
-      :host { transition: none; }
+      :host, #primary { transition: none; }
+      #primary .spin { animation: none; }
     }
   `;
+
+  const ICON_PLAY = '<svg class="play" viewBox="0 0 24 24" aria-hidden="true">'
+    + '<path d="M7 4.6v14.8a1 1 0 0 0 1.5.86l12-7.4a1 1 0 0 0 0-1.72l-12-7.4A1 1 0 0 0 7 4.6Z"/></svg>';
+  const ICON_PAUSE = '<svg viewBox="0 0 24 24" aria-hidden="true">'
+    + '<rect x="6" y="4.5" width="4.5" height="15" rx="1.2"/><rect x="13.5" y="4.5" width="4.5" height="15" rx="1.2"/></svg>';
+  const ICON_SPIN = '<span class="spin" aria-hidden="true"></span>';
+  const ICON_STOP = '<svg viewBox="0 0 24 24" aria-hidden="true"><rect x="5" y="5" width="14" height="14" rx="2.5"/></svg>';
 
   // ---------- state ----------
 
@@ -240,22 +270,21 @@
     const primary = document.createElement("button");
     primary.id = "primary";
     primary.type = "button";
-    primary.setAttribute("aria-label", "Speak selected text");
-    primary.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" '
-      + 'stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polygon points="5 3 19 12 5 21 5 3"/></svg>';
+    primary.setAttribute("aria-label", "Read selected text aloud");
+    primary.innerHTML = ICON_PLAY;
     primary.addEventListener("mousedown", (e) => { e.preventDefault(); e.stopPropagation(); }, true);
     primary.addEventListener("click", onPrimaryClick);
 
     const label = document.createElement("span");
     label.id = "label";
-    label.textContent = "Speak";
+    label.textContent = "Listen";
 
     const readBtn = document.createElement("button");
     readBtn.id = "read";
     readBtn.type = "button";
-    readBtn.title = "Read selection";
-    readBtn.setAttribute("aria-label", "Read the new selection");
-    readBtn.textContent = "NEW";
+    readBtn.title = "Stop the current reading and read this selection instead";
+    readBtn.setAttribute("aria-label", "Read the new selection instead");
+    readBtn.textContent = "Read this";
     readBtn.hidden = true;
     readBtn.addEventListener("mousedown", (e) => { e.preventDefault(); e.stopPropagation(); }, true);
     readBtn.addEventListener("click", onReadSelectionClick);
@@ -265,7 +294,7 @@
     stopBtn.type = "button";
     stopBtn.title = "Stop reading";
     stopBtn.setAttribute("aria-label", "Stop reading");
-    stopBtn.textContent = "■";
+    stopBtn.innerHTML = ICON_STOP;
     stopBtn.hidden = true;
     stopBtn.addEventListener("mousedown", (e) => { e.preventDefault(); e.stopPropagation(); }, true);
     stopBtn.addEventListener("click", onStopClick);
@@ -303,7 +332,30 @@
     }
     if (!host) return;
     const active = isActiveHere();
-    els.label.textContent = active ? (latestSession.state === "paused" ? "Resume" : "Pause") : "Speak";
+    const state = latestSession.state;
+    const loading = active && (state === "preparing" || state === "buffering");
+    let label = "Listen";
+    let icon = ICON_PLAY;
+    let aria = "Read selected text aloud";
+    if (active && state === "paused") {
+      label = "Resume";
+      aria = "Resume reading";
+    } else if (loading) {
+      label = state === "preparing" ? "Starting…" : "Loading…";
+      icon = ICON_SPIN;
+      aria = "Pause reading";
+    } else if (active) {
+      label = "Pause";
+      icon = ICON_PAUSE;
+      aria = "Pause reading";
+    }
+    if (host.dataset.error !== "true") els.label.textContent = label;
+    const iconKey = icon === ICON_PLAY ? "play" : icon === ICON_PAUSE ? "pause" : "spin";
+    if (els.primary.dataset.icon !== iconKey) {
+      els.primary.innerHTML = icon;
+      els.primary.dataset.icon = iconKey;
+    }
+    els.primary.setAttribute("aria-label", aria);
     els.stopBtn.hidden = !active;
     const prefix = savedSelectionText.slice(0, 200);
     els.readBtn.hidden = !(active && prefix && prefix !== latestSession.textPreview);

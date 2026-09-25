@@ -11,7 +11,7 @@ describe("manifest (v4 contract)", () => {
     expect(rest).toEqual({
       manifest_version: 3,
       name: "Open TTS",
-      version: "4.0.0",
+      version: "4.1.0",
       minimum_chrome_version: "116",
       permissions: ["storage", "nativeMessaging", "offscreen", "contextMenus"],
       host_permissions: ["http://127.0.0.1:8000/*"],
