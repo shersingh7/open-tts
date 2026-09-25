@@ -115,10 +115,10 @@ def fake_loader(monkeypatch):
     models = {}
 
     def load_model(path):
-        mid = "kokoro"
-        if "qwen" in str(path):
+        mid, p = "kokoro", str(path).lower()  # CI has no local models: path is the HF id ("Qwen3-TTS-...")
+        if "qwen" in p:
             mid = "qwen3-tts"
-        if "fish" in str(path):
+        if "fish" in p:
             mid = "fish-s2-pro"
         model = FakeModel(mid)
         models[mid] = model
